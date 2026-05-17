@@ -14,6 +14,7 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
+use sha2::{Digest, Sha256};
 use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
@@ -382,7 +383,10 @@ impl PackCreateCmd {
             // never holds the full tar in memory).
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_digest = format!("sha256:merged-{}", &image_info.digest[..16]);
+            let merged_hash = hex::encode(Sha256::digest(
+                format!("merged-{}", image_info.digest).as_bytes(),
+            ));
+            let merged_digest = format!("sha256:{}", merged_hash);
             let merged_file = collector.layer_staging_path(&merged_digest);
 
             let total_bytes = client
@@ -600,7 +604,9 @@ impl PackCreateCmd {
                 let overlay_dir =
                     format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
                 println!("Exporting container overlay...");
-                let overlay_digest = format!("sha256:overlay-{}", vm_name);
+                let overlay_hash =
+                    hex::encode(Sha256::digest(format!("overlay-{}", vm_name).as_bytes()));
+                let overlay_digest = format!("sha256:{}", overlay_hash);
                 let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
 
                 // Use the agent to tar the overlay dir

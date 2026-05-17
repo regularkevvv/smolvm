@@ -928,6 +928,39 @@ test_from_vm_debian_roundtrip() {
     rm -f "$pack_output" "$pack_output.smolmachine"
 }
 
+# Regression: short VM names (1-3 chars) must not panic in pack create --from-vm.
+# The overlay layer digest is derived from the VM name via SHA-256, so any length works.
+test_from_vm_short_name() {
+    local vm_name="x"
+    local pack_output="$TEST_DIR/from-vm-short"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    # Create, start, modify, stop
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- touch /etc/short-name-marker 2>&1 || true
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # Pack — this is where the panic used to occur
+    local exit_code=0
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || exit_code=$?
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    [[ $exit_code -eq 0 ]] || {
+        echo "FAIL: pack create --from-vm with 1-char name failed (exit $exit_code)"
+        return 1
+    }
+}
+
 # =============================================================================
 # Case-Insensitive Collision Test (macOS regression)
 #
@@ -1340,6 +1373,12 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
 
     run_test "from-vm-debian: Char device entries don't break extraction" test_from_vm_debian_roundtrip || true
+
+    echo ""
+    echo "Running --from-vm Short Name Tests..."
+    echo ""
+
+    run_test "from-vm: short VM name (1 char) does not panic" test_from_vm_short_name || true
 fi
 
 # =============================================================================
