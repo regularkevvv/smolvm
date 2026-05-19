@@ -5,13 +5,116 @@
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+
+/// Files larger than this threshold are extracted with a sparse write
+/// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
+/// dense sequential write.  Chosen to match typical overlay disk sizes while
+/// staying well above any regular asset file.
+const SPARSE_WRITE_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Extract a single tar entry as a sparse file.
+///
+/// Creates the destination with `ftruncate(entry_size)` so the OS allocates
+/// no disk blocks for the zero regions, then streams `entry` in 64 KiB
+/// chunks and `pwrite`s only the non-zero ones at their correct offsets.
+///
+/// This keeps a 10 GiB overlay disk (with ~50 MB of real data) from
+/// materialising as a dense file during sidecar extraction.
+fn unpack_sparse<R: Read>(
+    entry: &mut tar::Entry<R>,
+    path: &Path,
+    entry_size: u64,
+    mode: u32,
+) -> std::io::Result<()> {
+    // Ensure the parent directory exists (mirrors what entry.unpack_in does).
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Reject symlinks and unexpected directories at the destination.
+    // A prior tar entry may have placed an intra-dest relative symlink at this
+    // path; File::create would follow it, redirecting writes to the symlink
+    // target instead of the intended path.
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unpack_sparse: symlink at destination: {}", path.display()),
+            ));
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unpack_sparse: directory at destination: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            // Regular file: remove it so create_new (O_CREAT|O_EXCL) succeeds.
+            // This handles idempotent re-extraction without silently overwriting.
+            fs::remove_file(path)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // Open with O_CREAT|O_EXCL|O_NOFOLLOW: rejects any symlink placed in the
+    // TOCTOU window between the check above and the open (defense in depth).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    // ftruncate: on APFS and ext4 this allocates zero disk blocks for the
+    // hole regions — only written bytes consume real space.
+    file.set_len(entry_size)?;
+
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+
+    // Only file mode is restored, not timestamps, uid/gid, or xattrs.
+    // unpack_sparse applies to large cache assets (overlay disks, storage
+    // images) extracted to a host-local cache directory; the extra metadata
+    // does not affect functionality for those assets.
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    Ok(())
+}
 
 /// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
 /// that resolve outside `dest`.
@@ -147,25 +250,44 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             }
         }
 
-        if let Err(e) = entry.unpack_in(dest) {
-            // On macOS, certain entries fail to unpack due to platform
-            // limitations (xattr encoding, uid/gid mapping, resource forks).
-            // For non-Regular entries (symlinks, hardlinks, dirs), skip and
-            // continue rather than aborting the entire extraction.
-            if entry_type != tar::EntryType::Regular && entry_type != tar::EntryType::GNUSparse {
-                continue;
-            }
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to unpack '{}': {}", entry_path.display(), e),
-            ));
-        }
+        let is_regular =
+            entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
 
-        // After extracting a directory, force it writable so subsequent
-        // entries (children) can be created inside it. Final permissions
-        // are applied after the loop.
-        if entry_type == tar::EntryType::Directory && full_path.is_dir() {
-            let _ = std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
+        // For large regular files use a sparse write: ftruncate creates the
+        // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
+        // prevents 10 GiB overlay disks from materialising as dense files on
+        // disk and causing ENOSPC or slow extraction.
+        if is_regular && entry.header().size().unwrap_or(0) >= SPARSE_WRITE_THRESHOLD {
+            let entry_size = entry.header().size()?;
+            let mode = entry.header().mode().unwrap_or(0o644);
+            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+        } else {
+            if let Err(e) = entry.unpack_in(dest) {
+                // On macOS, certain entries fail to unpack due to platform
+                // limitations (xattr encoding, uid/gid mapping, resource forks).
+                // For non-Regular entries (symlinks, hardlinks, dirs), skip and
+                // continue rather than aborting the entire extraction.
+                if !is_regular {
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+
+            // After extracting a directory, force it writable so subsequent
+            // entries (children) can be created inside it. Final permissions
+            // are applied after the loop.
+            if entry_type == tar::EntryType::Directory && full_path.is_dir() {
+                let _ =
+                    std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
+            }
         }
     }
 
@@ -1155,8 +1277,10 @@ pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
 
 /// Copy overlay disk template from cache to a runtime directory.
 ///
-/// Copies the overlay template to `dest`, optionally extending the sparse
-/// file if `size_gb_override` is larger than the template.
+/// Copies the overlay template to `dest`, then restores the full sparse
+/// skeleton if `overlay_logical_size` is set (new packs store a truncated
+/// copy with the trailing hole stripped), and optionally extends further
+/// when `size_gb_override` is larger still.
 ///
 /// Returns an error if the template path is `None` or the template file
 /// does not exist in the cache.
@@ -1165,6 +1289,7 @@ pub fn copy_overlay_template(
     template_path: Option<&str>,
     dest: &Path,
     size_gb_override: Option<u64>,
+    overlay_logical_size: Option<u64>,
 ) -> std::io::Result<()> {
     let template = template_path.ok_or_else(|| {
         std::io::Error::new(
@@ -1183,14 +1308,25 @@ pub fn copy_overlay_template(
 
     fs::copy(&src, dest)?;
 
-    // Extend if requested size is larger than template
-    if let Some(gb) = size_gb_override {
-        let desired = gb * 1024 * 1024 * 1024;
-        let current = fs::metadata(dest)?.len();
-        if desired > current {
-            let file = fs::OpenOptions::new().write(true).open(dest)?;
-            file.set_len(desired)?;
-        }
+    // Determine target size: max of the copied size, overlay_logical_size
+    // (original sparse extent before trailing-hole truncation), and
+    // size_gb_override (user-requested larger disk).  A single ftruncate
+    // handles all three cases; ftruncate is instant and allocates no disk
+    // blocks for the extended region.
+    let copied_size = fs::metadata(dest)?.len();
+    let target = [
+        Some(copied_size),
+        overlay_logical_size,
+        size_gb_override.map(|gb| gb * 1024 * 1024 * 1024),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(copied_size);
+
+    if target > copied_size {
+        let file = fs::OpenOptions::new().write(true).open(dest)?;
+        file.set_len(target)?;
     }
 
     Ok(())
@@ -1237,6 +1373,65 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a single-file tar archive in memory with the given name and data.
+    fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unpack_sparse_rejects_symlink_at_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.bin");
+        let dest = temp_dir.path().join("overlay.raw");
+
+        fs::write(&outside, b"untouched").unwrap();
+        symlink(&outside, &dest).unwrap(); // dest is now a symlink → outside
+
+        let data = vec![0xFFu8; 512];
+        let tar_bytes = make_tar("overlay.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644);
+
+        assert!(result.is_err(), "should reject symlink at destination");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // The symlink target must not be modified
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn test_unpack_sparse_preserves_data_integrity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("data.raw");
+
+        // Alternating 64 KiB zero and non-zero blocks: covers the skip-zero
+        // path, the write-nonzero path, correct seek offsets, and the
+        // ftruncate skeleton giving the right final size.
+        let block = 64 * 1024;
+        let mut data = vec![0u8; 8 * block];
+        for i in (0..8).step_by(2) {
+            data[i * block..(i + 1) * block].fill(0xFF);
+        }
+
+        let tar_bytes = make_tar("data.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), data);
+    }
 
     #[test]
     fn test_cache_dir_format() {
@@ -1311,7 +1506,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), None, &dest, None);
+        let result = copy_overlay_template(temp_dir.path(), None, &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1321,7 +1516,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1336,15 +1532,52 @@ mod tests {
         let template_data = vec![0u8; 1024];
         fs::write(&template, &template_data).unwrap();
 
-        // Copy without size override
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None).unwrap();
+        // Copy without any size override or logical size
+        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None, None).unwrap();
         assert_eq!(fs::metadata(&dest).unwrap().len(), 1024);
 
-        // Copy with size override that extends (use small value for test)
+        // Copy with overlay_logical_size set — dest should be extended
         let dest2 = temp_dir.path().join("output2.raw");
-        // We can't test GiB-sized files, but we can verify the copy works
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest2, None).unwrap();
-        assert!(dest2.exists());
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_size_gb_takes_max() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let template = temp_dir.path().join("overlay.raw");
+        fs::write(&template, vec![0u8; 1024]).unwrap();
+
+        // size_gb_override wins when larger than overlay_logical_size
+        let dest = temp_dir.path().join("out_a.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest,
+            Some(1), // 1 GiB
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 1024 * 1024 * 1024);
+
+        // overlay_logical_size wins when larger than size_gb_override
+        let dest2 = temp_dir.path().join("out_b.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(8192), // overlay_logical_size bigger than template but smaller than size_gb_override test above
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 8192);
     }
 
     #[test]
@@ -1354,7 +1587,8 @@ mod tests {
         let dest = temp_dir.path().join("overlay.raw");
         fs::write(&outside, b"x").unwrap();
 
-        let result = copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }

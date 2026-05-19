@@ -532,18 +532,23 @@ fn setup_vm_overlay(
             .as_ref()
             .map(|t| t.path.as_str());
 
-        extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(
-            |e| {
-                Error::agent(
-                    "setup overlay",
-                    format!(
-                        "VM mode overlay template is missing or corrupt: {}. \
+        extract::copy_overlay_template(
+            cache_dir,
+            overlay_template,
+            dest,
+            overlay_gb,
+            manifest.assets.overlay_logical_size,
+        )
+        .map_err(|e| {
+            Error::agent(
+                "setup overlay",
+                format!(
+                    "VM mode overlay template is missing or corrupt: {}. \
                          Try re-packing with `smolvm pack --from-vm`.",
-                        e
-                    ),
-                )
-            },
-        )?;
+                    e
+                ),
+            )
+        })?;
 
         return Ok(Some(dest.to_path_buf()));
     }
