@@ -72,6 +72,19 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // Distinguish "machine not found" from "machine stopped"
+        // so a typo in the name gives a clear error rather than the
+        // generic "not running / use start" message.
+        if let Some(ref n) = name {
+            let exists = SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(n).ok().flatten())
+                .is_some();
+            if !exists {
+                return Err(smolvm::Error::vm_not_found(n));
+            }
+        }
+
         // Best-effort reconcile: if we can't connect to the agent
         // but the libkrun PID is alive, we're in the bug 2 zombie
         // state — record says "running" but agent is dead. Mark
@@ -1165,6 +1178,17 @@ where
         extra(&manager);
         manager.detach();
     } else {
+        // Only report "not running" when the machine actually exists.
+        // A missing DB record with an explicit name is "not found".
+        if let Some(ref n) = name {
+            let exists = SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(n).ok().flatten())
+                .is_some();
+            if !exists {
+                return Err(smolvm::Error::vm_not_found(n));
+            }
+        }
         println!("Machine '{}': not running", label);
     }
 
@@ -1283,7 +1307,9 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 if let Some(wd) = &record.workdir {
                     println!("  Workdir: {}", wd);
                 }
-                println!("  Created: {}", record.created_at);
+                let created = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(record.created_at);
+                println!("  Created: {}", humantime::format_rfc3339_seconds(created));
                 println!();
             }
         }
