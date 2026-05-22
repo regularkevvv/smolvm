@@ -105,14 +105,23 @@ impl PortMapping {
             let host: u16 = host
                 .parse()
                 .map_err(|_| format!("invalid host port: {}", host))?;
+            if host == 0 {
+                return Err("host port 0 is not valid for VM port forwarding".to_string());
+            }
             let guest: u16 = guest
                 .parse()
                 .map_err(|_| format!("invalid guest port: {}", guest))?;
+            if guest == 0 {
+                return Err("guest port 0 is not valid for VM port forwarding".to_string());
+            }
             Ok(Self::new(host, guest))
         } else {
             let port: u16 = spec
                 .parse()
                 .map_err(|_| format!("invalid port: {}", spec))?;
+            if port == 0 {
+                return Err("port 0 is not valid for VM port forwarding".to_string());
+            }
             Ok(Self::same(port))
         }
     }
@@ -180,6 +189,15 @@ mod tests {
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 3);
         assert!(cidrs.contains(&"1.1.1.1/32".to_string()));
+    }
+
+    #[test]
+    fn test_port_mapping_rejects_zero() {
+        assert!(PortMapping::parse("0:80").is_err());
+        assert!(PortMapping::parse("80:0").is_err());
+        assert!(PortMapping::parse("0").is_err());
+        assert!(PortMapping::parse("1:1").is_ok());
+        assert!(PortMapping::parse("8080:80").is_ok());
     }
 
     #[test]
