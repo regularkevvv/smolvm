@@ -17,6 +17,7 @@ use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::platform::Platform;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -250,7 +251,27 @@ impl PackRunCmd {
             return Ok(());
         }
 
-        // 5. Extract assets to cache (locked to prevent concurrent extraction races)
+        // 5. Platform compatibility check — fail before extraction so the error
+        //    is immediate and actionable rather than a cryptic dlopen failure.
+        {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                return Err(Error::agent(
+                    "platform mismatch",
+                    format!(
+                        "this artifact was built for {} but the current platform is {}\
+                         \n\nTo run on {}, create a new pack:\
+                         \n\n  smolvm pack create --image <image> -o <output>\
+                         \n\nOr push platform-specific artifacts under separate tags:\
+                         \n\n  smolvm pack push myrepo:v1-darwin-arm64 -f myapp-darwin.smolmachine\
+                         \n  smolvm pack push myrepo:v1-linux-amd64  -f myapp-linux.smolmachine",
+                        manifest.host_platform, current, current,
+                    ),
+                ));
+            }
+        }
+
+        // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
@@ -263,7 +284,7 @@ impl PackRunCmd {
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
-        // 6. Set up paths — use a unique runtime directory per invocation so
+        // 7. Set up paths — use a unique runtime directory per invocation so
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
@@ -301,7 +322,7 @@ impl PackRunCmd {
             self.overlay,
         )?;
 
-        // 7. Parse CLI args
+        // 8. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
 
@@ -332,7 +353,7 @@ impl PackRunCmd {
             );
         }
 
-        // 8. Fork child → launch VM with dynamically loaded libkrun
+        // 9. Fork child → launch VM with dynamically loaded libkrun
         smolvm::process::install_sigchld_handler();
 
         let console_log_path = runtime_dir.path().join("console.log");
@@ -422,7 +443,7 @@ impl PackRunCmd {
             runtime_dir,
         };
 
-        // 9. Parent: wait for agent, connect, execute command
+        // 10. Parent: wait for agent, connect, execute command
         let mut client = wait_for_agent(&vsock_path, self.debug)?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;

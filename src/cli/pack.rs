@@ -1380,6 +1380,22 @@ impl PackPullCmd {
             dest.display(),
             result.size,
         );
+
+        // Warn if the artifact targets a different host platform.
+        // This is not an error — the user may be inspecting or transferring
+        // the artifact — but it will not run on this host as-is.
+        if let Ok(manifest) = smolvm_pack::read_manifest_from_sidecar(&dest) {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                eprintln!(
+                    "Warning: this artifact was built for {} and will not run on {} (current platform).\
+                     \nTo run on {}, create a new pack:\
+                     \n\n  smolvm pack create --image {} -o <output>",
+                    manifest.host_platform, current, current, manifest.image,
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -1485,7 +1501,17 @@ async fn run_inspect(
         println!("Reference:  {}", full_ref);
         println!("Image:      {}", pack_manifest.image);
         println!("Platform:   {}", pack_manifest.platform);
-        println!("Host:       {}", pack_manifest.host_platform);
+        {
+            let current = Platform::current().host_oci_platform();
+            if pack_manifest.host_platform == current {
+                println!("Host:       {}", pack_manifest.host_platform);
+            } else {
+                println!(
+                    "Host:       {}  [incompatible — current platform: {}]",
+                    pack_manifest.host_platform, current
+                );
+            }
+        }
         println!("CPUs:       {}", pack_manifest.cpus);
         println!("Memory:     {} MiB", pack_manifest.mem);
         if !pack_manifest.entrypoint.is_empty() {
