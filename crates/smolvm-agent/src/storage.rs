@@ -13,7 +13,7 @@ use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_protocol::guest_env;
-use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
+use smolvm_protocol::{normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -985,6 +985,10 @@ where
         }
     })?;
 
+    // Canonicalize so all equivalent refs share the same on-disk cache key.
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
+
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, "using packed layers, skipping network pull");
@@ -1268,6 +1272,8 @@ where
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
     let root = Path::new(STORAGE_ROOT);
     let manifest_path = root
         .join(MANIFESTS_DIR)
@@ -2948,10 +2954,37 @@ fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
-/// Reverse sanitization.
+/// Reverse sanitization of a canonical image filename back to an image reference.
+///
+/// Because we now always store under the canonical form the mapping is
+/// deterministic:
+/// - The last `_`-delimited segment is the tag (or digest hex), except when
+///   the penultimate segment is `sha256`, in which case `sha256_<hex>` is the
+///   digest.
+/// - Everything else is the `registry/path` portion, with `_` reversed to `/`.
+///
+/// The result is passed to `query_image`, which normalizes it before
+/// computing the cache key.
 fn unsanitize_image_name(name: &str) -> String {
-    // This is approximate - we lose some info
-    name.replacen('_', "/", 1).replacen('_', ":", 1)
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() < 2 {
+        return name.to_string();
+    }
+
+    // Detect sha256 digest: penultimate segment is "sha256", last is 64 hex chars.
+    let n = parts.len();
+    if n >= 2
+        && parts[n - 2] == "sha256"
+        && parts[n - 1].len() == 64
+        && parts[n - 1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        let name_part = parts[..n - 2].join("/");
+        return format!("{name_part}@sha256:{}", parts[n - 1]);
+    }
+
+    // Normal case: last segment is the tag.
+    let name_part = parts[..n - 1].join("/");
+    format!("{name_part}:{}", parts[n - 1])
 }
 
 /// Get disk usage for a path.
@@ -3074,7 +3107,11 @@ mod tests {
 
     #[test]
     fn test_sanitize_image_name() {
-        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
+        // sanitize_image_name operates on already-canonical refs
+        assert_eq!(
+            sanitize_image_name("docker.io/library/alpine:latest"),
+            "docker.io_library_alpine_latest"
+        );
         assert_eq!(
             sanitize_image_name("docker.io/library/alpine:3.18"),
             "docker.io_library_alpine_3.18"
@@ -3082,6 +3119,25 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
+
+    #[test]
+    fn test_unsanitize_image_name() {
+        // Normal tag case
+        assert_eq!(
+            unsanitize_image_name("docker.io_library_alpine_3.20"),
+            "docker.io/library/alpine:3.20"
+        );
+        assert_eq!(
+            unsanitize_image_name("ghcr.io_owner_repo_v1"),
+            "ghcr.io/owner/repo:v1"
+        );
+        // Digest case
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            unsanitize_image_name(&format!("docker.io_library_alpine_sha256_{hex}")),
+            format!("docker.io/library/alpine@sha256:{hex}")
         );
     }
 

@@ -6,6 +6,7 @@
 use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
+use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
     FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
@@ -129,9 +130,13 @@ pub struct RunConfig {
 
 impl RunConfig {
     /// Create a new run configuration with the given image and command.
+    ///
+    /// The image reference is canonicalized immediately so all downstream
+    /// code (cache keys, logs, protocol messages) sees the same form
+    /// regardless of how the caller spelled it.
     pub fn new(image: impl Into<String>, command: Vec<String>) -> Self {
         Self {
-            image: image.into(),
+            image: normalize_image_ref(&image.into()),
             command,
             env: Vec::new(),
             workdir: None,
@@ -580,6 +585,9 @@ impl AgentClient {
         auth: Option<&RegistryAuth>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
+        let image = normalize_image_ref(image);
+        let image = image.as_str();
+
         // Use a long timeout for pull - large images can take minutes to download/extract.
         // The guard resets the timeout on drop (including error paths).
         self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
@@ -1947,7 +1955,7 @@ mod run_background_tests {
                     );
                     assert!(!interactive, "background runs are never interactive");
                     assert!(!tty, "background runs never allocate a TTY");
-                    assert_eq!(image, "alpine:3.19");
+                    assert_eq!(image, "docker.io/library/alpine:3.19");
                     assert_eq!(command, vec!["sh", "-c", "echo hi"]);
                     assert_eq!(
                         persistent_overlay_id,
@@ -2061,7 +2069,7 @@ mod run_streaming_tests {
                     persistent_overlay_id,
                     ..
                 } => {
-                    assert_eq!(image, "ubuntu:24.04");
+                    assert_eq!(image, "docker.io/library/ubuntu:24.04");
                     assert_eq!(command, vec!["/bin/bash", "-lc", "echo hi"]);
                     assert_eq!(
                         mounts,
