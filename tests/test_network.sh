@@ -19,6 +19,51 @@ echo "  Network and Egress Tests"
 echo "=========================================="
 echo ""
 
+# Assert that egress from a VM to a destination outside its allowlist is
+# blocked by the egress policy (EACCES) — not merely failing or timing out.
+#
+# The probe deliberately targets a real, reachable, NON-resolver web host on
+# port 443 (resolved on the host, where egress is open). A public-DNS IP such
+# as 8.8.8.8 is NOT a valid "blocked" example: the policy auto-adds the host's
+# own DNS resolver to every allowlist (so VMs can resolve names), so on a host
+# whose resolver is 8.8.8.8 that IP is silently permitted. A web IP is never
+# auto-added, so it is a sound block target regardless of the host's DNS config.
+#
+# A policy block returns EACCES immediately; an unreachable host would hang
+# until the timeout. We require BOTH a nonzero exit AND a fast failure, so a
+# timeout (or any non-policy failure) can never masquerade as a real block.
+assert_egress_blocked() {
+    local vm_name="$1"
+
+    local web_ip
+    web_ip=$(getent ahostsv4 example.com | awk 'NR==1{print $1}')
+    if [[ -z "$web_ip" ]]; then
+        echo "FAIL: could not resolve a non-resolver block-probe target on host"
+        return 1
+    fi
+
+    # Probe inside the guest; emit "<exit_code> <elapsed_ms>".
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- sh -c \
+        "s=\$(date +%s%N); nc -w 4 -z $web_ip 443 >/dev/null 2>&1; r=\$?; e=\$(date +%s%N); echo \"\$r \$(((e-s)/1000000))\"" \
+        2>/dev/null | tail -1)
+    if [[ -z "$result" ]]; then
+        echo "FAIL: egress probe to $web_ip:443 produced no result (exec failed?)"
+        return 1
+    fi
+
+    local rc=${result%% *} ms=${result##* }
+    if [[ "$rc" == "0" ]]; then
+        echo "FAIL: egress to non-allowlisted $web_ip:443 was permitted (policy not enforced)"
+        return 1
+    fi
+    if [[ -z "$ms" ]] || [[ "$ms" -ge 2000 ]]; then
+        echo "FAIL: egress to $web_ip:443 failed by timeout (${ms}ms), not a policy block (EACCES)"
+        return 1
+    fi
+    return 0
+}
+
 test_machine_network_disabled_by_default() {
     local vm_name="net-disabled-test-$$"
 
@@ -118,19 +163,20 @@ test_machine_egress_allow_cidr_blocked() {
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    # Create VM allowing only private range + auto-included DNS (1.1.1.1).
-    # Test with 8.8.8.8 which is NOT in the allowlist.
+    # Create VM allowing only a private range. ensure_dns_in_cidrs also
+    # auto-adds the host's DNS resolver so the VM can still resolve names.
     $SMOLVM machine create "$vm_name" --allow-cidr 10.0.0.0/8 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    local exit_code=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+    # A destination outside 10.0.0.0/8 (and not the auto-added resolver) blocked.
+    local blocked_rc=0
+    assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code -ne 0 ]]
+    [[ $blocked_rc -eq 0 ]]
 }
 
 test_machine_egress_outbound_localhost_only() {
@@ -142,14 +188,15 @@ test_machine_egress_outbound_localhost_only() {
     $SMOLVM machine create "$vm_name" --outbound-localhost-only 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    local exit_code=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+    # Loopback-only egress: every external destination must be blocked.
+    local blocked_rc=0
+    assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code -ne 0 ]]
+    [[ $blocked_rc -eq 0 ]]
 }
 
 test_machine_egress_invalid_cidr_rejected() {
@@ -189,18 +236,19 @@ test_machine_egress_allow_host_blocked() {
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    # Create VM allowing only one.one.one.one — 8.8.8.8 should be blocked
+    # Create VM allowing only one.one.one.one. A host outside the allowlist
+    # (and not the auto-added resolver) must be blocked.
     $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    local exit_code=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+    local blocked_rc=0
+    assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code -ne 0 ]]
+    [[ $blocked_rc -eq 0 ]]
 }
 
 test_machine_egress_allow_host_invalid_rejected() {
@@ -350,15 +398,15 @@ test_machine_allow_host_persists_across_restart() {
     $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # Should still be blocked (8.8.8.8 is not in allowlist)
-    local exit_code_after=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_after=$?
+    # Egress restriction must still hold after the restart.
+    local blocked_rc=0
+    assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code_after -ne 0 ]]
+    [[ $blocked_rc -eq 0 ]]
 }
 
 test_smolfile_allow_hosts_stale_cidr_regression() {
@@ -463,16 +511,16 @@ EOF
     local exit_code_resolution=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code_resolution=$?
 
-    # Egress to a non-allowed resolver (8.8.8.8) must be blocked
-    local exit_code_blocked=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
+    # Egress to a destination outside the allowlist must be blocked.
+    local blocked_rc=0
+    assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_resolution -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
+    [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_resolution -eq 0 ]] && [[ $blocked_rc -eq 0 ]]
 }
 
 test_egress_refresh_thread_stability() {
