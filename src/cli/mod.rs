@@ -111,6 +111,15 @@ impl ProgressBar {
     /// callers can invoke this on every chunk without flooding
     /// stderr.
     pub fn update(&mut self, bytes_so_far: u64) {
+        // Defer the terminal (100%) line to finish() so it is printed exactly
+        // once. Otherwise a small/single-chunk transfer prints "100%" here and
+        // again on completion — visible as two lines on non-TTY output where
+        // the overwriting `\r` has no effect.
+        if let Some(total) = self.total {
+            if total > 0 && bytes_so_far >= total {
+                return;
+            }
+        }
         let now = std::time::Instant::now();
         if now.duration_since(self.last_print).as_millis() < Self::THROTTLE_MS {
             return;
