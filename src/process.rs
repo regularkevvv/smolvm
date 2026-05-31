@@ -121,7 +121,10 @@ pub fn harden_self() {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     unsafe {
-        let lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         libc::setrlimit(libc::RLIMIT_CORE, &lim);
     }
 }
@@ -243,7 +246,11 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
 
     // Set limits on the leaf *before* joining it.
     let quota_us = (vcpus.max(1) as u64) * CGROUP_CPU_PERIOD_US;
-    let _ = write_cgroup(&vm, "cpu.max", &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"));
+    let _ = write_cgroup(
+        &vm,
+        "cpu.max",
+        &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
+    );
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
     let mem_bytes = (memory_mib as u64 + CGROUP_MEM_OVERHEAD_MIB) * 1024 * 1024;
     let _ = write_cgroup(&vm, "memory.max", &mem_bytes.to_string());
@@ -304,6 +311,11 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     // Syscalls observed across a full VM lifecycle (boot + exec + stop), plus a
     // small margin of common runtime syscalls that vDSO/timing can hide from a
     // single trace. An empty rule vec allows the syscall unconditionally.
+    //
+    // Kept as a hand-grouped table (rustfmt would explode it one-per-line):
+    // a security allowlist is far easier to audit when related syscalls sit
+    // together under a category comment.
+    #[rustfmt::skip]
     let allowed: &[libc::c_long] = &[
         // file & block I/O (storage/overlay disks, virtio-blk, layer files)
         libc::SYS_read, libc::SYS_write, libc::SYS_pread64, libc::SYS_pwrite64,
@@ -487,10 +499,16 @@ pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
             return Err(format!("setgroups: {}", std::io::Error::last_os_error()));
         }
         if libc::setgid(gid as libc::gid_t) != 0 {
-            return Err(format!("setgid({gid}): {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "setgid({gid}): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         if libc::setuid(uid as libc::uid_t) != 0 {
-            return Err(format!("setuid({uid}): {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "setuid({uid}): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         // Defense-in-depth: a complete drop (real+effective+saved) means uid 0
         // can no longer be regained. If it can, the drop was partial — fail.
@@ -1608,6 +1626,10 @@ mod tests {
             "unprivileged drop_privileges must fail (fail-closed contract)"
         );
         // Sanity: our identity is unchanged (setgroups failed before any setuid).
-        assert_ne!(unsafe { libc::getuid() }, 1, "drop must not have taken effect");
+        assert_ne!(
+            unsafe { libc::getuid() },
+            1,
+            "drop must not have taken effect"
+        );
     }
 }

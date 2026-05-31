@@ -419,5 +419,4 @@ mod tests {
             ListenTarget::Tcp(addr) => panic!("expected unix, got tcp address {addr}"),
         }
     }
-
 }

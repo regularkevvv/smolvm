@@ -136,8 +136,15 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
 
         let mut read_write: Vec<std::path::PathBuf> = [
-            "/dev/kvm", "/dev/null", "/dev/zero", "/dev/full", "/dev/urandom",
-            "/dev/random", "/dev/dri", "/dev/ptmx", "/tmp",
+            "/dev/kvm",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/full",
+            "/dev/urandom",
+            "/dev/random",
+            "/dev/dri",
+            "/dev/ptmx",
+            "/tmp",
         ]
         .iter()
         .map(std::path::PathBuf::from)
