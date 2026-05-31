@@ -1731,7 +1731,9 @@ mod init_runner_tests {
             &[],
             "vm",
         );
-        assert_eq!(config.image, "debian:slim");
+        // Image is canonicalized by `RunConfig::new` (normalize_image_ref):
+        // bare `debian:slim` → fully-qualified `docker.io/library/debian:slim`.
+        assert_eq!(config.image, "docker.io/library/debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
         assert_eq!(config.user.as_deref(), Some("steam"));
