@@ -310,6 +310,24 @@ pub struct MachineCountsResponse {
     pub running: usize,
 }
 
+/// Live node capacity: current allocations and real utilization across all
+/// running machines on this host. Read-only introspection — a fleet control
+/// plane (or any operator) polls this to gauge node load. The reporter owns
+/// totals/reserved; this endpoint reports only what the runtime itself knows.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityResponse {
+    /// CPUs allocated to running machines (sum of per-machine cpu requests).
+    pub allocated_cpus: u32,
+    /// Memory (MB) allocated to running machines.
+    pub allocated_memory_mb: u64,
+    /// Real fractional CPU load across VM processes (e.g. 2.5 = 2.5 CPUs).
+    pub used_cpus: f64,
+    /// Real resident memory (MB) across VM processes.
+    pub used_memory_mb: u64,
+    /// Real disk (GB) consumed by VM storage + overlay files.
+    pub used_disk_gb: u64,
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
