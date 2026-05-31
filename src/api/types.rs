@@ -115,6 +115,9 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = 30)]
     pub timeout_secs: Option<u64>,
+    /// Data to pipe to the command's stdin.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 /// Environment variable.
@@ -326,14 +329,6 @@ pub struct ApiErrorResponse {
 // Machine Types
 // ============================================================================
 
-fn default_cpus() -> u8 {
-    1
-}
-
-fn default_mem() -> u32 {
-    512
-}
-
 /// Request to create a new machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -343,13 +338,13 @@ pub struct CreateMachineRequest {
     #[schema(example = "my-vm")]
     pub name: Option<String>,
     /// Number of vCPUs.
-    #[serde(default = "default_cpus")]
-    #[schema(example = 2)]
-    pub cpus: u8,
+    #[serde(default)]
+    #[schema(example = 4)]
+    pub cpus: Option<u8>,
     /// Memory in MiB.
-    #[serde(default = "default_mem", rename = "memoryMb")]
-    #[schema(example = 1024)]
-    pub mem: u32,
+    #[serde(default, rename = "memoryMb")]
+    #[schema(example = 8192)]
+    pub mem: Option<u32>,
     /// Host mounts to attach.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
@@ -382,6 +377,11 @@ pub struct CreateMachineRequest {
     /// layers instead of pulling from a registry. Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
+    /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").
+    /// Pulls from the registry before creating the VM.
+    /// Mutually exclusive with `image` and `from`.
+    #[serde(default)]
+    pub registry_ref: Option<String>,
 }
 
 /// Request to execute a command in a machine.
@@ -400,6 +400,9 @@ pub struct MachineExecRequest {
     /// Timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Data to pipe to the command's stdin.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 /// Machine status information.

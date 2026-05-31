@@ -54,7 +54,8 @@ impl VmHandle {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        self.client_mut()?.vm_exec(command, env, workdir, timeout)
+        self.client_mut()?
+            .vm_exec(command, env, workdir, timeout, None)
     }
 
     /// Pull an OCI image and run a command inside it.

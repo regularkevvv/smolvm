@@ -855,6 +855,7 @@ impl AgentClient {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
+        stdin_data: Option<String>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
@@ -867,6 +868,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             background: false,
+            stdin_data,
         })?;
 
         expect_completed(resp, "vm exec")
@@ -890,6 +892,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             background: true,
+            stdin_data: None,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "vm exec background")?;
@@ -1063,6 +1066,7 @@ impl AgentClient {
                 interactive: true,
                 tty,
                 background: false,
+                stdin_data: None,
             },
             tty,
             "vm exec interactive",
@@ -1581,6 +1585,7 @@ impl AgentClient {
             interactive: true,
             tty: false,
             background: false,
+            stdin_data: None,
         })?;
 
         collect_exec_events(self, "streaming exec", on_event)

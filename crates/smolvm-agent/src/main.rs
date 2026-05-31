@@ -1904,8 +1904,16 @@ fn handle_request(
             timeout_ms,
             interactive: false,
             tty: false,
+            stdin_data,
             ..
-        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms, client_fd),
+        } => handle_vm_exec(
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+            client_fd,
+            stdin_data.as_deref(),
+        ),
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
@@ -4527,6 +4535,7 @@ fn handle_vm_exec(
     workdir: Option<&str>,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    stdin_data: Option<&str>,
 ) -> AgentResponse {
     info!(command = ?command, "executing directly in VM");
 
@@ -4547,10 +4556,13 @@ fn handle_vm_exec(
         cmd.current_dir(wd);
     }
 
-    // Commands that don't receive interactive stdin should get EOF
-    // immediately, not block on /dev/console (the agent's inherited stdin).
-    // Without this, `exec -- cat` hangs until the connection times out.
-    cmd.stdin(Stdio::null());
+    // If stdin data is provided, pipe it to the command.
+    // Otherwise, give the command immediate EOF via /dev/null.
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -4611,6 +4623,22 @@ fn handle_vm_exec(
                 let _ = err.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
                 buf
             })
+    });
+
+    // Write stdin on a separate thread after stdout/stderr drains are live.
+    // This keeps the timeout/disconnect loop below active even when the child
+    // never reads stdin and the pipe buffer fills.
+    let stdin_handle = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("exec-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    child_stdin.write_all(data.as_bytes())
+                    // child_stdin is dropped here, closing the pipe → child sees EOF.
+                })
+        })
     });
 
     // Wait for exit with timeout
@@ -4676,6 +4704,19 @@ fn handle_vm_exec(
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
+
+    if let Some(Ok(handle)) = stdin_handle {
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => debug!(error = %e, "stdin writer finished with error"),
+                Err(_) => debug!("stdin writer thread panicked"),
+            }
+        } else {
+            debug!("stdin writer still blocked after command exit; detaching");
+        }
+    }
 
     AgentResponse::Completed {
         exit_code,
@@ -4946,6 +4987,31 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_timeout_is_not_blocked_by_unread_stdin() {
+        let stdin_data = "x".repeat(8 * 1024 * 1024);
+        let start = std::time::Instant::now();
+
+        let response = handle_vm_exec(
+            &["sleep".to_string(), "5".to_string()],
+            &[],
+            None,
+            Some(100),
+            None,
+            Some(&stdin_data),
+        );
+
+        let AgentResponse::Completed { exit_code, .. } = response else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "blocked stdin must not prevent timeout handling"
+        );
+    }
 
     // ========================================================================
     // Streaming file-upload session tests

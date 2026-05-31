@@ -60,10 +60,11 @@ pub async fn exec_command(
     let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
+    let stdin_data = req.stdin.clone();
 
     let start = std::time::Instant::now();
     let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
-        c.vm_exec(command, env, workdir, timeout)
+        c.vm_exec(command, env, workdir, timeout, stdin_data)
     })
     .await?;
     metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
