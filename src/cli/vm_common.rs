@@ -585,6 +585,167 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
 }
 
 // ============================================================================
+// Fork
+// ============================================================================
+
+/// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
+fn control_socket_path(name: &str) -> std::path::PathBuf {
+    vm_data_dir(name).join("control.sock")
+}
+
+/// Mark the current process so the VM it is about to launch (in the inherited
+/// environment of the spawned `_boot-vm`) backs guest RAM with a memfd and
+/// exposes a control socket — the prerequisites for forking it later.
+pub fn enable_forkable_env(name: &str) {
+    std::env::set_var("SMOLVM_FORKABLE", "1");
+    std::env::set_var("SMOLVM_CONTROL_SOCKET", control_socket_path(name));
+}
+
+/// Send a single line command to a VM control socket and return its reply line.
+fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<String> {
+    use smolvm::Error;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock)
+        .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .ok();
+    stream
+        .write_all(format!("{cmd}\n").as_bytes())
+        .map_err(|e| Error::agent("write control socket", e.to_string()))?;
+    let mut reply = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                reply.push(byte[0] as char);
+            }
+            Err(e) => return Err(Error::agent("read control socket", e.to_string())),
+        }
+    }
+    Ok(reply)
+}
+
+/// Fork a running, forkable `golden` machine into a new `clone`.
+///
+/// Freezes the golden (it stays paused as the shared copy-on-write base — its
+/// guest RAM is mapped `MAP_PRIVATE` by clones, so it must not run again while
+/// clones exist), copy-on-write clones its disks, and boots the clone from the
+/// golden's in-memory snapshot.
+pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Result<()> {
+    use smolvm::Error;
+
+    validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
+
+    let db = SmolvmDb::open()?;
+    let golden_rec = db.get_vm(golden)?.ok_or_else(|| Error::vm_not_found(golden))?;
+
+    // The golden must be alive and forkable. We probe the control socket rather
+    // than the vsock agent: after its first fork the golden is frozen (paused)
+    // as the shared base, so an agent ping would fail — but STATUS still answers
+    // (running or paused), and we can fork it again.
+    let ctl = control_socket_path(golden);
+    if !ctl.exists() {
+        return Err(Error::agent(
+            "fork",
+            format!("golden '{golden}' is not running forkable; start it with `machine start --forkable {golden}`"),
+        ));
+    }
+    let status = control_socket_cmd(&ctl, "STATUS").map_err(|e| {
+        Error::agent(
+            "fork",
+            format!("golden '{golden}' control socket not responding ({e}); start it with `machine start --forkable {golden}`"),
+        )
+    })?;
+    if !status.starts_with("OK") {
+        return Err(Error::agent(
+            "fork",
+            format!("golden '{golden}' is not ready to fork: {status}"),
+        ));
+    }
+    if db.get_vm(clone)?.is_some() {
+        return Err(Error::agent(
+            "fork",
+            format!("machine '{clone}' already exists"),
+        ));
+    }
+
+    // Clone dir + snapshot dir.
+    let clone_dir = vm_data_dir(clone);
+    let snapshot_dir = clone_dir.join("snapshot");
+    std::fs::create_dir_all(&snapshot_dir)
+        .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
+
+    // Register the clone in the DB: same config as the golden, but with no
+    // host port forwards (they would collide with the still-running golden;
+    // per-clone network rejuvenation is future work) and no running-state.
+    let mut clone_rec = golden_rec.clone();
+    clone_rec.name = clone.to_string();
+    clone_rec.ports.clear();
+    clone_rec.pid = None;
+    clone_rec.pid_start_time = None;
+    db.insert_vm(clone, &clone_rec)?;
+
+    // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
+    eprintln!("Freezing golden '{golden}' as fork base...");
+    let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()))?;
+    if !reply.starts_with("OK") {
+        let _ = db.remove_vm(clone);
+        return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
+    }
+
+    // Copy-on-write clone the golden's disks. The golden is frozen and its
+    // device workers quiesced, so the disk images are at a consistent boundary.
+    // Copy the `.formatted` marker too, or the clone would reformat and wipe
+    // the golden's data. (`fs::copy` is sparse-aware via copy_file_range on
+    // Linux; reflink/clonefile is a future fast-path.)
+    let gdir = vm_data_dir(golden);
+    for fname in [
+        smolvm::data::storage::STORAGE_DISK_FILENAME,
+        smolvm::data::storage::OVERLAY_DISK_FILENAME,
+    ] {
+        let src = gdir.join(fname);
+        if !src.exists() {
+            continue;
+        }
+        let dst = clone_dir.join(fname);
+        // Sparse-aware copy (only allocated extents) — reflink/clonefile where
+        // the filesystem supports it, else a SEEK_DATA/SEEK_HOLE copy. The disks
+        // are 20/10 GiB nominal but mostly holes, so a plain copy would be huge.
+        smolvm::disk_utils::clone_or_copy_file(&src, &dst)
+            .map_err(|e| Error::agent("clone disk", format!("{fname}: {e}")))?;
+        let src_marker = src.with_extension("formatted");
+        if src_marker.exists() {
+            let _ = std::fs::copy(&src_marker, dst.with_extension("formatted"));
+        }
+    }
+
+    // Boot the clone from the golden's snapshot instead of cold-booting.
+    std::env::set_var("SMOLVM_SNAPSHOT_DIR", &snapshot_dir);
+    if clone_forkable {
+        enable_forkable_env(clone);
+    }
+    eprintln!("Booting clone '{clone}' from snapshot...");
+    let result = start_vm_named(clone, None, None);
+    std::env::remove_var("SMOLVM_SNAPSHOT_DIR");
+    if result.is_ok() {
+        eprintln!(
+            "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
+             (do not start it again while clones exist)."
+        );
+    } else {
+        let _ = db.remove_vm(clone);
+    }
+    result
+}
+
+// ============================================================================
 // Start
 // ============================================================================
 

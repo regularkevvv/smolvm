@@ -138,6 +138,9 @@ pub enum MachineCmd {
     /// Start a machine
     Start(StartCmd),
 
+    /// Fork a running forkable machine into a new clone (CoW memory + disks)
+    Fork(ForkCmd),
+
     /// Stop a running machine
     Stop(StopCmd),
 
@@ -202,6 +205,7 @@ impl MachineCmd {
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
+            MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -1627,6 +1631,11 @@ pub struct StartCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Start as a fork base: back guest RAM with a memfd (CoW-cloneable) and
+    /// expose a control socket so the machine can be forked with `machine fork`.
+    #[arg(long)]
+    pub forkable: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -1637,6 +1646,12 @@ impl StartCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.proxy();
         let no_proxy = self.proxy_opts.no_proxy();
+        if self.forkable {
+            // Read by launcher.rs in the spawned _boot-vm (inherits our env):
+            // memfd-back guest RAM and register a control socket at a known path
+            // so `machine fork` can later freeze this machine as a CoW base.
+            vm_common::enable_forkable_env(&name);
+        }
         match vm_common::start_vm_named(&name, proxy, no_proxy) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
@@ -1646,6 +1661,40 @@ impl StartCmd {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+// ============================================================================
+// Fork Command
+// ============================================================================
+
+/// Fork a running forkable machine into a new clone.
+///
+/// Freezes the source (the "golden") via its control socket, copy-on-write
+/// clones its disks, and boots the new machine from the golden's in-memory
+/// snapshot instead of cold-booting — so the clone comes up already warm
+/// (same processes, same filesystem state), in well under a second.
+///
+/// The golden must have been started with `--forkable`.
+#[derive(Args, Debug)]
+pub struct ForkCmd {
+    /// The running, forkable source machine to clone from.
+    #[arg(value_name = "GOLDEN")]
+    pub golden: String,
+
+    /// Name for the new clone machine.
+    #[arg(value_name = "CLONE")]
+    pub clone: String,
+
+    /// Make the clone itself forkable (memfd RAM + control socket), so it can
+    /// in turn be forked.
+    #[arg(long)]
+    pub forkable: bool,
+}
+
+impl ForkCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::fork_vm(&self.golden, &self.clone, self.forkable)
     }
 }
 
