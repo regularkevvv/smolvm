@@ -52,7 +52,7 @@ tempfile = "3"
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio-stream = "0.1"
 parking_lot = "0.12"

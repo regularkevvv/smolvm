@@ -91,6 +91,59 @@ impl CrunCommand {
         c
     }
 
+    /// Run a container with its console handed back over a socket:
+    /// `crun run --bundle <path> --console-socket <sock> <id>`.
+    ///
+    /// crun creates the container's PTY and sends its master fd to `console_socket`
+    /// (via SCM_RIGHTS), instead of relaying through crun's own stdio. This is the
+    /// only way the agent can own the real console — and therefore drive window
+    /// size / resize, which crun does not propagate in stdio-relay mode. crun's own
+    /// stdio is unused, so it's nulled.
+    pub fn run_with_console(bundle_dir: &Path, container_id: &str, console_socket: &Path) -> Self {
+        let mut c = Self::new();
+        c.cmd.args([
+            "run",
+            "--bundle",
+            &bundle_dir.to_string_lossy(),
+            "--console-socket",
+            &console_socket.to_string_lossy(),
+            container_id,
+        ]);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        // Pipe stderr so the caller can surface crun's reason if the console
+        // handshake fails (and it falls back to a stdio PTY).
+        c.cmd.stderr(Stdio::piped());
+        c
+    }
+
+    /// `crun exec --tty --console-socket <sock> [--env ...] [--cwd <wd>] <id> <cmd...>`.
+    /// The TTY counterpart to [`Self::exec`] that takes the console over a socket
+    /// so the agent owns the real PTY master (for resize). crun's stdio is nulled.
+    pub fn exec_with_console(
+        container_id: &str,
+        env: &[(String, String)],
+        command: &[String],
+        workdir: Option<&str>,
+        console_socket: &Path,
+    ) -> Self {
+        let mut c = Self::new();
+        c.cmd.arg("exec").arg("--tty");
+        c.cmd.arg("--console-socket").arg(console_socket);
+        let env_with_path = ensure_path_in_env(env);
+        for (key, value) in &env_with_path {
+            c.cmd.arg("--env").arg(format!("{}={}", key, value));
+        }
+        if let Some(wd) = workdir {
+            c.cmd.args(["--cwd", wd]);
+        }
+        c.cmd.arg(container_id).args(command);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        c.cmd.stderr(Stdio::piped());
+        c
+    }
+
     /// Run a container detached: `crun run --detach --bundle <path> <id>`
     ///
     /// Returns immediately after the container process is started. The container

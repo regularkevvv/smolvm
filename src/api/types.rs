@@ -118,6 +118,11 @@ pub struct ExecRequest {
     /// Data to pipe to the command's stdin.
     #[serde(default)]
     pub stdin: Option<String>,
+    /// Run the command detached: spawn it in the background and return its PID
+    /// immediately instead of waiting. The process keeps running (a long-lived
+    /// daemon — dev server, agent runner) until it exits or the machine stops.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Environment variable.

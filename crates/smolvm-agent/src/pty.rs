@@ -6,6 +6,9 @@
 
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// RAII wrapper around the master side of a PTY pair.
 ///
@@ -67,6 +70,137 @@ impl PtyMaster {
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+
+    /// Wrap an already-open master fd — e.g. one received from crun over a
+    /// `--console-socket` — as a `PtyMaster`.
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
+        PtyMaster { fd }
+    }
+}
+
+/// A listening AF_UNIX socket that an OCI runtime connects to (via
+/// `--console-socket`) to hand back the master fd of the container's PTY.
+///
+/// crun/runc, when `terminal: true`, create the console PTY themselves and — in
+/// foreground mode — relay byte data between that PTY and their own stdio but do
+/// NOT propagate window-size changes. Taking the master directly over this
+/// socket means the agent owns the container's real console, so
+/// [`PtyMaster::set_window_size`] (and resize events) reach the process's tty.
+pub struct ConsoleSocket {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+impl ConsoleSocket {
+    /// Bind a uniquely-named console socket. `tag` (e.g. the container id) keeps
+    /// concurrent sessions from colliding; only its tail is used to stay within
+    /// the ~108-byte AF_UNIX path limit.
+    pub fn bind(tag: &str) -> io::Result<Self> {
+        let tail: String = {
+            let s = tag.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            let start = s.len().saturating_sub(24);
+            s[start..].to_string()
+        };
+        // The guest root filesystem (and thus /tmp) is read-only, so bind the
+        // socket under the writable storage disk. crun shares this mount
+        // namespace, so it can connect to the same path. Kept short to stay
+        // within the ~108-byte AF_UNIX path limit.
+        let dir = Path::new(crate::paths::STORAGE_ROOT);
+        let path = dir.join(format!("smolvm-con-{}.sock", tail));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        Ok(Self { path, listener })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Accept the runtime's connection and receive the PTY master fd via
+    /// `SCM_RIGHTS`. Bounded by `timeout` so a runtime that never connects (a
+    /// crun failure) can't hang the interactive session.
+    pub fn recv_master(&self, timeout: Duration) -> io::Result<PtyMaster> {
+        let mut pfd = libc::pollfd {
+            fd: self.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "console socket: runtime did not connect",
+            ));
+        }
+        if pr < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (conn, _) = self.listener.accept()?;
+        recv_fd(conn.as_raw_fd()).map(PtyMaster::from_owned_fd)
+    }
+}
+
+impl Drop for ConsoleSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Receive a single fd from a connected unix socket via `SCM_RIGHTS`.
+fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
+    // 8-byte-aligned control buffer (cmsghdr requires size_t alignment).
+    #[repr(C, align(8))]
+    struct AlignedCmsg([u8; 32]);
+    let mut cmsg = AlignedCmsg([0u8; 32]);
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    // SAFETY: zeroed msghdr is valid; pointers below reference live local buffers.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.0.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg.0.len() as _;
+
+    let n = unsafe { libc::recvmsg(sock_fd, &mut msg, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let cptr = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cptr.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "console socket: no SCM_RIGHTS control message",
+        ));
+    }
+    // SAFETY: cptr is non-null and points into our cmsg buffer.
+    let chdr = unsafe { &*cptr };
+    if chdr.cmsg_level != libc::SOL_SOCKET || chdr.cmsg_type != libc::SCM_RIGHTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "console socket: unexpected control message",
+        ));
+    }
+    let mut fd: RawFd = -1;
+    // SAFETY: CMSG_DATA points to at least size_of::<RawFd>() bytes here.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cptr),
+            &mut fd as *mut RawFd as *mut u8,
+            std::mem::size_of::<RawFd>(),
+        );
+    }
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "console socket: invalid fd received",
+        ));
+    }
+    // SAFETY: fd was just received from the kernel and is owned by us now.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Allocate a new PTY pair with the given initial window size.

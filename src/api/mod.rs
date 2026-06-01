@@ -148,8 +148,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Node capacity introspection (polled by a fleet node-agent over HTTP).
     let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
 
-    // SSE logs route (no timeout - streams indefinitely)
-    let logs_route = Router::new().route("/{id}/logs", get(handlers::exec::stream_logs));
+    // Long-lived streaming routes (no request timeout): SSE logs and the
+    // interactive PTY WebSocket both outlive the 5-minute API timeout.
+    let logs_route = Router::new()
+        .route("/{id}/logs", get(handlers::exec::stream_logs))
+        .route(
+            "/{id}/exec/interactive",
+            get(handlers::exec::exec_interactive),
+        );
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()
