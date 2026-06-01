@@ -648,6 +648,19 @@ pub fn fork_vm(
 
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
 
+    // Nested fork is unsupported: a clone boots from a copy-on-write MAP_PRIVATE
+    // mapping of the golden's RAM, not a fresh memfd, so it cannot itself be
+    // re-forked (its FORK would fail with "no memfd-backed RAM"). Reject
+    // `--forkable` up front instead of producing a clone that looks forkable but
+    // isn't.
+    if clone_forkable {
+        return Err(Error::agent(
+            "fork",
+            "nested fork is not supported: a clone cannot be re-forked, so `--forkable` \
+             on a fork has no effect (drop it)",
+        ));
+    }
+
     let db = SmolvmDb::open()?;
     let golden_rec = db
         .get_vm(golden)?
@@ -731,6 +744,7 @@ pub fn fork_vm(
     let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()))?;
     if !reply.starts_with("OK") {
         let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(&clone_dir);
         return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
     }
 
@@ -802,14 +816,12 @@ pub fn fork_vm(
     };
     if let Err(e) = clone_disks() {
         let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(&clone_dir);
         return Err(e);
     }
 
     // Boot the clone from the golden's snapshot instead of cold-booting.
     std::env::set_var("SMOLVM_SNAPSHOT_DIR", &snapshot_dir);
-    if clone_forkable {
-        enable_forkable_env(clone);
-    }
     eprintln!("Booting clone '{clone}' from snapshot...");
     let result = start_vm_named(clone, None, None, /* from_snapshot */ true);
     std::env::remove_var("SMOLVM_SNAPSHOT_DIR");
@@ -821,6 +833,7 @@ pub fn fork_vm(
         );
     } else {
         let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(&clone_dir);
     }
     result
 }
@@ -1650,18 +1663,23 @@ where
         println!("Machine '{}': running{}", label, pid_suffix);
         extra(&manager);
         manager.detach();
-    } else {
-        // Only report "not running" when the machine actually exists.
-        // A missing DB record with an explicit name is "not found".
-        if let Some(ref n) = name {
-            let exists = SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(n).ok().flatten())
-                .is_some();
-            if !exists {
-                return Err(smolvm::Error::vm_not_found(n));
+    } else if let Some(ref n) = name {
+        // Agent not reachable. Report the precise state from the registry
+        // (stopped / failed / created / unreachable), consistent with
+        // `machine list`, instead of a flat "not running". A missing record
+        // with an explicit name is "not found".
+        match SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(n).ok().flatten())
+        {
+            Some(record) => {
+                let state = smolvm::agent::state_probe::resolve_state(n, &record);
+                println!("Machine '{}': {}", label, state);
             }
+            None => return Err(smolvm::Error::vm_not_found(n)),
         }
+    } else {
+        // Default/unnamed VM: no record to resolve.
         println!("Machine '{}': not running", label);
     }
 
