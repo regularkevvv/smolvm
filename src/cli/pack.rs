@@ -439,6 +439,10 @@ impl PackCreateCmd {
             }
         }
 
+        // Carry Smolfile [secrets] refs into the manifest. Refs only — the
+        // plaintext is resolved on the run host at exec time, never packed.
+        manifest.secret_refs = pack_config.secret_refs.clone();
+
         // Smolfile workdir overrides image workdir
         if pack_config.workdir.is_some() {
             manifest.workdir = pack_config.workdir;
@@ -733,6 +737,12 @@ impl PackCreateCmd {
                 manifest.env.push(e.clone());
             }
         }
+
+        // Baseline secret refs from the source VM record, then layer the
+        // Smolfile [secrets] on top (Smolfile wins on key collisions). Refs
+        // only — plaintext is resolved on the run host, never packed.
+        manifest.secret_refs = vm.secret_refs.clone();
+        manifest.secret_refs.extend(pack_config.secret_refs.clone());
 
         // Smolfile workdir overrides VmRecord workdir
         if pack_config.workdir.is_some() {

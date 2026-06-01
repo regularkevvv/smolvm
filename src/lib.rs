@@ -77,6 +77,7 @@ pub mod network;
 pub mod platform;
 pub mod process;
 pub mod registry;
+pub mod secrets;
 pub mod settings;
 pub mod smolfile;
 pub mod storage;

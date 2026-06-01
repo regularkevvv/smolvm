@@ -9,6 +9,7 @@ pub mod pack;
 pub mod pack_run;
 pub mod parsers;
 pub mod proxy_opts;
+pub mod secret;
 pub mod serve;
 pub mod smolfile;
 pub mod vm_common;

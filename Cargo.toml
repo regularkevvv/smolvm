@@ -47,6 +47,15 @@ sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+base64 = { workspace = true }
+
+# Secrets management.
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rpassword = "7"
+fs2 = "0.4"
 humantime = "2"
 tempfile = "3"
 
