@@ -304,6 +304,10 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // TODO(reflink): try a FICLONE ioctl before sparse_copy for true
+        // copy-on-write on btrfs/XFS hosts. (Fork clones already get
+        // filesystem-independent block CoW via qcow2 overlays; this would only
+        // speed up the remaining full-copy callers on reflink-capable hosts.)
         match sparse_copy(src, dst) {
             Ok(bytes) => {
                 tracing::debug!(

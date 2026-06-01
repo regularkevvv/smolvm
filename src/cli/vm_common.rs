@@ -722,6 +722,8 @@ pub fn fork_vm(
         }
         clone_rec.ports = remapped;
     }
+    clone_rec.golden = Some(golden.to_string());
+    let gdir = vm_data_dir(golden);
     db.insert_vm(clone, &clone_rec)?;
 
     // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
@@ -732,30 +734,75 @@ pub fn fork_vm(
         return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
     }
 
-    // Copy-on-write clone the golden's disks. The golden is frozen and its
-    // device workers quiesced, so the disk images are at a consistent boundary.
-    // Copy the `.formatted` marker too, or the clone would reformat and wipe
-    // the golden's data. (`fs::copy` is sparse-aware via copy_file_range on
-    // Linux; reflink/clonefile is a future fast-path.)
-    let gdir = vm_data_dir(golden);
-    for fname in [
-        smolvm::data::storage::STORAGE_DISK_FILENAME,
-        smolvm::data::storage::OVERLAY_DISK_FILENAME,
-    ] {
-        let src = gdir.join(fname);
-        if !src.exists() {
-            continue;
+    // Give the clone its own disks. The golden is frozen with its block workers
+    // quiesced and flushed, so its images are a consistent backing. On Linux
+    // each disk is a qcow2 copy-on-write overlay over the golden's — filesystem
+    // independent, so the overlay starts near-empty and the fork is O(metadata)
+    // regardless of how much data the golden holds. macOS clonefiles the disks
+    // (APFS CoW). Either way the `.formatted` marker is copied so the clone
+    // never reformats and wipes the inherited filesystem.
+    let clone_disks = || -> smolvm::Result<()> {
+        // The golden's actual disks that exist, resolved by file presence
+        // (`.qcow2` if the golden is itself a clone, else `.raw`) — the same
+        // single source of truth the agent manager uses. Each entry pairs the
+        // canonical `.raw` filename (for naming the clone's disk) with the
+        // golden's real backing file and its format.
+        let disks: Vec<(&str, std::path::PathBuf, smolvm::data::disk::DiskFormat)> = [
+            smolvm::data::storage::STORAGE_DISK_FILENAME,
+            smolvm::data::storage::OVERLAY_DISK_FILENAME,
+        ]
+        .into_iter()
+        .map(|raw| {
+            let (src, fmt) = smolvm::agent::resolve_disk_image(&gdir, raw);
+            (raw, src, fmt)
+        })
+        .filter(|(_, src, _)| src.exists())
+        .collect();
+
+        #[cfg(target_os = "linux")]
+        {
+            // Each clone disk is a qcow2 CoW overlay over the golden's disk.
+            // Build all overlay specs first so libkrun is loaded once for the
+            // batch (absolute backing path: it's written verbatim into the
+            // overlay header), then copy the `.formatted` markers so the clone
+            // never reformats and wipes the inherited filesystem.
+            let mut specs = Vec::with_capacity(disks.len());
+            for (raw, src, fmt) in &disks {
+                let base = src
+                    .canonicalize()
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+                let overlay = clone_dir.join(std::path::Path::new(raw).with_extension("qcow2"));
+                specs.push((overlay, base, *fmt));
+            }
+            smolvm::agent::create_disk_overlays(&specs)?;
+            for (raw, _, _) in &disks {
+                // Marker basename is the disk stem + ".formatted" (same for the
+                // golden's `.raw`/`.qcow2` and the clone's `.qcow2`).
+                let marker = std::path::Path::new(raw).with_extension("formatted");
+                let src_marker = gdir.join(&marker);
+                if src_marker.exists() {
+                    let _ = std::fs::copy(&src_marker, clone_dir.join(&marker));
+                }
+            }
         }
-        let dst = clone_dir.join(fname);
-        // Sparse-aware copy (only allocated extents) — reflink/clonefile where
-        // the filesystem supports it, else a SEEK_DATA/SEEK_HOLE copy. The disks
-        // are 20/10 GiB nominal but mostly holes, so a plain copy would be huge.
-        smolvm::disk_utils::clone_or_copy_file(&src, &dst)
-            .map_err(|e| Error::agent("clone disk", format!("{fname}: {e}")))?;
-        let src_marker = src.with_extension("formatted");
-        if src_marker.exists() {
-            let _ = std::fs::copy(&src_marker, dst.with_extension("formatted"));
+        #[cfg(target_os = "macos")]
+        {
+            // macOS uses clonefile (APFS CoW), keeping the golden's disk format.
+            for (_, src, _) in &disks {
+                let dst = clone_dir.join(src.file_name().unwrap());
+                smolvm::disk_utils::clone_or_copy_file(src, &dst)
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+                let src_marker = src.with_extension("formatted");
+                if src_marker.exists() {
+                    let _ = std::fs::copy(&src_marker, dst.with_extension("formatted"));
+                }
+            }
         }
+        Ok(())
+    };
+    if let Err(e) = clone_disks() {
+        let _ = db.remove_vm(clone);
+        return Err(e);
     }
 
     // Boot the clone from the golden's snapshot instead of cold-booting.
@@ -1491,6 +1538,29 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         .get_vm(name)
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
+
+    // A golden's disks are the copy-on-write backing for its clones' overlays,
+    // so it must outlive them. Refuse to delete a golden while clones depend on
+    // it (unless forced, in which case the clones' overlays are left dangling).
+    let dependent_clones = SmolvmDb::open()?.dependent_clones(name)?;
+    if !dependent_clones.is_empty() {
+        if !force {
+            return Err(smolvm::Error::agent(
+                "delete",
+                format!(
+                    "machine '{name}' is the fork base for {} clone(s) ({}); \
+                     delete the clones first, or use --force to break them",
+                    dependent_clones.len(),
+                    dependent_clones.join(", ")
+                ),
+            ));
+        }
+        tracing::warn!(
+            golden = name,
+            clones = %dependent_clones.join(", "),
+            "force-deleting a golden; dependent clones' disk overlays will dangle"
+        );
+    }
 
     // Stop if running (machine run does this). Use the shared
     // resolver so an `Unreachable` VM (live PID, dead agent) is also

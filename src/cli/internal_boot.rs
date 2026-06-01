@@ -8,7 +8,21 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
-use std::path::PathBuf;
+use smolvm::data::disk::{DiskFormat, DiskType};
+use smolvm::storage::VmDisk;
+use std::path::{Path, PathBuf};
+
+/// Open a boot disk honoring its on-disk format. A fork clone's disk path ends
+/// in `.qcow2` (a copy-on-write overlay, opened as-is over its backing image);
+/// every other disk is a raw image that may need creating/formatting. The path
+/// is the single source of truth for the format — see `agent::resolve_disk_image`.
+fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDisk<K>> {
+    if path.extension().and_then(|e| e.to_str()) == Some("qcow2") {
+        VmDisk::<K>::open_existing_with_format(path, DiskFormat::Qcow2)
+    } else {
+        VmDisk::<K>::open_or_create_at(path, size_gb)
+    }
+}
 
 /// Run the boot subprocess.
 ///
@@ -225,8 +239,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     }
     proc_timing!("fds closed");
 
-    // Open storage and overlay disks
-    let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
+    // Open storage and overlay disks, honoring qcow2 fork-clone overlays.
+    let storage_disk = match open_boot_disk::<smolvm::storage::Storage>(
         &config.storage_disk_path,
         config.storage_size_gb,
     ) {
@@ -241,7 +255,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
     proc_timing!("storage opened");
 
-    let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
+    let overlay_disk = match open_boot_disk::<smolvm::storage::Overlay>(
         &config.overlay_disk_path,
         config.overlay_size_gb,
     ) {
