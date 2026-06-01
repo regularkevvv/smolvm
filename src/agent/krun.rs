@@ -41,7 +41,14 @@ pub struct KrunFunctions {
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
+    pub set_egress_policy: Option<
+        unsafe extern "C" fn(
+            u32,
+            *const *const libc::c_char,
+            *const *const libc::c_char,
+            *const *const libc::c_char,
+        ) -> i32,
+    >,
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,

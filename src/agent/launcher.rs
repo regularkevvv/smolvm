@@ -394,19 +394,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
-                if let Some(ref cidrs) = resources.allowed_cidrs {
+                // Egress policy: static CIDRs plus DNS allow-host filtering
+                // enforced inside libkrun. When allow-hosts are set, the guest's
+                // UDP DNS queries to port 53 are intercepted and forwarded only
+                // to the host-trusted resolver; A/AAAA answers are learned as
+                // temporary allowed IPs. The guest-side DNS proxy is left off
+                // (see below) so those queries leave as real UDP datagrams.
+                let egress_hosts = egress_refresh_hosts.clone().unwrap_or_default();
+                if resources.allowed_cidrs.is_some() || !egress_hosts.is_empty() {
                     let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                             Update libkrun or remove --allow-cidr flags.",
+                             Update libkrun or remove --allow-cidr/--allow-host flags.",
                         ));
                     };
 
-                    let mut all_cidrs = cidrs.clone();
+                    // CIDRs (plus the resolver IP via ensure_dns_in_cidrs) — a
+                    // null-terminated array.
+                    let mut all_cidrs = resources.allowed_cidrs.clone().unwrap_or_default();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-
                     let cidr_cstrings: Vec<CString> = all_cidrs
                         .iter()
                         .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
@@ -415,7 +423,28 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
 
-                    if set_egress(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    // Allow-host list + trusted resolver, only when hosts are set.
+                    let host_cstrings: Vec<CString> = egress_hosts
+                        .iter()
+                        .map(|h| CString::new(h.as_str()).expect("host cannot contain null bytes"))
+                        .collect();
+                    let mut host_ptrs: Vec<*const libc::c_char> =
+                        host_cstrings.iter().map(|s| s.as_ptr()).collect();
+                    host_ptrs.push(std::ptr::null());
+
+                    let resolver_cstring =
+                        CString::new(crate::data::network::default_dns_addr().to_string())
+                            .expect("resolver IP has no null bytes");
+                    let resolver_ptrs: Vec<*const libc::c_char> =
+                        vec![resolver_cstring.as_ptr(), std::ptr::null()];
+
+                    let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
+                        (std::ptr::null(), std::ptr::null())
+                    } else {
+                        (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
+                    };
+
+                    if set_egress(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) < 0 {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
@@ -706,10 +735,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Tell the agent to start DNS filtering proxy
-        if dns_filter_socket.is_some() {
-            env_strings.push(cstr(&format!("{}=1", guest_env::DNS_FILTER)));
-        }
+        // DNS allow-host filtering is now enforced inside libkrun (see the
+        // egress policy above). The guest-side DNS proxy is intentionally NOT
+        // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so
+        // its UDP DNS queries leave as real datagrams and are intercepted at the
+        // TSI layer. `dns_filter_socket` is retained for now but unused on the
+        // guest path.
+        let _ = &dns_filter_socket;
 
         if let Some(network) = guest_network {
             env_strings.push(cstr(&format!(
