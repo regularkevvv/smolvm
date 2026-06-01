@@ -80,7 +80,13 @@ impl KrunFunctions {
         let lib_path_c = CString::new(lib_path.to_string_lossy().as_bytes())
             .map_err(|_| "invalid library path")?;
 
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        // RTLD_LAZY (not RTLD_NOW): a single libkrun built with the GPU feature
+        // references virglrenderer, but on Linux that NEEDED entry is stripped at
+        // package time so a host without virglrenderer can still load it. Lazy
+        // binding defers the virgl symbols until the GPU path actually calls them;
+        // preload_linux_gpu_dependencies() loads virglrenderer first when a GPU
+        // host has it. Non-GPU hosts never bind those symbols.
+        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
         if handle.is_null() {
             let err = dlerror_message();
             libc::dlclose(fw_handle);
@@ -167,6 +173,14 @@ fn preload_linux_gpu_dependencies(lib_dir: &Path) {
         let path = lib_dir.join(lib_name);
         if path.exists() {
             dlopen_global(&path);
+        } else {
+            // Not bundled: try the host's copy by soname. A GPU host has
+            // virglrenderer (and its X11/DRM/Mesa chain) installed system-wide;
+            // loading it RTLD_GLOBAL here lets libkrun's lazily-bound virgl
+            // symbols resolve when the GPU path runs. Best-effort — on a non-GPU
+            // host it simply isn't found, which is fine: those symbols are never
+            // called, and the libkrun NEEDED entry was stripped at package time.
+            dlopen_global_soname(lib_name);
         }
     }
 
@@ -198,4 +212,16 @@ fn dlopen_global(path: &Path) -> bool {
     }
 
     true
+}
+
+/// Load a library by soname (no path), letting the dynamic loader search the
+/// host's standard library directories. Used to pick up a GPU host's
+/// system-installed virglrenderer when it isn't bundled. Best-effort: on a
+/// non-GPU host the library is absent, which is expected and not an error.
+#[cfg(target_os = "linux")]
+fn dlopen_global_soname(soname: &str) -> bool {
+    let Ok(soname_c) = CString::new(soname) else {
+        return false;
+    };
+    unsafe { !libc::dlopen(soname_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL).is_null() }
 }
