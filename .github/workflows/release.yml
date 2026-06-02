@@ -136,7 +136,7 @@ jobs:
             agent_arch: x86_64
             lib_dir: lib/linux-x86_64
           - platform: linux-arm64
-            runner: ubuntu-24.04-arm64
+            runner: ubuntu-24.04-arm
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib/linux-aarch64
