@@ -10,6 +10,7 @@ repository = "https://github.com/smol-machines/smolvm"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+smolvm-protocol = { path = "../smolvm-protocol" }
 tar = "0.4"
 zstd = "0.13"
 crc32fast = "1.4"

@@ -21,8 +21,10 @@ use serde::{Deserialize, Serialize};
 pub mod guest_env;
 pub mod image_ref;
 pub mod retry;
+pub mod secrets;
 
 pub use image_ref::normalize_image_ref;
+pub use secrets::{SecretRef, SecretSourceKind};
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
 ///

@@ -615,6 +615,14 @@ impl RunCmd {
             None
         };
 
+        // Resolve Smolfile [secrets] for this launch. Tuples are plaintext;
+        // do not log them. Zeroizing buffers were scrubbed inside the helper.
+        // These are merged into `env`/`init_env` below but never flow into
+        // `params.env`, so the plaintext values never touch the persisted
+        // VM record — only the refs are stored (via DefaultVmOverrides), and
+        // they get re-resolved at each subsequent `machine start`.
+        let resolved_secrets = vm_common::resolve_secret_refs_for_env(&params.secret_refs)?;
+
         if freshly_started && !params.init.is_empty() {
             // Route through `run_init_commands` so init runs inside the
             // container when an image is set (so package managers like
@@ -636,7 +644,8 @@ impl RunCmd {
                     )
                 })
                 .collect();
-            let init_env = parse_env_list(&params.env);
+            let mut init_env = parse_env_list(&params.env);
+            init_env.extend(resolved_secrets.iter().cloned());
             // Use the machine name as the overlay ID so any rootfs changes
             // init makes (e.g. `pacman -S git`) are visible to a
             // subsequent `machine exec`. The exec path resolves the
@@ -691,7 +700,8 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let env = parse_env_list(&params.env);
+        let mut env = parse_env_list(&params.env);
+        env.extend(resolved_secrets.iter().cloned());
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
@@ -738,6 +748,10 @@ impl RunCmd {
                             &vm_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
+                                // Persist the REFS (re-resolved at each start via
+                                // record_env_with_secrets), never the resolved
+                                // plaintext — see `env` below.
+                                secret_refs: params.secret_refs.clone(),
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
@@ -748,7 +762,16 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: defaults.env.clone(),
+                                // Strip resolved secret values so plaintext never
+                                // reaches the DB/pack record. defaults.env still
+                                // carries them for RUNNING the container above; the
+                                // record keeps only refs + non-secret env.
+                                env: defaults
+                                    .env
+                                    .iter()
+                                    .filter(|(k, _)| !params.secret_refs.contains_key(k))
+                                    .cloned()
+                                    .collect(),
                                 workdir: defaults.workdir.clone(),
                                 user: defaults.user.clone(),
                                 image: Some(img.clone()),
@@ -877,6 +900,9 @@ impl RunCmd {
                         &vm_name,
                         manager.child_pid(),
                         Some(DefaultVmOverrides {
+                            // Persist the refs so secrets re-resolve on restart
+                            // (env below is already secret-free: parse_env_list).
+                            secret_refs: params.secret_refs.clone(),
                             cpus: params.cpus,
                             mem: params.mem,
                             mounts: mount_tuples,
@@ -1125,6 +1151,16 @@ impl ExecCmd {
             .map(|r| mounts_to_virtiofs_bindings(&r.host_mounts()))
             .unwrap_or_default();
 
+        // Base env for the exec: the record's persisted `env` plus its
+        // `secret_refs` resolved to plaintext on the host (RecordReplay scope).
+        // CLI `--env` flags are layered on top via `merge_env_overrides`. The
+        // resolved plaintext lives only in this local for the exec's duration —
+        // it is never written back to the record or the DB.
+        let record_env: Vec<(String, String)> = match record.as_ref() {
+            Some(r) => vm_common::record_env_with_secrets(r)?,
+            None => Vec::new(),
+        };
+
         if let Some(ref image) = record_image {
             let image_info = match client.query(image) {
                 Ok(info) => info,
@@ -1137,10 +1173,7 @@ impl ExecCmd {
                     None
                 }
             };
-            let configured_env = vm_common::merge_env_overrides(
-                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &env,
-            );
+            let configured_env = vm_common::merge_env_overrides(&record_env, &env);
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &configured_env,
@@ -1187,11 +1220,8 @@ impl ExecCmd {
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
-            // Merge record env (from create/update) with CLI env, same as image path.
-            let env = vm_common::merge_env_overrides(
-                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &env,
-            );
+            // Merge record env + resolved secrets with CLI env, same as image path.
+            let env = vm_common::merge_env_overrides(&record_env, &env);
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
@@ -1525,7 +1555,26 @@ impl CreateCmd {
             manifest.mem
         };
 
+        // A .smolmachine is an untrusted, portable artifact: validate its secret
+        // refs under the Untrusted scope so only `from_store` survives. A packed
+        // `from_env`/`from_file` ref would otherwise read THIS host's env/files at
+        // exec time — reject at create rather than carry an exfil primitive.
+        for (key, r) in &manifest.secret_refs {
+            smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+                |e| {
+                    smolvm::Error::config(
+                        "create from .smolmachine",
+                        format!(
+                            "secret '{}': {} (packs may only carry from_store refs)",
+                            key, e
+                        ),
+                    )
+                },
+            )?;
+        }
+
         let params = vm_common::CreateVmParams {
+            secret_refs: manifest.secret_refs,
             name,
             image: Some(manifest.image),
             entrypoint: manifest.entrypoint,

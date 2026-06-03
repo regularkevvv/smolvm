@@ -13,8 +13,10 @@ use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
+use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
+use std::collections::BTreeMap;
 use std::io::Write;
 
 // ============================================================================
@@ -436,6 +438,39 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
+    /// Secret refs from Smolfile `[secrets]`. The refs themselves are
+    /// persisted to the VM record (they are not sensitive); resolved
+    /// plaintext values are produced per-launch and never touch the DB.
+    pub secret_refs: BTreeMap<String, SecretRef>,
+}
+
+/// Resolve refs supplied by a trusted-local caller (CLI with a Smolfile passed
+/// by the host user) into `(name, value)` env pairs. Empty vec if no refs, so
+/// callers can unconditionally `.extend()`. Resolved values live in a
+/// `Zeroizing<String>` inside `resolve_refs_to_env` and are scrubbed as soon as
+/// it returns — the caller must not log them.
+pub fn resolve_secret_refs_for_env(
+    refs: &BTreeMap<String, SecretRef>,
+) -> smolvm::Result<Vec<(String, String)>> {
+    smolvm::secrets::resolve_refs_to_env(refs, smolvm::secrets::ResolutionScope::TrustedLocal)
+        .map(smolvm::secrets::expose_into_env)
+}
+
+/// Build the exec-time env for a persistent VM: the record's own `env`
+/// (`KEY=VALUE` strings) plus freshly resolved `secret_refs`, formatted the
+/// same way. Called at `machine start` (init + entrypoint) and `machine exec`.
+/// Scope is `RecordReplay` — the refs were written by a trusted-local actor at
+/// create time. The resolved plaintext stays in the returned vector and never
+/// touches the record or the DB.
+pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
+    let mut env = record.env.clone();
+    env.extend(smolvm::secrets::expose_into_env(
+        smolvm::secrets::resolve_refs_to_env(
+            &record.secret_refs,
+            smolvm::secrets::ResolutionScope::RecordReplay,
+        )?,
+    ));
+    Ok(env)
 }
 
 /// Create a named machine configuration (does not start it).
@@ -469,6 +504,16 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     // Parse environment variables for init
     let env = smolvm::util::parse_env_list(&params.env);
 
+    // Validate every ref against the CLI trust scope before persisting.
+    // The CLI caller is `TrustedLocal`, so all source kinds are allowed,
+    // but structural rules (exactly one source, absolute from_file paths)
+    // still apply and catch Smolfile typos before they reach the DB.
+    for (name, r) in &params.secret_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::TrustedLocal).map_err(
+            |e| smolvm::Error::config("create machine", format!("secret '{}': {}", name, e)),
+        )?;
+    }
+
     // Create record with restart policy if configured
     let restart = smolvm::config::RestartConfig {
         policy: params
@@ -489,6 +534,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     );
     record.init = params.init.clone();
     record.env = env;
+    record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
@@ -701,6 +747,12 @@ pub fn start_vm_named(
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
+    // Resolve secret refs to plaintext on the host and inject them only into
+    // the env handed to guest commands (init + workload entrypoint). Only the
+    // refs persist on the record/DB; the resolved plaintext lives in `exec_env`
+    // for the duration of this call and never leaves the host or reaches the DB.
+    let exec_env = record_env_with_secrets(&record)?;
+
     // On first boot, pull the image and run init commands. On subsequent
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
@@ -727,7 +779,7 @@ pub fn start_vm_named(
             InitRunContext {
                 image: record.image.as_deref(),
                 image_info: image_info.as_ref(),
-                env: &record.env,
+                env: &exec_env,
                 workdir: record.workdir.as_deref(),
                 record_mounts: &record.mounts,
                 overlay_id: name,
@@ -765,7 +817,7 @@ pub fn start_vm_named(
         let mount_bindings =
             crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
         let bg_config = smolvm::agent::RunConfig::new(img, cmd)
-            .with_env(record.env.clone())
+            .with_env(exec_env.clone())
             .with_workdir(record.workdir.clone())
             .with_user(record.user.clone())
             .with_mounts(mount_bindings)
@@ -782,9 +834,11 @@ pub fn start_vm_named(
         let mut bare_cmd = record.entrypoint.clone();
         bare_cmd.extend(record.cmd.clone());
         if !bare_cmd.is_empty() {
-            let env = record.env.clone();
+            // Reuse the secrets already resolved into `exec_env` above — avoids
+            // a second store load + decrypt and a duplicate audit-log record.
+            // The plaintext stays in this vector and never touches the record/DB.
             let (exit_code, stdout, stderr) =
-                client.vm_exec(bare_cmd, env, record.workdir.clone(), None, None)?;
+                client.vm_exec(bare_cmd, exec_env, record.workdir.clone(), None, None)?;
             if !stdout.is_empty() {
                 let _ = std::io::stdout().write_all(&stdout);
             }
@@ -854,6 +908,7 @@ pub fn persist_named_running(
                 r.init = o.init.clone();
                 r.init_completed = false;
                 r.env = o.env.clone();
+                r.secret_refs = o.secret_refs.clone();
                 r.workdir = o.workdir.clone();
                 r.user = o.user.clone();
                 r.image = o.image.clone();
@@ -888,6 +943,7 @@ pub struct DefaultVmOverrides {
     pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub secret_refs: BTreeMap<String, SecretRef>,
     pub workdir: Option<String>,
     pub user: Option<String>,
     pub image: Option<String>,
@@ -974,6 +1030,10 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
+            // Resolve secret refs to plaintext on the host for init only; refs
+            // (not values) persist on the record, the plaintext stays here.
+            let exec_env = record_env_with_secrets(&record)?;
+
             let image_info = if let Some(ref image) = record.image {
                 eprintln!("Pulling {}...", image);
                 Some(crate::cli::pull_with_progress(
@@ -993,7 +1053,7 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
                 InitRunContext {
                     image: record.image.as_deref(),
                     image_info: image_info.as_ref(),
-                    env: &record.env,
+                    env: &exec_env,
                     workdir: record.workdir.as_deref(),
                     record_mounts: &record.mounts,
                     overlay_id: "default",

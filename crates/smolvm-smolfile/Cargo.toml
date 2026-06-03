@@ -11,6 +11,7 @@ keywords = ["smolvm", "microvm", "configuration"]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+smolvm-protocol = { path = "../smolvm-protocol" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -108,8 +108,19 @@ pub async fn exec_command(
         }));
     }
 
+    // Env precedence (low → high): req.env (caller-plaintext) →
+    // record.secret_refs (persisted by a TrustedLocal actor) →
+    // req.secrets (ad-hoc, Untrusted). Validation of req.secrets
+    // happens before resolution so structural/scope violations
+    // surface as 400 without the resolution audit firing.
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+
     let command = req.command.clone();
-    let env = EnvVar::to_tuples(&req.env);
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
@@ -200,8 +211,14 @@ pub async fn exec_stream(
         .await
         .map_err(classify_ensure_running_error)?;
 
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+
     let command = req.command.clone();
-    let env = EnvVar::to_tuples(&req.env);
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
@@ -306,9 +323,15 @@ pub async fn run_command(
         .await
         .map_err(classify_ensure_running_error)?;
 
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+
     let image = req.image.clone();
     let command = req.command.clone();
-    let env = EnvVar::to_tuples(&req.env);
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 

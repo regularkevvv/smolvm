@@ -1,7 +1,19 @@
 //! JSON request and response types for the API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
+
+/// Map of guest-side env var names to secret refs.
+///
+/// Present on every exec-like endpoint and on `CreateMachineRequest`.
+/// Every entry is validated under `ResolutionScope::Untrusted` before
+/// it's acted on — the HTTP API treats every caller as untrusted
+/// regardless of where the server is bound, so only `from_store` refs
+/// are accepted. `from_env` and `from_file` are rejected with 400.
+///
+/// Capped at `MAX_REQ_SECRETS_PER_REQUEST` entries per request.
+pub type RequestSecretRefs = BTreeMap<String, smolvm_protocol::SecretRef>;
 
 // ============================================================================
 // Machine Types
@@ -107,6 +119,11 @@ pub struct ExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Only `from_store` is honored; other source
+    /// kinds return 400. See `RequestSecretRefs`.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     #[schema(example = "/workspace")]
@@ -181,6 +198,10 @@ pub struct RunRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Only `from_store` is honored.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
@@ -411,6 +432,15 @@ pub struct CreateMachineRequest {
     /// `.smolmachine`. Takes precedence over any persisted registry credential.
     #[serde(default)]
     pub registry_identity_token: Option<String>,
+    /// Secret refs attached to the machine. Resolved at every
+    /// subsequent exec against the host's store. Only `from_store` is
+    /// accepted — `from_env`/`from_file` on the API surface would let
+    /// an untrusted caller exfiltrate the server process's env or
+    /// read arbitrary host files; use the CLI `machine create` path
+    /// for those source kinds.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
 }
 
 /// Request to execute a command in a machine.
@@ -423,6 +453,10 @@ pub struct MachineExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Only `from_store` is honored.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
