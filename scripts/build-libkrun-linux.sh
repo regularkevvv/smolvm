@@ -21,6 +21,11 @@
 # Usage:  ./scripts/build-libkrun-linux.sh
 #   GPU=0                 skip the GPU feature (drops the virglrenderer dep)
 #   SKIP_DEPS=1           assume build deps are already installed
+#   SKIP_LIBKRUNFW=1      reuse the committed lib/linux-<arch>/libkrunfw.so and
+#                         rebuild ONLY libkrun. libkrunfw is host-glibc-independent
+#                         (it wraps a guest-kernel blob; its floor is GLIBC_2.2),
+#                         so when the goal is lowering libkrun's glibc floor there's
+#                         no need to recompile the kernel — skips the slow step.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -63,8 +68,15 @@ if [ -d .git ]; then
     git submodule update --init libkrun libkrunfw || true
     git lfs pull 2>/dev/null || true
 fi
-[ -f libkrunfw/Makefile ] && [ -d libkrun/src ] \
-    || { echo "ERROR: libkrun/ and libkrunfw/ source must be present (clone or rsync them here)." >&2; exit 1; }
+[ -d libkrun/src ] \
+    || { echo "ERROR: libkrun/ source must be present (clone or rsync it here)." >&2; exit 1; }
+# Only the libkrunfw kernel source is needed when we actually rebuild it — under
+# SKIP_LIBKRUNFW the committed lib/linux-<arch>/libkrunfw.so is reused, so a
+# light rsync of just libkrun/ + lib/ is enough (no multi-GB kernel tree).
+if [[ "${SKIP_LIBKRUNFW:-0}" != "1" ]]; then
+    [ -f libkrunfw/Makefile ] \
+        || { echo "ERROR: libkrunfw/ source must be present (or set SKIP_LIBKRUNFW=1 to reuse the committed lib)." >&2; exit 1; }
+fi
 
 # bindgen needs to find libclang at runtime on some distros.
 if [[ -z "${LIBCLANG_PATH:-}" ]]; then
@@ -73,13 +85,18 @@ if [[ -z "${LIBCLANG_PATH:-}" ]]; then
 fi
 
 # --- 2. libkrunfw (guest kernel) ---------------------------------------------
-echo "--- building libkrunfw (kernel ${ARCH}; this is the slow step) ---"
-# Build from INSIDE the dir, NOT `make -C`: `-C` auto-enables -w (print-dir),
-# which lands in MAKEFLAGS as a bare `w`; the kernel's `$(MAKE) $(MAKEFLAGS)`
-# recipe then dies with "No rule to make target 'w'". -j scales the kernel build.
-( cd libkrunfw && make clean >/dev/null 2>&1 || true; make -j"$(nproc)" GUESTARCH="${ARCH}" )
-KRUNFW_SO="$(ls -1 libkrunfw/libkrunfw.so.*.*.* 2>/dev/null | head -1)"
-[[ -n "$KRUNFW_SO" ]] || { echo "ERROR: libkrunfw build produced no .so" >&2; exit 1; }
+if [[ "${SKIP_LIBKRUNFW:-0}" == "1" ]]; then
+    echo "--- SKIP_LIBKRUNFW=1: reusing committed ${LIBDIR}/libkrunfw.so.* (host-glibc-independent) ---"
+    KRUNFW_SO=""   # signals "do not re-assemble libkrunfw" below
+else
+    echo "--- building libkrunfw (kernel ${ARCH}; this is the slow step) ---"
+    # Build from INSIDE the dir, NOT `make -C`: `-C` auto-enables -w (print-dir),
+    # which lands in MAKEFLAGS as a bare `w`; the kernel's `$(MAKE) $(MAKEFLAGS)`
+    # recipe then dies with "No rule to make target 'w'". -j scales the kernel build.
+    ( cd libkrunfw && make clean >/dev/null 2>&1 || true; make -j"$(nproc)" GUESTARCH="${ARCH}" )
+    KRUNFW_SO="$(ls -1 libkrunfw/libkrunfw.so.*.*.* 2>/dev/null | head -1)"
+    [[ -n "$KRUNFW_SO" ]] || { echo "ERROR: libkrunfw build produced no .so" >&2; exit 1; }
+fi
 
 # --- 3. init (static guest-arch ELF, built natively) -------------------------
 echo "--- building guest init (native ${ARCH} ELF) ---"
@@ -109,7 +126,11 @@ assemble() {
     ln -sf "${base}.${major}" "$LIBDIR/${base}"  # libkrunfw.so   -> .so.5
 }
 
-assemble "$KRUNFW_SO" "libkrunfw.so"
+if [[ -n "$KRUNFW_SO" ]]; then
+    assemble "$KRUNFW_SO" "libkrunfw.so"
+else
+    echo "--- keeping committed ${LIBDIR}/libkrunfw.so (SKIP_LIBKRUNFW) ---"
+fi
 # libkrun: x86_64 keeps libkrun.so as a real file too — mirror that.
 KRUN_FNAME="$(basename "$KRUN_SO")"; KRUN_VER="${KRUN_FNAME#libkrun.so.}"; KRUN_MAJOR="${KRUN_VER%%.*}"
 cp -f "$KRUN_SO" "$LIBDIR/$KRUN_FNAME"

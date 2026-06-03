@@ -130,13 +130,18 @@ jobs:
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib
+          # Linux dist binaries build on 22.04 (glibc 2.35), NOT ubuntu-latest
+          # (24.04 = glibc 2.39). Symbol versioning is backward-compatible only,
+          # so the build host's glibc is the MINIMUM a user needs at runtime —
+          # a 2.39-built binary dies on 22.04 with "GLIBC_2.39 not found". 2.35
+          # covers Ubuntu 22.04+ / Debian 12+ / RHEL 9+.
           - platform: linux-x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             rootfs_arch: x86_64
             agent_arch: x86_64
             lib_dir: lib/linux-x86_64
           - platform: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib/linux-aarch64
