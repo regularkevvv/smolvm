@@ -1135,16 +1135,57 @@ fn scope_label(scope: ResolutionScope) -> &'static str {
 pub fn resolve_refs_to_env(
     refs: &BTreeMap<String, SecretRef>,
     scope: ResolutionScope,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, Secret)>> {
     if refs.is_empty() {
         return Ok(Vec::new());
     }
     let store = SecretStore::load()?;
     let resolved = resolve_secrets(refs, &store, scope)?;
-    Ok(resolved
+    Ok(resolved.into_iter().map(|(k, v)| (k, Secret(v))).collect())
+}
+
+/// A resolved secret plaintext value.
+///
+/// Deliberately has NO `Serialize`, `Display`, or `Deref` impl, and a REDACTING
+/// `Debug`, so resolved plaintext cannot leak into logs, error messages, the
+/// DB, or a pack by accident — the type system now enforces the "plaintext
+/// never persists / never logs" invariant that previously rested on a grep
+/// guard. Zeroized on drop. Cross it into the guest env (the one legitimate
+/// boundary) only via the explicit, greppable `expose` / `into_plaintext`.
+#[derive(Clone)]
+pub struct Secret(Zeroizing<String>);
+
+impl Secret {
+    /// Borrow the plaintext. Each call site is a reviewable point where a
+    /// secret crosses a trust boundary.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume into the plaintext `String` for the one place it must go plain:
+    /// the agent env vector serialized to the guest over vsock. Moves the inner
+    /// buffer out, leaving nothing extra to scrub.
+    pub fn into_plaintext(mut self) -> String {
+        std::mem::take(&mut *self.0)
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// Expose resolved secrets into plain `(name, value)` tuples for the agent env
+/// vector. This is THE boundary where secret plaintext deliberately crosses into
+/// the guest's environment (serialized over vsock to the guest). Every call site
+/// is a greppable point where plaintext leaves the `Secret` type's protection —
+/// keep them few and obvious.
+pub fn expose_into_env(secrets: Vec<(String, Secret)>) -> Vec<(String, String)> {
+    secrets
         .into_iter()
-        .map(|(k, v)| (k, (*v).clone()))
-        .collect())
+        .map(|(k, v)| (k, v.into_plaintext()))
+        .collect()
 }
 
 /// Resolve a map of refs, returning a classified [`ResolutionError`]
@@ -1156,7 +1197,7 @@ pub fn resolve_refs_to_env(
 pub fn resolve_refs_to_env_classified(
     refs: &BTreeMap<String, SecretRef>,
     scope: ResolutionScope,
-) -> std::result::Result<Vec<(String, String)>, ResolutionError> {
+) -> std::result::Result<Vec<(String, Secret)>, ResolutionError> {
     if refs.is_empty() {
         return Ok(Vec::new());
     }
@@ -1172,7 +1213,7 @@ pub fn resolve_refs_to_env_classified(
                 kind,
             }
         })?;
-        out.push((name.clone(), (*value).clone()));
+        out.push((name.clone(), Secret(value)));
     }
     Ok(out)
 }
@@ -1241,6 +1282,20 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn secret_debug_redacts_and_exposes_only_explicitly() {
+        let s = Secret(Zeroizing::new("hunter2".to_string()));
+        // Debug must never reveal the plaintext — this is the leak surface the
+        // type exists to close (e.g. tracing::debug!(?env)).
+        let dbg = format!("{:?}", s);
+        assert_eq!(dbg, "Secret(<redacted>)");
+        assert!(!dbg.contains("hunter2"), "Debug leaked the secret: {}", dbg);
+        // The plaintext is reachable only through the explicit, greppable
+        // accessors.
+        assert_eq!(s.expose(), "hunter2");
+        assert_eq!(s.into_plaintext(), "hunter2");
     }
 
     #[test]

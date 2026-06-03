@@ -858,8 +858,8 @@ pub async fn exec_machine(
     let name_clone = name.clone();
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(req_env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();

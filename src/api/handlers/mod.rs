@@ -25,7 +25,7 @@ pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
 /// across exec/run handlers.
 pub(crate) fn record_secret_refs_env(
     entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
-) -> Result<Vec<(String, String)>, ApiError> {
+) -> Result<Vec<(String, crate::secrets::Secret)>, ApiError> {
     let refs = {
         let guard = entry.lock();
         guard.secret_refs.clone()
@@ -131,7 +131,7 @@ pub(crate) fn validate_request_secrets(
 /// must have already called [`validate_request_secrets`].
 pub(crate) fn resolve_request_secrets(
     refs: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
-) -> Result<Vec<(String, String)>, ApiError> {
+) -> Result<Vec<(String, crate::secrets::Secret)>, ApiError> {
     if refs.is_empty() {
         return Ok(Vec::new());
     }

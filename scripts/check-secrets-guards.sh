@@ -72,6 +72,17 @@ else
   ok "packed secret refs resolve under Untrusted scope"
 fi
 
+# 6. The resolved-plaintext `Secret` newtype must never gain a Serialize/Display
+#    impl, and must not be `derive`d with Serialize. Either would re-open the
+#    accidental-leak surface (JSON/logs) the type exists to close — the no-leak
+#    invariant is now enforced by the type system, and this guards that.
+if git grep -nE 'impl[^=]*(Serialize|Display)[^=]*for Secret\b' -- src/secrets.rs \
+   || git grep -nE -B1 'struct Secret\(' -- src/secrets.rs | grep -q 'Serialize'; then
+  note "the Secret newtype gained a Serialize/Display impl — resolved plaintext could leak"
+else
+  ok "Secret has no Serialize/Display impl (plaintext can't serialize/log by accident)"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "secrets guardrails FAILED" >&2
   exit 1

@@ -119,8 +119,8 @@ pub async fn exec_command(
 
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(req_env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
@@ -217,8 +217,8 @@ pub async fn exec_stream(
 
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(req_env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
@@ -330,8 +330,8 @@ pub async fn run_command(
     let image = req.image.clone();
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(req_env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 

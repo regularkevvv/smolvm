@@ -695,10 +695,12 @@ fn build_env(
     // refs (resolved against THIS host's own secret store) are honored. A
     // `from_env`/`from_file` ref in a pack would read the running host's env or
     // arbitrary files — reject it (fail closed) rather than exfiltrate.
-    env.extend(smolvm::secrets::resolve_refs_to_env(
-        &manifest.secret_refs,
-        smolvm::secrets::ResolutionScope::Untrusted,
-    )?);
+    env.extend(smolvm::secrets::expose_into_env(
+        smolvm::secrets::resolve_refs_to_env(
+            &manifest.secret_refs,
+            smolvm::secrets::ResolutionScope::Untrusted,
+        )?,
+    ));
 
     // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {

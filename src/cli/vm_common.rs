@@ -453,6 +453,7 @@ pub fn resolve_secret_refs_for_env(
     refs: &BTreeMap<String, SecretRef>,
 ) -> smolvm::Result<Vec<(String, String)>> {
     smolvm::secrets::resolve_refs_to_env(refs, smolvm::secrets::ResolutionScope::TrustedLocal)
+        .map(smolvm::secrets::expose_into_env)
 }
 
 /// Build the exec-time env for a persistent VM: the record's own `env`
@@ -463,10 +464,12 @@ pub fn resolve_secret_refs_for_env(
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
     let mut env = record.env.clone();
-    env.extend(smolvm::secrets::resolve_refs_to_env(
-        &record.secret_refs,
-        smolvm::secrets::ResolutionScope::RecordReplay,
-    )?);
+    env.extend(smolvm::secrets::expose_into_env(
+        smolvm::secrets::resolve_refs_to_env(
+            &record.secret_refs,
+            smolvm::secrets::ResolutionScope::RecordReplay,
+        )?,
+    ));
     Ok(env)
 }
 
