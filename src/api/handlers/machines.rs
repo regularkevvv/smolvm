@@ -1186,6 +1186,7 @@ mod tests {
             from: None,
             registry_ref: None,
             registry_identity_token: None,
+            secrets: Default::default(),
         }
     }
 
