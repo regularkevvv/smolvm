@@ -1564,7 +1564,10 @@ impl CreateCmd {
                 |e| {
                     smolvm::Error::config(
                         "create from .smolmachine",
-                        format!("secret '{}': {} (packs may only carry from_store refs)", key, e),
+                        format!(
+                            "secret '{}': {} (packs may only carry from_store refs)",
+                            key, e
+                        ),
                     )
                 },
             )?;

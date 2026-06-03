@@ -1248,29 +1248,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Redirect HOME to a temp dir for the duration of a test so the real
-    /// `~/.config` and `~/.local/share` are not touched.
+    /// Redirect HOME — and the XDG base dirs that `dirs::config_dir` /
+    /// `data_local_dir` consult on Linux — to a temp dir for the duration of a
+    /// test, so the real store/key are never touched and the test is hermetic
+    /// regardless of the CI runner's `XDG_*` env. (On macOS `dirs` ignores XDG
+    /// and follows HOME, so pinning the XDG vars is harmless there.)
     struct HomeGuard {
         _dir: TempDir,
-        prev: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_config: Option<std::ffi::OsString>,
+        prev_data: Option<std::ffi::OsString>,
+    }
+
+    fn restore_env(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(p) => std::env::set_var(key, p),
+            None => std::env::remove_var(key),
+        }
     }
 
     impl HomeGuard {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let prev = std::env::var_os("HOME");
+            let prev_home = std::env::var_os("HOME");
+            let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+            let prev_data = std::env::var_os("XDG_DATA_HOME");
             std::env::set_var("HOME", dir.path());
-            Self { _dir: dir, prev }
+            std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
+            std::env::set_var("XDG_DATA_HOME", dir.path().join(".local").join("share"));
+            Self {
+                _dir: dir,
+                prev_home,
+                prev_config,
+                prev_data,
+            }
         }
     }
 
     impl Drop for HomeGuard {
         fn drop(&mut self) {
-            if let Some(p) = self.prev.take() {
-                std::env::set_var("HOME", p);
-            } else {
-                std::env::remove_var("HOME");
-            }
+            restore_env("HOME", self.prev_home.take());
+            restore_env("XDG_CONFIG_HOME", self.prev_config.take());
+            restore_env("XDG_DATA_HOME", self.prev_data.take());
         }
     }
 
