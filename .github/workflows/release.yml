@@ -177,7 +177,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config e2fsprogs
+          # patchelf: build-dist.sh strips libkrun's hard libvirglrenderer NEEDED
+          # so non-GPU Linux hosts can dlopen it (GPU stays optional at runtime).
+          # Without patchelf the strip is silently skipped and `smolvm run` fails
+          # with "libvirglrenderer.so.1: cannot open shared object file".
+          sudo apt-get install -y build-essential libssl-dev pkg-config e2fsprogs patchelf
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'

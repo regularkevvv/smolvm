@@ -106,7 +106,14 @@ file libkrun/init/init | grep -q 'statically linked' \
 
 # --- 4. libkrun (VMM) --------------------------------------------------------
 echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
+# Link with partial RELRO (lazy binding), NOT full RELRO. The GPU-enabled libkrun
+# carries a hard virglrenderer NEEDED that build-dist.sh strips via patchelf so
+# non-GPU hosts can dlopen it (paired with RTLD_LAZY in src/agent/krun.rs). That
+# strip only holds if symbols bind lazily — full RELRO's BIND_NOW would eagerly
+# resolve the now-unprovided virgl symbols and fail the load. Must match the
+# relro-level=partial that build-dist.sh applies on its own libkrun compiles.
 ( cd libkrun && make clean >/dev/null 2>&1 || true; \
+  RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
   KRUN_INIT_BINARY_PATH="$(realpath init/init)" make --no-print-directory BLK=1 NET=1 "${GPU_FLAG}" )
 KRUN_SO="$(ls -1 libkrun/target/release/libkrun.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUN_SO" ]] || { echo "ERROR: libkrun build produced no .so" >&2; exit 1; }
