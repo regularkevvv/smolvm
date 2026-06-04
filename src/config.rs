@@ -704,17 +704,15 @@ mod tests {
         use crate::secrets::SecretRef;
         let mut record = VmRecord::new("r".into(), 1, 256, vec![], vec![], false);
         record.secret_refs.insert(
-            "API_KEY".into(),
+            "TLS_KEY".into(),
             SecretRef {
-                from_store: Some("API_KEY".into()),
                 from_env: None,
-                from_file: None,
+                from_file: Some("/run/secrets/tls.key".into()),
             },
         );
         record.secret_refs.insert(
             "DB_URL".into(),
             SecretRef {
-                from_store: None,
                 from_env: Some("PROD_DB".into()),
                 from_file: None,
             },
@@ -722,14 +720,17 @@ mod tests {
 
         let json = serde_json::to_string(&record).unwrap();
         // Ref metadata — not sensitive — roundtrips through serde_json.
-        assert!(json.contains("API_KEY"));
+        assert!(json.contains("TLS_KEY"));
         assert!(json.contains("PROD_DB"));
 
         let back: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.secret_refs.len(), 2);
         assert_eq!(
-            back.secret_refs["API_KEY"].from_store.as_deref(),
-            Some("API_KEY")
+            back.secret_refs["TLS_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/run/secrets/tls.key".to_string())
         );
         assert_eq!(
             back.secret_refs["DB_URL"].from_env.as_deref(),
