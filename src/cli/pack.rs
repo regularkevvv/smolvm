@@ -869,15 +869,28 @@ impl PackCreateCmd {
             return Ok(dir.clone());
         }
 
-        // Best option: use the exact libkrun that this process has loaded.
-        // This guarantees the packed binary gets a library with all required symbols,
-        // avoiding mismatches when multiple libkrun versions are installed.
+        // Use the same canonical resolver as the launcher and embedded runtime so
+        // `pack create` finds libkrun anywhere the rest of smolvm does: it honors
+        // the explicit `$SMOLVM_LIB_DIR` override (e.g. a distro libkrun, or a
+        // non-standard install dir) and the installed/exe-relative `lib/` layout.
+        // Without this, packing a build whose libs live outside the hardcoded
+        // candidates below required `--lib-dir`, even though the env var was set.
+        if let Some(dir) = smolvm::agent::find_lib_dir() {
+            debug!(lib_dir = %dir.display(), "found library directory via canonical resolver");
+            return Ok(dir);
+        }
+
+        // Next best: use the exact libkrun that this process has loaded, which
+        // guarantees the packed binary gets a library with all required symbols.
+        // (Rarely fires for `pack create`: the builder VM boots in a subprocess,
+        // so the packer process itself never dlopens libkrun.)
         if let Some(dir) = Self::find_loaded_libkrun_dir() {
             debug!(lib_dir = %dir.display(), "using libkrun from running process");
             return Ok(dir);
         }
 
-        // Fallback: check common locations
+        // Fallback: a few well-known locations the canonical resolver does not
+        // check (Homebrew, /usr/local/lib, and the current working directory).
         let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
         let candidates = [
             // Relative to executable
@@ -916,7 +929,7 @@ impl PackCreateCmd {
 
         Err(Error::agent(
             "find libkrun",
-            "could not find libkrun library. Use --lib-dir to specify the location.",
+            "could not find libkrun library. Set SMOLVM_LIB_DIR or pass --lib-dir to specify the location.",
         ))
     }
 
