@@ -159,6 +159,9 @@ pub struct RunConfig {
     /// Persistent overlay ID. If set, the overlay persists across exec sessions
     /// so filesystem changes (e.g. package installs) survive.
     pub persistent_overlay_id: Option<String>,
+    /// Data to pipe to the command's stdin (non-interactive runs only). The
+    /// pipe is closed after writing so the command sees EOF.
+    pub stdin: Option<String>,
 }
 
 impl RunConfig {
@@ -178,6 +181,7 @@ impl RunConfig {
             timeout: None,
             tty: false,
             persistent_overlay_id: None,
+            stdin: None,
         }
     }
 
@@ -214,6 +218,12 @@ impl RunConfig {
     /// Enable TTY mode.
     pub fn with_tty(mut self, tty: bool) -> Self {
         self.tty = tty;
+        self
+    }
+
+    /// Set stdin data piped to the command (non-interactive runs).
+    pub fn with_stdin(mut self, stdin: Option<String>) -> Self {
+        self.stdin = stdin;
         self
     }
 
@@ -1130,6 +1140,7 @@ impl AgentClient {
             tty: false,
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            stdin_data: config.stdin,
             background: false,
         })?;
 
@@ -1154,6 +1165,7 @@ impl AgentClient {
             tty: false,
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            stdin_data: None,
             background: true,
         })?;
 
@@ -1194,6 +1206,7 @@ impl AgentClient {
             tty: false,
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            stdin_data: None,
             background: false,
         })?;
 
@@ -1228,6 +1241,7 @@ impl AgentClient {
                 tty,
                 detached: false,
                 persistent_overlay_id: config.persistent_overlay_id,
+                stdin_data: None,
                 background: false,
             },
             tty,
@@ -1262,6 +1276,7 @@ impl AgentClient {
             tty: false,
             detached: true,
             persistent_overlay_id: config.persistent_overlay_id,
+            stdin_data: None,
             background: false,
         })?;
         let (exit_code, stdout, _) = expect_completed(resp, "run container detached")?;
@@ -1457,6 +1472,7 @@ impl AgentClient {
                 tty,
                 detached: false,
                 persistent_overlay_id: config.persistent_overlay_id,
+                stdin_data: None,
                 background: false,
             },
             input,

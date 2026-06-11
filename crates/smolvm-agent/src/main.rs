@@ -1950,6 +1950,7 @@ fn handle_request(
             tty: false,
             detached: false,
             persistent_overlay_id,
+            stdin_data,
             background,
         } => {
             if background {
@@ -1972,6 +1973,7 @@ fn handle_request(
                     &mounts,
                     timeout_ms,
                     persistent_overlay_id.as_deref(),
+                    stdin_data.as_deref(),
                     client_fd,
                 )
             }
@@ -4343,9 +4345,10 @@ fn handle_run(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
 
     match storage::run_command(
         image,
@@ -4356,6 +4359,7 @@ fn handle_run(
         mounts,
         timeout_ms,
         persistent_overlay_id,
+        stdin_data,
         client_fd,
     ) {
         Ok(result) => oversized_output_error(&result.stdout, &result.stderr).unwrap_or(

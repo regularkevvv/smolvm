@@ -132,8 +132,7 @@ pub async fn exec_command(
     // per-machine persistent overlay so filesystem changes persist across exec
     // sessions. Without this, exec runs in the bare agent VM (no `python3`,
     // etc.) — the image is never entered. Plain machines exec in the VM
-    // directly via `vm_exec`. (The `Run` path does not carry stdin yet, so
-    // stdin is ignored for image-machine exec — tracked separately.)
+    // directly via `vm_exec`.
     let machine_image = state
         .db()
         .get_vm(&id)
@@ -151,6 +150,7 @@ pub async fn exec_command(
                 .collect::<Vec<_>>()
         };
         let overlay_id = id.clone();
+        let stdin_data = stdin_data.clone();
         with_machine_client_traced(&entry, tid, move |c| {
             // Pull only if the image isn't already present — avoids a registry
             // round-trip on every exec, and works once cached even on
@@ -163,7 +163,8 @@ pub async fn exec_command(
                 .with_workdir(workdir)
                 .with_mounts(mounts_config)
                 .with_timeout(timeout)
-                .with_persistent_overlay(Some(overlay_id));
+                .with_persistent_overlay(Some(overlay_id))
+                .with_stdin(stdin_data);
             c.run_non_interactive(config)
         })
         .await?

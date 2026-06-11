@@ -2120,6 +2120,7 @@ pub fn run_command(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     // Validate inputs
@@ -2181,7 +2182,13 @@ pub fn run_command(
         let container_id = generate_container_id();
 
         // Run with crun
-        let result = run_with_crun(&bundle_path, &container_id, timeout_ms, client_fd);
+        let result = run_with_crun(
+            &bundle_path,
+            &container_id,
+            timeout_ms,
+            stdin_data,
+            client_fd,
+        );
 
         // Note: virtiofs mounts are left in place for reuse
         // They will be cleaned up when the overlay is cleaned up or the VM shuts down
@@ -2505,6 +2512,7 @@ fn run_with_crun(
     bundle_dir: &Path,
     container_id: &str,
     timeout_ms: Option<u64>,
+    stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     info!(
@@ -2515,19 +2523,38 @@ fn run_with_crun(
     );
 
     // Spawn the container using CrunCommand.
-    // stdin_null() is critical: without it, crun inherits the agent's vsock
-    // stdin, and /bin/sh reads protocol bytes instead of user input, hanging.
-    let mut child = CrunCommand::run(bundle_dir, container_id)
-        .stdin_null()
-        .capture_output()
-        .spawn()
-        .map_err(|e| {
-            StorageError::new(format!(
-                "failed to spawn crun: {}. Is crun installed at {}?",
-                e,
-                paths::CRUN_PATH
-            ))
-        })?;
+    // stdin_null() is critical when no input is supplied: without it, crun
+    // inherits the agent's vsock stdin, and /bin/sh reads protocol bytes
+    // instead of user input, hanging. With input, pipe it in and close the
+    // pipe so the command sees EOF (same contract as the bare-VM exec path).
+    let builder = CrunCommand::run(bundle_dir, container_id);
+    let builder = if stdin_data.is_some() {
+        builder.stdin_piped()
+    } else {
+        builder.stdin_null()
+    };
+    let mut child = builder.capture_output().spawn().map_err(|e| {
+        StorageError::new(format!(
+            "failed to spawn crun: {}. Is crun installed at {}?",
+            e,
+            paths::CRUN_PATH
+        ))
+    })?;
+
+    // Write stdin on a separate thread so the wait/timeout loop stays live
+    // even if the child never reads and the pipe buffer fills. Dropping the
+    // handle closes the pipe → EOF.
+    let _stdin_writer = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("run-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let _ = child_stdin.write_all(data.as_bytes());
+                })
+        })
+    });
 
     // Capture container_id for the cleanup closure
     let cid = container_id.to_string();

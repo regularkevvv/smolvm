@@ -294,6 +294,10 @@ pub enum AgentRequest {
         /// created and destroyed after the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_overlay_id: Option<String>,
+        /// Data to pipe to the command's stdin (non-interactive runs only).
+        /// The pipe is closed after writing, so the command sees EOF.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin_data: Option<String>,
         /// Spawn the container and return immediately with the crun PID.
         /// The container runs detached; stdout/stderr go to /dev/null.
         /// Incompatible with `interactive` and `tty`.
