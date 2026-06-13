@@ -372,6 +372,22 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
         libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
         libc::SYS_capget, libc::SYS_setpgid,
+        // accept4 + sock{name,peername}: the published-port listener threads
+        // (smolvm-tcp-*) and virtio-net path. Rust's TcpListener uses accept4,
+        // not accept — the audit run logged these (288/51/52 on x86_64) because
+        // they post-date the original capture.
+        libc::SYS_accept4, libc::SYS_getsockname, libc::SYS_getpeername,
+        // virtiofs passthrough executes the guest's FS mutations on the HOST, so
+        // the host VMM issues the full *at family + fd/symlink xattrs. Derived
+        // from fs/linux/passthrough.rs (NOT just the audit trace, which only
+        // exercised mkdirat/symlinkat) so a guest that mknod/link/setxattr/chmod
+        // doesn't trip `enforce`. SYS_* exist on both arches; BTreeMap dedups any
+        // overlap with the arch-gated lists below.
+        libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_symlinkat, libc::SYS_linkat,
+        libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_fchmodat, libc::SYS_fchownat,
+        libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
+        libc::SYS_fsetxattr, libc::SYS_fremovexattr,
+        libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
     ];
 
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
