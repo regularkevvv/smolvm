@@ -32,7 +32,8 @@ use std::time::Duration;
 use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
-    vm_resources_to_spec, ApiState, MachineEntry, MachineRegistration, ReservationGuard,
+    vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
+    ReservationGuard,
 };
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse,
@@ -220,13 +221,16 @@ pub async fn create_machine(
         ));
     }
 
-    // Published ports need the inbound path that only virtio-net has; on the
-    // default (TSI) backend they would silently never accept connections.
-    if !req.ports.is_empty()
-        && req.network_backend != Some(crate::network::NetworkBackend::VirtioNet)
-    {
+    // Published ports need the inbound path that only virtio-net has. With an
+    // UNSET backend the launcher auto-selects virtio-net when ports are present
+    // (see `plan_launch_network`), so ports "just work" without per-request
+    // wiring — mirroring the CLI and `validate_requested_network_backend`. Only
+    // an EXPLICIT TSI choice alongside ports is a misconfig (TSI is
+    // outbound-only and would silently never accept connections).
+    if !req.ports.is_empty() && req.network_backend == Some(crate::network::NetworkBackend::Tsi) {
         return Err(ApiError::BadRequest(
-            "published ports require networkBackend 'virtio-net' (TSI is outbound-only)"
+            "published ports require networkBackend 'virtio-net' (TSI is outbound-only); \
+             omit networkBackend or set it to 'virtio-net'"
                 .to_string(),
         ));
     }
@@ -660,6 +664,58 @@ pub async fn start_machine(
 
     // Register in ApiState so exec/run/container endpoints can find it
     state.insert_machine(&name, machine_entry_from_record(&record, manager));
+
+    // Image machines: launch the image's workload (its ENTRYPOINT+CMD) as a
+    // detached container now that the VM is up — mirroring the CLI start path
+    // (`vm_common.rs`). Without this, an image machine started via the API boots
+    // only the bare agent VM and never runs its server, so a published port
+    // forwards to a guest socket nothing is listening on (connection reset →
+    // proxy 502). An empty command lets the agent resolve the image's own
+    // ENTRYPOINT+CMD. This runs once per fresh start: the handler returns early
+    // above when the machine is already Running, so the container is never
+    // double-launched. Best-effort: a launch failure leaves a reachable VM
+    // (Running, exec-able) rather than failing the start and stranding a retry
+    // on the early-return path where the workload would never get launched.
+    if let Some(image) = record.image.clone() {
+        let entry = state.get_machine(&name)?;
+        let mut command = record.entrypoint.clone();
+        command.extend(record.cmd.clone());
+        let mut env = record.env.clone();
+        env.extend(crate::secrets::expose_into_env(
+            super::record_secret_refs_env(&entry)?,
+        ));
+        let workdir = record.workdir.clone();
+        let user = record.user.clone();
+        let mounts_config = {
+            let e = entry.lock();
+            e.mounts
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
+                .collect::<Vec<_>>()
+        };
+        let overlay_id = name.clone();
+        let launch = with_machine_client_traced(&entry, None, move |c| {
+            if c.query(&image)?.is_none() {
+                c.pull_with_registry_config(&image)?;
+            }
+            let config = crate::agent::RunConfig::new(image, command)
+                .with_env(env)
+                .with_workdir(workdir)
+                .with_user(user)
+                .with_mounts(mounts_config)
+                .with_persistent_overlay(Some(overlay_id));
+            c.run_container_detached(config).map(|_| ())
+        })
+        .await;
+        if let Err(e) = launch {
+            tracing::warn!(
+                machine = %name,
+                error = ?e,
+                "failed to launch image workload after start; VM is up but its server is not running"
+            );
+        }
+    }
 
     // Capture start time for PID verification
     let pid_start_time = pid.and_then(process_start_time);
