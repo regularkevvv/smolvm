@@ -200,9 +200,17 @@ impl ServeStartCmd {
         let drain_state = state.clone();
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
+        // Resolve the serve API's TLS posture before binding. In fleet mode this
+        // is fail-closed: a missing/partial mTLS config aborts startup rather
+        // than silently serving plain HTTP (control↔node mTLS, increment 3).
+        let tls = super::serve_tls::resolve_tls().map_err(|e| smolvm::error::Error::Config {
+            operation: "serve tls".to_string(),
+            reason: e.to_string(),
+        })?;
+
         // Listen server on TCP or Unix socket
         match listen_target {
-            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app).await?,
+            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, tls).await?,
             #[cfg(unix)]
             ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
         }
@@ -231,7 +239,16 @@ impl ServeStartCmd {
         Ok(())
     }
 
-    async fn serve_tcp(&self, addr: SocketAddr, app: Router) -> Result<()> {
+    async fn serve_tcp(
+        &self,
+        addr: SocketAddr,
+        app: Router,
+        tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    ) -> Result<()> {
+        if let Some(tls_config) = tls {
+            return Self::serve_tcp_tls(addr, app, tls_config).await;
+        }
+
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(smolvm::error::Error::Io)?;
@@ -241,6 +258,35 @@ impl ServeStartCmd {
 
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(smolvm::error::Error::Io)
+    }
+
+    /// HTTPS variant with mutual TLS (fleet mode). `axum-server`'s rustls
+    /// acceptor performs the handshake + client-cert verification configured in
+    /// `tls_config`; graceful shutdown is driven through its `Handle` (the
+    /// `axum::serve` graceful-shutdown future doesn't apply here).
+    async fn serve_tcp_tls(
+        addr: SocketAddr,
+        app: Router,
+        tls_config: std::sync::Arc<rustls::ServerConfig>,
+    ) -> Result<()> {
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+        let handle = axum_server::Handle::new();
+
+        // Trip graceful shutdown on the same signal the plain path observes.
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+
+        tracing::info!(address = %addr, "starting HTTPS API server (mTLS, client cert required)");
+        println!("smolvm API server listening on https://{} (mTLS)", addr);
+
+        axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
             .await
             .map_err(smolvm::error::Error::Io)
     }

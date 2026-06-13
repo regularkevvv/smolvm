@@ -59,6 +59,13 @@ tempfile = "3"
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
+# mTLS for the fleet serve API (control↔node). axum-server's rustls acceptor
+# does the TLS handshake + client-cert verification; rustls-pemfile parses the
+# CA/cert/key PEMs handed to us at enrollment.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio-stream = "0.1"
 parking_lot = "0.12"

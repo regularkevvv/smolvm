@@ -10,6 +10,7 @@ pub mod pack_run;
 pub mod parsers;
 pub mod proxy_opts;
 pub mod serve;
+pub mod serve_tls;
 pub mod smolfile;
 pub mod vm_common;
 
