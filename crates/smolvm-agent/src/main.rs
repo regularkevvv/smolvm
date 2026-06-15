@@ -299,10 +299,18 @@ fn main() {
     // exist. The symlink makes /workspace available in both modes.
     // Placed AFTER init_volume_mounts so that `-v host:/workspace` takes
     // priority — the exists() check sees the bind mount and skips.
+    //
+    // The target `/storage/workspace` is created by the storage mount, which
+    // now runs *after* this block (it was moved below signal_ready_to_host()
+    // to overlap with the host connect). So the symlink is created even when
+    // the target doesn't exist yet — a dangling symlink is fine, it resolves
+    // once storage mounts, which always completes before the accept loop reads
+    // any request. Gating on `workspace_target.exists()` here would silently
+    // skip the symlink for bare VMs and is what regressed `/workspace`.
     {
         let workspace_link = std::path::Path::new("/workspace");
         let workspace_target = std::path::Path::new("/storage/workspace");
-        if !workspace_link.exists() && workspace_target.exists() {
+        if !workspace_link.exists() {
             let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
         }
     }
