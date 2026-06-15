@@ -137,7 +137,7 @@ fn resolve_directory(path: &Path) -> Result<ResolvedImage> {
         ));
     }
     Ok(ResolvedImage::Local {
-        reference: format!("local-dir:{}", canonical.display()),
+        reference: format!("{LOCAL_DIR_PREFIX}{}", canonical.display()),
         packed_layers_dir: canonical,
     })
 }
@@ -150,7 +150,7 @@ fn resolve_archive(input: ArchiveInput) -> Result<ResolvedImage> {
         ArchiveInput::Stdin => stage_from_stdin(&cache_base)?,
     };
     Ok(ResolvedImage::Local {
-        reference: format!("local:{hash}"),
+        reference: format!("{LOCAL_ARCHIVE_PREFIX}{hash}"),
         packed_layers_dir: cache_base.join(hash),
     })
 }
@@ -234,6 +234,28 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
     }
     std::fs::copy(src, dst)?;
     Ok(())
+}
+
+/// Reference prefixes produced by [`resolve`] for the two local-source kinds.
+const LOCAL_ARCHIVE_PREFIX: &str = "local:";
+const LOCAL_DIR_PREFIX: &str = "local-dir:";
+
+/// Whether a persisted image reference points at a local source (produced by
+/// [`resolve`]) rather than a registry.
+pub fn is_local_ref(reference: &str) -> bool {
+    reference.starts_with(LOCAL_ARCHIVE_PREFIX) || reference.starts_with(LOCAL_DIR_PREFIX)
+}
+
+/// Map a persisted `local:…`/`local-dir:…` reference back to the host directory
+/// to mount into the guest via virtiofs, so a later `start` re-resolves to the
+/// same source without re-staging. Returns `None` for a registry reference. The
+/// directory may be gone if the archive cache was pruned — `start` then fails
+/// with a clear "no such directory" rather than silently pulling.
+pub fn packed_layers_dir_for_ref(reference: &str) -> Option<PathBuf> {
+    if let Some(hash) = reference.strip_prefix(LOCAL_ARCHIVE_PREFIX) {
+        return archive_cache_base().ok().map(|base| base.join(hash));
+    }
+    reference.strip_prefix(LOCAL_DIR_PREFIX).map(PathBuf::from)
 }
 
 fn archive_cache_base() -> Result<PathBuf> {
@@ -335,6 +357,25 @@ mod tests {
         // Identical content → identical hash, idempotent (no error, reused).
         let h2 = stage_from_file(src.path(), cache.path()).unwrap();
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn local_refs_round_trip_to_a_packed_layers_dir() {
+        assert!(is_local_ref("local:abc123"));
+        assert!(is_local_ref("local-dir:/srv/rootfs"));
+        assert!(!is_local_ref("alpine"));
+        assert!(!is_local_ref("ghcr.io/o/r:v1"));
+
+        // A dir ref maps straight back to the directory.
+        assert_eq!(
+            packed_layers_dir_for_ref("local-dir:/srv/rootfs"),
+            Some(PathBuf::from("/srv/rootfs"))
+        );
+        // An archive ref maps under the shared cache base, keyed by hash.
+        let dir = packed_layers_dir_for_ref("local:deadbeef").unwrap();
+        assert!(dir.ends_with("smolvm-image-archives/deadbeef"));
+        // Registry refs have no packed-layers dir.
+        assert_eq!(packed_layers_dir_for_ref("alpine"), None);
     }
 
     #[test]
