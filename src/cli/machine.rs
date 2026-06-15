@@ -1696,9 +1696,24 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
+        // Resolve a local image source (archive/dir) on the host now: stage it
+        // into the content-addressed cache and persist the resulting `local:…`
+        // reference, so `start` re-derives the mount dir without a registry
+        // pull. Registry refs pass through unchanged.
+        let image = match self.image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                Some(match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => reference,
+                    ResolvedImage::Local { reference, .. } => reference,
+                })
+            }
+            None => None,
+        };
+
         let params = crate::cli::smolfile::build_create_params(
             name,
-            self.image,
+            image,
             None,         // entrypoint: from Smolfile only
             self.command, // persistent-workload command (detached container on start)
             self.cpus,
