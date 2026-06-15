@@ -1743,8 +1743,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             total_size,
         } = request
         {
-            // Drop any leftover session (Drop cleans its tmp file).
-            write_session = None;
+            // Drop any leftover session now (Drop cleans its tmp file) before
+            // starting a new one. `take()` makes the drop explicit and keeps the
+            // value from looking like a dead store.
+            let _ = write_session.take();
             let (new_session, response) = handle_file_write_begin(path, mode, total_size);
             write_session = new_session;
             send_response(stream, &response)?;

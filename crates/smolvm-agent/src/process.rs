@@ -91,9 +91,10 @@ pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
     }
     if rc < 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        // EAGAIN/EWOULDBLOCK = no data but connection alive → peer still there.
-        // Any other error (ECONNRESET, ENOTCONN, EBADF, etc.) → peer gone.
-        return !matches!(errno, libc::EAGAIN | libc::EWOULDBLOCK);
+        // EAGAIN = no data but connection alive → peer still there. (EWOULDBLOCK
+        // is the same value as EAGAIN on Linux.) Any other error (ECONNRESET,
+        // ENOTCONN, EBADF, etc.) → peer gone.
+        return !matches!(errno, libc::EAGAIN);
     }
     // rc > 0: there's data in the buffer — connection is alive.
     false

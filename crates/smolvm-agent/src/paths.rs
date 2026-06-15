@@ -57,19 +57,6 @@ pub const CONTAINERS_LOGS_DIR: &str = "/storage/containers/logs";
 /// Directory for container exit code files.
 pub const CONTAINERS_EXIT_DIR: &str = "/storage/containers/exit";
 
-/// Path to the persistent container registry file.
-pub const REGISTRY_PATH: &str = "/storage/containers/registry.json";
-
-/// Path to the registry lock file.
-pub const REGISTRY_LOCK_PATH: &str = "/storage/containers/registry.lock";
-
-// =============================================================================
-// Timeouts (milliseconds)
-// =============================================================================
-
-/// Timeout for acquiring registry lock.
-pub const REGISTRY_LOCK_TIMEOUT_MS: u64 = 5000;
-
 // =============================================================================
 // Path Helper Functions
 // =============================================================================
