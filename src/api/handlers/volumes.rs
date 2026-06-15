@@ -18,9 +18,13 @@ pub struct ProvisionVolumeRequest {
     /// Control-plane volume id (e.g. `vol-<hex>`); names the on-node directory.
     pub id: String,
     /// Requested size. Advisory for the `local` backend (a plain directory has no
-    /// hard quota); honored once size-bearing backends (PD) land.
+    /// hard quota); the disk size for `pd`.
     #[serde(default)]
     pub size_gb: u64,
+    /// Storage backend: `local` (default — a worker dir) or `pd` (a GCP
+    /// persistent disk that survives node loss and can re-attach elsewhere).
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// Response body for `POST /api/v1/volumes`.
@@ -29,6 +33,19 @@ pub struct ProvisionVolumeResponse {
     /// Host path the volume is mounted at on this node — becomes a workload mount
     /// `source`.
     pub node_path: String,
+    /// Backend storage handle (the GCP disk name for `pd`); the control plane
+    /// stores it to re-attach the disk on failover. `None` for `local`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
+/// Request body for `POST /api/v1/volumes/attach` (failover re-home).
+#[derive(Deserialize)]
+pub struct AttachVolumeRequest {
+    /// Control-plane volume id.
+    pub id: String,
+    /// Backend storage handle to re-attach (the GCP disk name).
+    pub handle: String,
 }
 
 /// Base directory for node-local volumes: `<data_local_dir>/smolvm/volumes`.
@@ -59,11 +76,41 @@ pub async fn provision_volume(
     Json(req): Json<ProvisionVolumeRequest>,
 ) -> Result<Json<ProvisionVolumeResponse>, ApiError> {
     safe_volume_id(&req.id)?;
-    let path = volumes_base().join(&req.id);
-    std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
-    let node_path = path.to_string_lossy().to_string();
-    tracing::info!(volume_id = %req.id, node_path = %node_path, size_gb = req.size_gb, "provisioned local volume");
-    Ok(Json(ProvisionVolumeResponse { node_path }))
+    match req.backend.as_deref().unwrap_or("local") {
+        "local" => {
+            let path = volumes_base().join(&req.id);
+            std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
+            let node_path = path.to_string_lossy().to_string();
+            tracing::info!(volume_id = %req.id, node_path = %node_path, size_gb = req.size_gb, "provisioned local volume");
+            Ok(Json(ProvisionVolumeResponse {
+                node_path,
+                handle: None,
+            }))
+        }
+        "pd" => {
+            let (node_path, handle) = super::gcp_pd::provision(&req.id, req.size_gb).await?;
+            Ok(Json(ProvisionVolumeResponse {
+                node_path,
+                handle: Some(handle),
+            }))
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "unsupported volume backend: {other:?}"
+        ))),
+    }
+}
+
+/// `POST /api/v1/volumes/attach` — attach an existing PD (the failover re-home)
+/// onto this node and mount it, returning the host path. No format (data intact).
+pub async fn attach_volume(
+    Json(req): Json<AttachVolumeRequest>,
+) -> Result<Json<ProvisionVolumeResponse>, ApiError> {
+    safe_volume_id(&req.id)?;
+    let node_path = super::gcp_pd::attach(&req.handle, &req.id).await?;
+    Ok(Json(ProvisionVolumeResponse {
+        node_path,
+        handle: Some(req.handle),
+    }))
 }
 
 /// `DELETE /api/v1/volumes/{id}` — tear down the backing storage. Idempotent:
