@@ -477,7 +477,10 @@ impl AgentManager {
             DiskFormat::Qcow2 => {
                 StorageDisk::open_existing_with_format(&storage_path, storage_format)?
             }
-            DiskFormat::Raw => StorageDisk::open_or_create_at(&storage_path, sg)?,
+            // Fresh disk: prefer an instant qcow2 CoW overlay over the template
+            // (Linux, default size) instead of a raw copy, to avoid per-boot
+            // host-disk thrash under concurrency. Falls back to raw otherwise.
+            DiskFormat::Raw => StorageDisk::open_or_overlay_at(&storage_path, sg)?,
         };
 
         let (overlay_path, overlay_format) =
@@ -486,7 +489,7 @@ impl AgentManager {
             DiskFormat::Qcow2 => {
                 OverlayDisk::open_existing_with_format(&overlay_path, overlay_format)?
             }
-            DiskFormat::Raw => OverlayDisk::open_or_create_at(&overlay_path, og)?,
+            DiskFormat::Raw => OverlayDisk::open_or_overlay_at(&overlay_path, og)?,
         };
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
