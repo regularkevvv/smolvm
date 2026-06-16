@@ -72,12 +72,6 @@ pub struct VmDisk<K> {
     _kind: PhantomData<K>,
 }
 
-/// Serializes the one-time sparse resize of a shared disk template (see
-/// [`VmDisk::create_overlay_from_template`]) so concurrent boots don't read a
-/// torn file size while another is mid-truncate.
-#[cfg(target_os = "linux")]
-static TEMPLATE_RESIZE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 impl<K: DiskType> VmDisk<K> {
     /// Get the default path for the disk.
     pub fn default_path() -> Result<PathBuf> {
@@ -148,56 +142,75 @@ impl<K: DiskType> VmDisk<K> {
     }
 
     /// Open the disk for a fresh (non-clone) VM. On Linux at this disk type's
-    /// DEFAULT size, create an instant qcow2 copy-on-write overlay over the
-    /// read-only template (O(metadata), no byte copy) — so N concurrent boots
-    /// don't thrash the host disk the way N full template copies do. Anything
-    /// else (a custom size, a pre-existing disk, non-Linux, or an overlay-create
-    /// failure) falls back to the raw create + format-time copy.
+    /// DEFAULT size, when the shipped template has already been sized to the
+    /// default virtual size **at install time**, create an instant qcow2
+    /// copy-on-write overlay over the read-only template (O(metadata), no byte
+    /// copy) — so N concurrent boots don't thrash the host disk the way N full
+    /// template copies do. Anything else (a custom size, a pre-existing disk, a
+    /// not-yet-sized legacy template, non-Linux, or an overlay-create failure)
+    /// falls back to the raw create + format-time copy. The template is treated
+    /// as immutable here: sizing it is an install-time concern (see
+    /// `scripts/install.sh`), never a per-boot mutation of a shared file.
     pub fn open_or_overlay_at(raw_path: &Path, size_gb: u64) -> Result<Self> {
         #[cfg(target_os = "linux")]
         if !raw_path.exists() && size_gb == K::DEFAULT_SIZE_GIB {
-            let overlay_path = raw_path.with_extension(DiskFormat::Qcow2.extension());
-            match Self::create_overlay_from_template(&overlay_path, size_gb * BYTES_PER_GIB) {
-                Ok(disk) => return Ok(disk),
-                Err(error) => {
-                    tracing::warn!(
-                        disk_type = K::NAME, %error,
-                        "qcow2 overlay create failed; falling back to raw template copy"
-                    );
+            let size_bytes = size_gb * BYTES_PER_GIB;
+            // Only overlay when the template already presents the full virtual
+            // size. A legacy/too-small template would make the overlay inherit an
+            // undersized device, so degrade to the copy path rather than mutate
+            // the shared template.
+            if Self::template_at_least(size_bytes) {
+                let overlay_path = raw_path.with_extension(DiskFormat::Qcow2.extension());
+                match Self::create_overlay_from_template(&overlay_path, size_bytes) {
+                    Ok(disk) => return Ok(disk),
+                    Err(error) => {
+                        tracing::warn!(
+                            disk_type = K::NAME, %error,
+                            "qcow2 overlay create failed; falling back to raw template copy"
+                        );
+                    }
                 }
             }
         }
         Self::open_or_create_at(raw_path, size_gb)
     }
 
-    /// Create a `.qcow2` CoW overlay backed by the read-only template instead of
-    /// copying it. The overlay inherits the backing file's VIRTUAL size, and the
-    /// shipped template is small (512 MiB), so we first ensure the template
-    /// presents `size_bytes` (a sparse truncate-extend: O(metadata),
-    /// data-preserving, idempotent) — the guest then grows the inherited 512 MiB
-    /// ext4 with resize2fs at boot, exactly as on the copy path. Marks the disk
-    /// formatted so it is never reformatted (the overlay shares the template's
-    /// filesystem). Linux only.
+    /// True if a disk template exists and already presents at least `size_bytes`
+    /// of virtual size (sized at install). Used to decide whether the fast qcow2
+    /// overlay path is safe without ever mutating the shared template.
     #[cfg(target_os = "linux")]
-    pub fn create_overlay_from_template(overlay_path: &Path, size_bytes: u64) -> Result<Self> {
+    fn template_at_least(size_bytes: u64) -> bool {
+        Self::template_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() >= size_bytes)
+            .unwrap_or(false)
+    }
+
+    /// Create a `.qcow2` CoW overlay backed by the read-only template instead of
+    /// copying it. The overlay inherits the backing file's VIRTUAL size; the
+    /// template is sized to the default at install time (see
+    /// `scripts/install.sh`) while its ext4 stays 512 MiB, so the guest grows the
+    /// inherited filesystem with resize2fs at boot, exactly as on the copy path.
+    /// The template is opened read-only and never mutated — if it is not yet
+    /// sized to `size_bytes`, this refuses (the caller falls back to the copy
+    /// path) rather than truncate a shared file under concurrent boots. Marks the
+    /// disk formatted so it is never reformatted (the overlay shares the
+    /// template's filesystem). Linux only; called only via [`Self::open_or_overlay_at`].
+    #[cfg(target_os = "linux")]
+    fn create_overlay_from_template(overlay_path: &Path, size_bytes: u64) -> Result<Self> {
         let template = Self::template_path()
             .ok_or_else(|| Error::storage("overlay from template", "no disk template found"))?;
 
-        // Make the shared template present the target virtual size so the overlay
-        // inherits it. Serialized so concurrent boots don't read a torn size
-        // mid-truncate; idempotent (truncate to the same/smaller is a no-op).
-        {
-            let _g = TEMPLATE_RESIZE_LOCK.lock().unwrap();
-            let current = std::fs::metadata(&template)
-                .map_err(|e| Error::storage("read template size", e.to_string()))?
-                .len();
-            if current < size_bytes {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&template)
-                    .and_then(|f| f.set_len(size_bytes))
-                    .map_err(|e| Error::storage("resize template", e.to_string()))?;
-            }
+        // The template must already present the full virtual size (install-time
+        // sizing). Refuse rather than mutate a shared file under concurrent boots.
+        let template_len = std::fs::metadata(&template)
+            .map_err(|e| Error::storage("read template size", e.to_string()))?
+            .len();
+        if template_len < size_bytes {
+            return Err(Error::storage(
+                "overlay from template",
+                format!("template virtual size {template_len} < required {size_bytes}; not sized at install"),
+            ));
         }
 
         if let Some(parent) = overlay_path.parent() {

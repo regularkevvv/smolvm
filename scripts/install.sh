@@ -392,6 +392,19 @@ install_smolvm() {
         cp "$extracted_dir/overlay-template.ext4" "$prefix/"
     fi
 
+    # Size the disk templates to their default virtual size at install time, so
+    # the runtime boots fresh VMs from an instant qcow2 copy-on-write overlay
+    # (no per-boot template copy) instead of mutating a shared template lazily.
+    # The ext4 inside stays 512 MiB; the guest grows it with resize2fs at boot.
+    # Sparse, so it costs no real disk. Linux-only (the overlay path is gated to
+    # Linux) and needs `truncate` (GNU coreutils); skipped otherwise, in which
+    # case the runtime safely falls back to the copy path. The sizes mirror
+    # DEFAULT_STORAGE_SIZE_GIB (20) and DEFAULT_OVERLAY_SIZE_GIB (10).
+    if command -v truncate >/dev/null 2>&1; then
+        [[ -f "$prefix/storage-template.ext4" ]] && truncate -s 20G "$prefix/storage-template.ext4"
+        [[ -f "$prefix/overlay-template.ext4" ]] && truncate -s 10G "$prefix/overlay-template.ext4"
+    fi
+
     # Install agent-rootfs to data directory
     local data_dir
     if [[ "$(uname -s)" == "Darwin" ]]; then

@@ -502,19 +502,34 @@ if [[ -z "$MKFS_BIN" ]]; then
     echo "Warning: mkfs.ext4 not found, skipping storage template creation"
     echo "         Users will need e2fsprogs installed"
 else
+    # Set a file's virtual size (sparse), portably (macOS lacks GNU truncate).
+    extend_sparse() { # $1=path $2=bytes
+        if command -v truncate >/dev/null 2>&1; then
+            truncate -s "$2" "$1"
+        else
+            perl -e 'truncate($ARGV[0], $ARGV[1]) or die "truncate: $!"' "$1" "$2"
+        fi
+    }
+
     # Create sparse file
     dd if=/dev/zero of="$TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
 
     # Format with ext4
     "$MKFS_BIN" -F -q -m 0 -L smolvm "$TEMPLATE_PATH"
 
-    echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) (sparse)"
+    # Size to the default storage virtual size (DEFAULT_STORAGE_SIZE_GIB=20) so a
+    # fresh VM boots from an instant qcow2 overlay (the guest grows the 512 MiB
+    # ext4 with resize2fs); the runtime treats the template as immutable. Sparse.
+    extend_sparse "$TEMPLATE_PATH" $((20 * 1024 * 1024 * 1024))
+    echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) physical (20 GiB virtual)"
 
     # Create overlay template (same format, different label)
     OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
     dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
     "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
-    echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) (sparse)"
+    # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
+    extend_sparse "$OVERLAY_TEMPLATE_PATH" $((10 * 1024 * 1024 * 1024))
+    echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) physical (10 GiB virtual)"
 fi
 
 # Copy README
@@ -588,10 +603,16 @@ echo "Generating checksums..."
 echo "Cleaning up existing tarball..."
 rm -f "smolvm-*.tar.gz"
 
-# Create tarball
+# Create tarball. Preserve sparseness so the 20/10 GiB-virtual disk templates
+# (a few hundred KiB physical) don't balloon to full size on extraction. GNU tar
+# needs --sparse; bsdtar (macOS) detects holes automatically.
 echo "Creating tarball..."
 cd dist
-tar -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+if tar --version 2>/dev/null | grep -qi gnu; then
+    tar --sparse -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+else
+    tar -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+fi
 cd ..
 
 # Summary
