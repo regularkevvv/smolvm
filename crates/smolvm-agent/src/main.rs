@@ -712,6 +712,34 @@ fn log_gpu_status() {
     }
 }
 
+/// Ensure a mount-point directory exists on the agent rootfs, logging a WARN
+/// (rather than failing) if it can't be created.
+///
+/// The boot-critical mount points (/mnt/{overlay,storage,newroot}) are baked
+/// into the rootfs at build time — see the `mkdir` block in
+/// scripts/build-agent-rootfs.sh. This runtime `create_dir_all` is a backstop
+/// for rootfs images that predate that change or are assembled differently.
+///
+/// On a writable rootfs the dir already exists (no-op) or is created here. On a
+/// read-only rootfs the mkdir fails; we surface that as a WARN so the resulting
+/// failed overlay/storage mount is diagnosable instead of presenting as a
+/// silent boot-without-persistence. It also flags drift: a newly added `/mnt`
+/// mount point that wasn't baked into the build script will WARN here on a RO
+/// rootfs rather than fail mysteriously.
+#[cfg(target_os = "linux")]
+fn ensure_mount_dir(path: &str) {
+    if let Err(e) = std::fs::create_dir_all(path) {
+        boot_log(
+            "WARN",
+            &format!(
+                "could not create mount point {} ({}); rootfs may be read-only and \
+                 missing baked-in mount dirs — the following mount will likely fail",
+                path, e
+            ),
+        );
+    }
+}
+
 /// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
 ///
 /// If /dev/vdb exists (overlay disk attached by host), this function:
@@ -792,7 +820,7 @@ fn setup_persistent_rootfs() {
         return;
     }
 
-    let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
+    ensure_mount_dir(OVERLAY_MOUNT);
 
     // Probe and mount storage disk in parallel with the overlay ext4 operations.
     // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
@@ -800,7 +828,7 @@ fn setup_persistent_rootfs() {
     // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
     // removes storage mount latency from the critical path entirely.
     let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
-        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
+        ensure_mount_dir(STORAGE_TEMP_MOUNT);
         Some(std::thread::spawn(|| {
             // Resize before mount — template may be smaller than device.
             // Skip if filesystem already fills the device (subsequent boots).
@@ -916,7 +944,7 @@ fn setup_persistent_rootfs() {
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
     let _ = std::fs::create_dir_all(format!("{}/work", OVERLAY_MOUNT));
-    let _ = std::fs::create_dir_all(NEWROOT);
+    ensure_mount_dir(NEWROOT);
 
     // Mount overlayfs: initramfs (lower, read-only) + persistent disk (upper)
     let overlay_src = cstr("overlay");
