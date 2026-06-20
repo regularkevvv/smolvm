@@ -90,6 +90,7 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::exec_machine,
         handlers::machines::resize_machine,
+        handlers::machines::snapshot_machine,
     ),
     components(schemas(
         // Request types
@@ -157,13 +158,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
 
     // Long-lived streaming routes (no request timeout): SSE logs and the
-    // interactive PTY WebSocket both outlive the 5-minute API timeout.
+    // interactive PTY WebSocket both outlive the 5-minute API timeout, as does
+    // snapshot capture (boots a helper VM + tars the overlay). The node bounds
+    // these itself; the control-plane driver sends them with no client timeout.
     let logs_route = Router::new()
         .route("/{id}/logs", get(handlers::exec::stream_logs))
         .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
-        );
+        )
+        .route("/{id}/snapshot", post(handlers::machines::snapshot_machine));
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()
