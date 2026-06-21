@@ -115,7 +115,14 @@ pub async fn push(
     // 6. Store the single-platform manifest content-addressably (by digest), and
     //    also tag it per platform (e.g. `latest-linux-amd64`) so a specific
     //    platform is directly pullable.
-    let platform = OciPlatform::parse(&manifest.host_platform);
+    //
+    //    Key the index entry on the GUEST platform (`linux/<arch>`), not the
+    //    builder's `host_platform`. The `.smolmachine` sidecar is selected on
+    //    pull by guest arch (client.rs matches `os == linux && arch == host
+    //    arch`); keying on `host_platform` made artifacts built on macOS index
+    //    as `darwin/arm64`, which pull could never select. On Linux builders
+    //    `platform == host_platform`, so this is a no-op there.
+    let platform = OciPlatform::parse(&manifest.platform);
     let platform_tag = format!("{reference}-{}-{}", platform.os, platform.architecture);
     tracing::info!(digest = %manifest_digest, platform = %platform.label(), "uploading manifest...");
     client
