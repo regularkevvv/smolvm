@@ -530,9 +530,10 @@ fn ensure_init_layer(
         )
     })?;
     println!(
-        "Baking init layer {key} ({} init step(s)) — one-time, reused on later runs...",
+        "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
         params.init.len()
     );
+    let started = std::time::Instant::now();
 
     let exe = std::env::current_exe()
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
@@ -540,12 +541,14 @@ fn ensure_init_layer(
     let sf = smolfile.to_string_lossy().to_string();
     let out = dir.join(&key).to_string_lossy().to_string(); // `pack` appends `.smolmachine`
 
-    // Clear any temp machine left by a prior failed bake (best-effort).
+    // Clear any temp machine left by a prior failed bake (best-effort; the common
+    // case is "doesn't exist", whose error is captured and discarded by run_smolvm).
     let _ = run_smolvm(&exe, &["machine", "delete", "--name", &tmp, "-f"]);
 
     let bake = (|| -> smolvm::Result<()> {
         // Create from the Smolfile (image + init + volumes) but replace the workload
         // with `/bin/true`, so `start` runs init only and not the real command.
+        println!("  · pulling image and running init...");
         run_smolvm(
             &exe,
             &[
@@ -561,6 +564,7 @@ fn ensure_init_layer(
         )?;
         run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
+        println!("  · snapshotting...");
         run_smolvm(&exe, &["pack", "create", "--from-vm", &tmp, "-o", &out])?;
         Ok(())
     })();
@@ -577,19 +581,38 @@ fn ensure_init_layer(
     // (tens of MB) next to the `<key>.smolmachine` sidecar. The cache only needs the
     // sidecar, so drop the stub to avoid doubling the cache's disk footprint.
     let _ = std::fs::remove_file(dir.join(&key));
+    println!("  ✓ baked in {}s", started.elapsed().as_secs());
     Ok(cached)
 }
 
-/// Run this same smolvm binary as a subprocess for one bake step; error on non-zero.
+/// Run this same smolvm binary as a subprocess for one bake step. Output is
+/// CAPTURED (not inherited) so the bake's internal create/pull/pack chatter — and
+/// the harmless "vm not found" from the best-effort pre-clean — never reach the
+/// user's terminal; on failure the captured stderr tail is surfaced in the error.
 fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
-    let status = std::process::Command::new(exe)
+    let out = std::process::Command::new(exe)
         .args(args)
-        .status()
+        .output()
         .map_err(|e| smolvm::Error::config("init-layer bake", e.to_string()))?;
-    if !status.success() {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(smolvm::Error::config(
             "init-layer bake",
-            format!("`smolvm {}` failed ({})", args.join(" "), status),
+            format!(
+                "`smolvm {}` failed ({}):\n{tail}",
+                args.join(" "),
+                out.status
+            ),
         ));
     }
     Ok(())
