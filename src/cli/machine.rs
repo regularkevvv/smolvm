@@ -573,6 +573,10 @@ fn ensure_init_layer(
             format!("bake did not produce {}", cached.display()),
         ));
     }
+    // `pack create -o <key>` also emits a self-contained stub binary at `<key>`
+    // (tens of MB) next to the `<key>.smolmachine` sidecar. The cache only needs the
+    // sidecar, so drop the stub to avoid doubling the cache's disk footprint.
+    let _ = std::fs::remove_file(dir.join(&key));
     Ok(cached)
 }
 
