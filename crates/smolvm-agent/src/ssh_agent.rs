@@ -74,6 +74,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
         let mounts_before = spec.mounts.len();
         let envs_before = spec.process.env.len();
@@ -97,6 +98,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
 
         inject_into_container_if(&mut spec, true);
@@ -132,6 +134,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
         spec.process
             .env

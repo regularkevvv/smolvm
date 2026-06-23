@@ -462,6 +462,7 @@ impl OciSpec {
         workdir: &str,
         tty: bool,
         identity: &ProcessIdentity,
+        unprivileged: bool,
     ) -> Self {
         // Build environment variables
         let mut env_strings = vec![
@@ -475,12 +476,21 @@ impl OciSpec {
         }
         env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
-        // Default capabilities for root containers
+        // Capabilities. Default is VM-grade (full set): the microVM is the security
+        // boundary, so the in-VM workload runs privileged — that's what lets init
+        // systems (systemd as PID 1) and tmpfs-mounting workloads boot (the "boot
+        // any image" promise). `unprivileged` opts into the restricted set for
+        // defense-in-depth with untrusted code.
+        let caps = if unprivileged {
+            default_capabilities()
+        } else {
+            full_capabilities()
+        };
         let capabilities = OciCapabilities {
-            bounding: default_capabilities(),
-            effective: default_capabilities(),
+            bounding: caps.clone(),
+            effective: caps.clone(),
             inheritable: vec![],
-            permitted: default_capabilities(),
+            permitted: caps,
             ambient: vec![],
         };
 
@@ -545,7 +555,7 @@ impl OciSpec {
                     "/proc/sysrq-trigger".to_string(),
                 ],
             },
-            mounts: default_mounts(),
+            mounts: default_mounts(unprivileged),
             hostname: Some("container".to_string()),
         }
     }
@@ -804,6 +814,8 @@ pub fn generate_container_id() -> String {
 }
 
 /// Default Linux capabilities for root containers.
+// Retained as the fallback for a future opt-in unprivileged mode (`--unprivileged`).
+#[allow(dead_code)]
 fn default_capabilities() -> Vec<String> {
     vec![
         "CAP_CHOWN".to_string(),
@@ -821,6 +833,62 @@ fn default_capabilities() -> Vec<String> {
         "CAP_KILL".to_string(),
         "CAP_AUDIT_WRITE".to_string(),
     ]
+}
+
+/// Full capability set for a "VM-grade" workload. smolvm runs one workload per
+/// microVM, so the KVM boundary — not the in-VM container — is the security
+/// boundary; dropping capabilities here protects nothing (an escape lands in the
+/// VM's own single-tenant kernel) while breaking legitimate images that expect a
+/// real machine (systemd/OpenRC as PID 1, or anything that mounts a tmpfs). So the
+/// default container is effectively privileged. An opt-in unprivileged mode can
+/// fall back to [`default_capabilities`] for defense-in-depth with untrusted code.
+fn full_capabilities() -> Vec<String> {
+    [
+        "CAP_AUDIT_CONTROL",
+        "CAP_AUDIT_READ",
+        "CAP_AUDIT_WRITE",
+        "CAP_BLOCK_SUSPEND",
+        "CAP_BPF",
+        "CAP_CHECKPOINT_RESTORE",
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_DAC_READ_SEARCH",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_IPC_LOCK",
+        "CAP_IPC_OWNER",
+        "CAP_KILL",
+        "CAP_LEASE",
+        "CAP_LINUX_IMMUTABLE",
+        "CAP_MAC_ADMIN",
+        "CAP_MAC_OVERRIDE",
+        "CAP_MKNOD",
+        "CAP_NET_ADMIN",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_NET_BROADCAST",
+        "CAP_NET_RAW",
+        "CAP_PERFMON",
+        "CAP_SETFCAP",
+        "CAP_SETGID",
+        "CAP_SETPCAP",
+        "CAP_SETUID",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_BOOT",
+        "CAP_SYS_CHROOT",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_NICE",
+        "CAP_SYS_PACCT",
+        "CAP_SYS_PTRACE",
+        "CAP_SYS_RAWIO",
+        "CAP_SYS_RESOURCE",
+        "CAP_SYS_TIME",
+        "CAP_SYS_TTY_CONFIG",
+        "CAP_SYSLOG",
+        "CAP_WAKE_ALARM",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Default device nodes for container execution.
@@ -891,8 +959,8 @@ fn default_devices() -> Vec<OciDevice> {
 }
 
 /// Default mounts for container execution.
-fn default_mounts() -> Vec<OciMount> {
-    vec![
+fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
+    let mut mounts = vec![
         // /proc - process information
         OciMount {
             destination: "/proc".to_string(),
@@ -965,19 +1033,60 @@ fn default_mounts() -> Vec<OciMount> {
                 "ro".to_string(),
             ],
         },
-        // /sys/fs/cgroup - cgroup filesystem (read-only)
-        OciMount {
-            destination: "/sys/fs/cgroup".to_string(),
-            mount_type: Some("cgroup2".to_string()),
-            source: "cgroup".to_string(),
+    ];
+    // /sys/fs/cgroup — cgroup2. Writable by default so an init system (systemd) can
+    // manage its own cgroup subtree; read-only in unprivileged mode.
+    mounts.push(OciMount {
+        destination: "/sys/fs/cgroup".to_string(),
+        mount_type: Some("cgroup2".to_string()),
+        source: "cgroup".to_string(),
+        options: vec![
+            "nosuid".to_string(),
+            "noexec".to_string(),
+            "nodev".to_string(),
+            if unprivileged { "ro" } else { "rw" }.to_string(),
+        ],
+    });
+    if !unprivileged {
+        // tmpfs that init systems and many services set up at boot. Pre-providing
+        // them means the workload doesn't have to mount them itself, and read-only
+        // rootfs images still get writable runtime dirs. Omitted when unprivileged
+        // (the workload can't mount, but also isn't expected to be an init system).
+        mounts.push(OciMount {
+            destination: "/run".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
             options: vec![
                 "nosuid".to_string(),
-                "noexec".to_string(),
                 "nodev".to_string(),
-                "ro".to_string(),
+                "mode=0755".to_string(),
+                "size=65536k".to_string(),
             ],
-        },
-    ]
+        });
+        mounts.push(OciMount {
+            destination: "/run/lock".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+                "mode=1777".to_string(),
+                "size=5120k".to_string(),
+            ],
+        });
+        mounts.push(OciMount {
+            destination: "/tmp".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "mode=1777".to_string(),
+            ],
+        });
+    }
+    mounts
 }
 
 #[cfg(test)]
@@ -1054,6 +1163,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
 
         assert_eq!(spec.oci_version, "1.0.2");
@@ -1072,6 +1182,7 @@ mod tests {
             "/",
             true,
             &ProcessIdentity::root(),
+            false,
         );
         spec.process.console_size = Some(OciConsoleSize {
             height: 24,
@@ -1094,6 +1205,7 @@ mod tests {
             "/",
             true,
             &ProcessIdentity::root(),
+            false,
         );
         let json = serde_json::to_value(&spec).unwrap();
         assert!(
@@ -1112,6 +1224,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
         spec.add_bind_mount("/host/path", "/container/path", true);
 
@@ -1215,6 +1328,7 @@ mod tests {
                 },
                 home: Some("/home/steam".to_string()),
             },
+            false,
         );
 
         assert!(spec.process.env.contains(&"HOME=/home/steam".to_string()));
@@ -1242,7 +1356,7 @@ mod tests {
     fn test_gpu_devices_added_when_dri_exists() {
         // On a system with /dev/dri (GPU-enabled VM), a bind mount is added
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         let mounts_before = spec.mounts.len();
         spec.add_gpu_devices_if_available();
 
@@ -1263,7 +1377,7 @@ mod tests {
     #[test]
     fn test_gpu_devices_are_not_added_twice() {
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         spec.mounts.push(super::OciMount {
             destination: "/dev/dri".to_string(),
             mount_type: Some("bind".to_string()),
@@ -1285,7 +1399,7 @@ mod tests {
     #[test]
     fn test_gpu_devices_correct_properties() {
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         // Manually push a GPU bind mount to verify expected properties
         spec.mounts.push(super::OciMount {
             destination: "/dev/dri".to_string(),
