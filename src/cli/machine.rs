@@ -1830,6 +1830,11 @@ impl CreateCmd {
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
 
+        // Reject a cross-architecture artifact up front: a packed VM/image carries
+        // native binaries and cannot boot under a different-arch guest kernel. Only
+        // the guest arch must match — the host OS does not (see the fn's docs).
+        smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+
         // Read the footer now; the bundle is extracted into the machine's own
         // data dir after `create_vm` succeeds (below), so a duplicate-name create
         // cannot clobber an existing machine's layers.

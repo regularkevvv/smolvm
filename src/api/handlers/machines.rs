@@ -327,6 +327,11 @@ pub async fn create_machine(
         }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
+        // Reject a cross-architecture artifact up front (400, not a mid-boot 500):
+        // a packed VM/image carries native binaries that cannot run under a
+        // different-arch guest kernel. Guest arch must match; host OS need not.
+        crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         // Extraction happens after the agent manager creates this machine's data
         // dir (below), so the layers land in the machine's own dir, not here.
         let canonical = path
