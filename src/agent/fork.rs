@@ -141,9 +141,19 @@ pub fn prepare_fork(
         std::fs::remove_dir_all(&clone_dir)
             .map_err(|e| Error::agent("clear orphan clone dir", e.to_string()))?;
     }
-    let snapshot_dir = clone_dir.join("snapshot");
-    std::fs::create_dir_all(&snapshot_dir)
+    std::fs::create_dir_all(&clone_dir)
         .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
+
+    // The golden writes its frozen snapshot (checkpoint + memfd manifest) here.
+    // It lives under the GOLDEN's data dir, not the clone's: under Landlock the
+    // frozen golden VMM is confined to its own data dir, so it can write here but
+    // could not write into a separate clone's dir. The clone — which already needs
+    // read access to the golden's dir for its copy-on-write disk backing — reads
+    // the snapshot from the same place. See `internal_boot`'s Landlock grants.
+    let gdir = vm_data_dir(golden);
+    let snapshot_dir = gdir.join("fork-snapshots").join(clone);
+    std::fs::create_dir_all(&snapshot_dir)
+        .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?;
 
     // Register the clone in the DB with the golden's config, no running-state,
     // and its port forwards remapped to fresh host ports. With the default TSI
@@ -179,13 +189,13 @@ pub fn prepare_fork(
         clone_rec.ports = remapped;
     }
     clone_rec.golden = Some(golden.to_string());
-    let gdir = vm_data_dir(golden);
     db.insert_vm(clone, &clone_rec)?;
 
     // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
     let cleanup = || {
         let _ = db.remove_vm(clone);
         let _ = std::fs::remove_dir_all(&clone_dir);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
     };
     let reply = match control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display())) {
         Ok(r) => r,

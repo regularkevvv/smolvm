@@ -339,11 +339,17 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_ftruncate, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
         libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
-        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_umask,
+        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_faccessat2, libc::SYS_umask,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
         // memory (guest RAM, dlopen of libkrun)
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
         libc::SYS_madvise, libc::SYS_brk,
+        // memfd_create: a forkable machine (`machine start --forkable`) backs its
+        // guest RAM with a memfd so clones can MAP_PRIVATE it copy-on-write. Used
+        // only on the fork base, but harmless (anonymous in-memory file, no host
+        // fs reach) to allow for every VM. Without it a forkable boot is SIGSYS-
+        // killed under `seccomp=enforce`.
+        libc::SYS_memfd_create,
         // KVM + device ioctls, eventfd plumbing
         libc::SYS_ioctl, libc::SYS_eventfd2,
         // epoll / poll event loops (virtio, vsock/TSI)
@@ -352,7 +358,7 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         // sockets (vsock/TSI data path, host networking)
         libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
-        libc::SYS_sendmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
+        libc::SYS_sendmsg, libc::SYS_sendmmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
         libc::SYS_getsockopt, libc::SYS_shutdown,
         // threads & synchronization (vCPU/worker threads, render-thread priority)
         libc::SYS_clone, libc::SYS_clone3, libc::SYS_futex, libc::SYS_set_robust_list,

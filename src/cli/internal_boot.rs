@@ -160,6 +160,15 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
     }
 
+    // A fork clone restores by mapping the golden's guest-RAM memfd, opened via
+    // /proc/<golden_pid>/fd/<N> — an anonymous inode with no filesystem path.
+    // Landlock is path-based and cannot grant access to a pathless object, so a
+    // Landlock-confined clone can never open the memfd (EACCES → can't boot).
+    // Clones therefore skip Landlock; they stay confined by seccomp, the per-VM
+    // uid drop, and the cgroup. Goldens and normal VMs are unaffected.
+    #[cfg(target_os = "linux")]
+    let is_fork_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
+
     // Confine the VMM's filesystem view via Landlock — BEFORE seccomp (whose
     // allowlist omits the landlock_* syscalls) and before libkrun loads. Granted:
     // read+exec on rootfs/libs/system dirs, read-write on this VM's own data dir
@@ -168,7 +177,14 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // derived per-VM from the boot config. Gated by SMOLVM_LANDLOCK=enforce
     // (unset = off); fails closed. See docs/runtime-isolation-hardening.md.
     #[cfg(target_os = "linux")]
-    if std::env::var("SMOLVM_LANDLOCK").as_deref() == Ok("enforce") {
+    if std::env::var("SMOLVM_LANDLOCK").as_deref() == Ok("enforce") && is_fork_clone {
+        eprintln!(
+            "[landlock] fork clone skips Landlock (must map the golden's pathless \
+             memfd); still confined by seccomp + uid drop + cgroup"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::var("SMOLVM_LANDLOCK").as_deref() == Ok("enforce") && !is_fork_clone {
         let mut read_exec: Vec<std::path::PathBuf> = [
             "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/proc", "/sys",
         ]
