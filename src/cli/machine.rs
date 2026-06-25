@@ -382,6 +382,11 @@ pub struct RunCmd {
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Custom DNS resolver for the guest (implies --net). Use this when the
+    /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -831,6 +836,7 @@ impl RunCmd {
             self.port,
             net,
             self.net_backend,
+            self.dns,
             vec![],
             self.env,
             self.workdir,
@@ -993,6 +999,7 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            dns: params.dns,
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1264,6 +1271,7 @@ impl RunCmd {
                                 ports: port_tuples,
                                 network: params.net,
                                 network_backend: params.network_backend,
+                                dns: params.dns,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1423,6 +1431,7 @@ impl RunCmd {
                             ports: port_tuples,
                             network: params.net,
                             network_backend: params.network_backend,
+                            dns: params.dns,
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
                             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -2018,6 +2027,11 @@ pub struct CreateCmd {
     #[arg(long = "net-backend", value_enum)]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Custom DNS resolver for the guest (implies --net). Use this when the
+    /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
+    #[arg(long, value_name = "IP")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -2139,6 +2153,7 @@ impl CreateCmd {
             self.port,
             net,
             self.net_backend,
+            self.dns,
             self.init,
             self.env,
             self.workdir,
@@ -2166,6 +2181,7 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            dns: params.dns,
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             storage_gib: params.storage_gb,
@@ -2309,6 +2325,7 @@ impl CreateCmd {
             port: self.port.clone(),
             net: self.net || manifest.network,
             network_backend: self.net_backend,
+            dns: self.dns,
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
