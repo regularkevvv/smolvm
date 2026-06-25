@@ -71,31 +71,33 @@ pub async fn push(
     let manifest = smolvm_pack::read_manifest_from_sidecar(smolmachine_path)?;
     let config_json = serde_json::to_vec_pretty(&manifest)?;
 
-    // 3. Upload the sidecar as the layer blob. Large blobs go chunked (POST +
-    // per-chunk PATCH + PUT) so a body-size-capping proxy in front of the
-    // registry (e.g. Cloudflare, which 413s a multi-hundred-MB monolithic PUT)
-    // never sees an oversized request; smaller blobs keep the single-PUT stream.
-    let chunk_size = crate::client::upload_chunk_size();
-    if layer_size as usize > chunk_size {
-        tracing::info!(chunk_size, "uploading sidecar blob (chunked)...");
-        client
-            .push_blob_chunked(repo, &layer_digest, smolmachine_path, chunk_size)
-            .await?;
-    } else {
-        // The factory reopens the file on each call so that a 401 mid-upload can
-        // be retried with a fresh stream. The OS page cache makes reopens cheap.
-        tracing::info!("uploading sidecar blob...");
-        let path = smolmachine_path.to_path_buf();
-        client
-            .push_blob_stream(repo, &layer_digest, layer_size, move || {
-                // std::fs::File::open is synchronous but fast (just a syscall).
-                let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
-                let async_file = tokio::fs::File::from_std(file);
-                let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
-                Ok(reqwest::Body::wrap_stream(stream))
-            })
-            .await?;
-    }
+    // 3. Upload the sidecar as the layer blob in a SINGLE streamed request.
+    //
+    // We deliberately do NOT split it into resumable per-chunk PATCH uploads.
+    // The registry's S3 backend is Cloudflare R2, which (unlike AWS S3) requires
+    // every non-final part of a multipart upload to be the same size. zot maps
+    // each OCI PATCH chunk onto an R2 multipart part, so unequal client chunks
+    // (e.g. 16 MiB + a smaller remainder) fail R2's CompleteMultipartUpload with
+    // `400 InvalidPart: All non-trailing parts must have the same length`, which
+    // the registry surfaces as a 500 on the finalizing PUT. Streaming the whole
+    // blob in one request lets the registry's storage driver choose uniform part
+    // sizes, which R2 accepts.
+    //
+    // Corollary: the registry's push path must NOT sit behind a request-body cap
+    // (e.g. an orange-cloud Cloudflare proxy that 413s large bodies). The body
+    // factory reopens the file per attempt so a 401 mid-upload retries with a
+    // fresh stream; the OS page cache makes reopens cheap.
+    tracing::info!("uploading sidecar blob...");
+    let path = smolmachine_path.to_path_buf();
+    client
+        .push_blob_stream(repo, &layer_digest, layer_size, move || {
+            // std::fs::File::open is synchronous but fast (just a syscall).
+            let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
+            let async_file = tokio::fs::File::from_std(file);
+            let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
+            Ok(reqwest::Body::wrap_stream(stream))
+        })
+        .await?;
 
     // 4. Upload config blob (small, buffered is fine).
     tracing::info!("uploading config blob...");

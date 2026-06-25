@@ -16,24 +16,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Default chunk size for chunked blob upload: 16 MiB — comfortably under common
-/// proxy request-body caps (e.g. Cloudflare Free/Pro = 100 MB). Override with the
-/// `SMOLVM_REGISTRY_CHUNK_MB` env var. Blobs at or below this size still take the
-/// monolithic single-PUT path; only larger ones are chunked.
-const DEFAULT_CHUNK_MB: usize = 16;
-
-/// The configured upload chunk size in bytes (see [`DEFAULT_CHUNK_MB`]). Also the
-/// threshold above which a blob is uploaded chunked rather than monolithically.
-pub(crate) fn upload_chunk_size() -> usize {
-    std::env::var("SMOLVM_REGISTRY_CHUNK_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&m| m > 0)
-        .unwrap_or(DEFAULT_CHUNK_MB)
-        * 1024
-        * 1024
-}
-
 /// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
 pub(crate) fn validate_digest(digest: &str) -> Result<()> {
     if let Some(hex_part) = digest.strip_prefix("sha256:") {
