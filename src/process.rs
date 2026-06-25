@@ -412,6 +412,18 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
         libc::SYS_fsetxattr, libc::SYS_fremovexattr,
         libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
+        // virtiofs scopes each request to the guest process's uid/gid before
+        // touching the host fs (so DAC checks run as the guest user, not as a
+        // root VMM) via per-thread setres{u,g}id — passthrough.rs `scoped_cred!`
+        // / `set_creds`. Reached only when the VMM keeps CAP_SETUID (root, no
+        // per-VM uid drop) AND a NON-root guest process does fs I/O: a path a
+        // single-uid (all-root) trace never exercises, which is why a diverse-
+        // workload review caught it and the original audit didn't. Without these
+        // an unprivileged guest writing through virtiofs SIGSYS-kills the VMM
+        // under `enforce`. Safe to allow: a capability-dropped (uid-isolated)
+        // VMM still can't escalate — the kernel enforces CAP_SETUID regardless,
+        // so the syscall just EPERMs. Matches virtiofsd's own allowlist.
+        libc::SYS_setresuid, libc::SYS_setresgid,
     ];
 
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
