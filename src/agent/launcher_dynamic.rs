@@ -434,6 +434,13 @@ pub fn launch_agent_vm_dynamic(
             network.prefix_len6
         )));
         env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
+    } else if let Some(dns) = config.resources.dns {
+        // TSI backend: there is no host-side gateway to route a resolver
+        // override through, so the custom `--dns` value must become the guest's
+        // resolv.conf nameserver directly. The static launcher does the same
+        // (launcher.rs); without this, `--dns` is silently dropped on TSI (the
+        // default backend) and the guest falls back to 1.1.1.1/8.8.8.8.
+        env_strings.push(cstr(&format!("{}={}", guest_env::DNS, dns)));
     }
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
