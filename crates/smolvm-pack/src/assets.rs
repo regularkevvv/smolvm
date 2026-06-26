@@ -109,6 +109,10 @@ impl AssetCollector {
 
         let lib_names = if cfg!(target_os = "macos") {
             vec!["libkrun.dylib", "libkrunfw.5.dylib"]
+        } else if cfg!(target_os = "windows") {
+            // Must match smolvm's loader (util::libkrun_filename): WHP uses the
+            // Windows DLL names, not the Linux .so names.
+            vec!["krun.dll", "libkrunfw.dll"]
         } else {
             vec!["libkrun.so", "libkrunfw.so.5"]
         };
