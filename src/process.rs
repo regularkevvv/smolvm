@@ -106,6 +106,33 @@ mod win {
             None => false,
         }
     }
+
+    /// Process creation time as a u64 (Windows FILETIME: 100 ns ticks since
+    /// 1601). Stable for the life of the process, so it pins PID identity
+    /// against reuse — the same role the start-time-from-/proc plays on Linux.
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        // SAFETY: handle is a live process handle for the duration of the call;
+        // all four FILETIME out-params are valid, writable locals.
+        let ok = unsafe {
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+        };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            None
+        } else {
+            Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+        }
+    }
 }
 
 /// Flag indicating whether SIGCHLD handler has been installed. Only the Unix
@@ -1431,8 +1458,14 @@ pub fn process_start_time(pid: Pid) -> Option<u64> {
     fields.get(19)?.parse::<u64>().ok()
 }
 
+/// Get the start time of a process (Windows process creation FILETIME).
+#[cfg(windows)]
+pub fn process_start_time(pid: Pid) -> Option<u64> {
+    win::process_start_time(pid as u32)
+}
+
 /// Get the start time of a process (stub for unsupported platforms).
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_start_time(_pid: Pid) -> Option<u64> {
     None
 }

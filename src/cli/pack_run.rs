@@ -1339,6 +1339,7 @@ fn run_from_cache(
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
+    #[cfg(unix)]
     let child_pid = smolvm::process::fork_session_leader(move || {
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
             Ok(k) => k,
@@ -1372,6 +1373,69 @@ fn run_from_cache(
         smolvm::process::exit_child(1);
     })
     .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+
+    // Windows has no fork(): re-spawn this executable as `_boot-vm <config>`,
+    // mirroring the non-packed launcher and the `--sidecar` path. BootConfig
+    // carries the same packed launch data (rootfs/disks/layers/ports).
+    #[cfg(not(unix))]
+    let child_pid = {
+        let _ = (&packed_mounts, &port_mappings, &vsock_path_clone);
+        let overlay_disk_path = overlay_runtime_path
+            .clone()
+            .unwrap_or_else(|| runtime_dir.path().join("overlay.raw"));
+        let boot_config = smolvm::agent::boot_config::BootConfig {
+            rootfs_path: rootfs_path.clone(),
+            storage_disk_path: storage_path.clone(),
+            overlay_disk_path,
+            vsock_socket: vsock_path.clone(),
+            console_log: Some(console_log_path.clone()),
+            startup_error_log: runtime_dir.path().join("startup-error.log"),
+            storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
+            overlay_size_gb: args.overlay.unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            mounts: mounts.clone(),
+            ports: args.port.clone(),
+            resources: resources.clone(),
+            ssh_agent_socket: None,
+            dns_filter_hosts: None,
+            packed_layers_dir: Some(layers_dir.to_path_buf()),
+            extra_disks: vec![],
+        };
+        let config_path = runtime_dir.path().join("boot-config.json");
+        let config_json = serde_json::to_vec(&boot_config)
+            .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+        std::fs::write(&config_path, &config_json)
+            .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+            .env("SMOLVM_LIB_DIR", &lib_dir)
+            .env("SMOLVM_BOOT_WATCH_PARENT", "0")
+            .env(
+                smolvm_protocol::guest_env::READY_MARKER,
+                smolvm_protocol::AGENT_READY_MARKER,
+            );
+        if debug {
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+        } else {
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+        child.id() as smolvm::process::Pid
+    };
 
     let child_start_time = {
         let mut st = smolvm::process::process_start_time(child_pid);
