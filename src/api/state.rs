@@ -54,6 +54,19 @@ pub struct ApiState {
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
     /// rate as a delta over wall time. Pruned on each sample to drop dead PIDs.
     cpu_samples: parking_lot::Mutex<HashMap<i32, CpuSample>>,
+    /// Monotonic base for the runtime-liveness heartbeat. All heartbeat values
+    /// are millis elapsed since this instant, so they're a single lock-free
+    /// `AtomicU64` instead of a mutex-guarded `Instant`.
+    started_at: std::time::Instant,
+    /// Milliseconds (since `started_at`) of the supervisor's last tick. The
+    /// supervisor bumps this every `CHECK_INTERVAL` from the main runtime, so a
+    /// stale value means the main runtime's timer wheel stopped being driven
+    /// (a reactor stall) or the supervisor task itself wedged. The loopback
+    /// `/capacity` listener — which runs on its OWN runtime and so keeps
+    /// answering even when the main runtime is stuck — reads this to report the
+    /// node as unschedulable (HTTP 503) the moment the main runtime stops
+    /// making progress, turning a silent wedge into a fast, honest drain signal.
+    runtime_heartbeat_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -191,6 +204,8 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
+            started_at: std::time::Instant::now(),
+            runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -204,7 +219,48 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
+            started_at: std::time::Instant::now(),
+            runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How long the main runtime may go without a supervisor heartbeat before
+    /// the loopback `/capacity` door reports the node as stalled. Defaults to
+    /// 4× the supervisor's 5s tick (`SMOLVM_RUNTIME_STALE_SECS` overrides), so
+    /// a few slow ticks never flap the node but a genuine reactor wedge drains
+    /// it within ~20s + the node-agent's own cordon grace.
+    fn runtime_stale_after_ms() -> u64 {
+        std::env::var("SMOLVM_RUNTIME_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(|s| s * 1000)
+            .unwrap_or(20_000)
+    }
+
+    /// Record that the main runtime is making progress. Called from the
+    /// supervisor's tick — a value only advances if the runtime's timer wheel
+    /// fired the tick, so it is a true liveness signal for the main reactor.
+    pub fn beat_runtime_heartbeat(&self) {
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        self.runtime_heartbeat_ms
+            .store(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the main runtime has gone too long without a heartbeat — i.e. the
+    /// supervisor tick stopped firing, which on a multi-thread runtime means the
+    /// IO/timer driver is no longer being driven. Read from the loopback door's
+    /// dedicated runtime so it stays accurate even when the main runtime is
+    /// wedged. The window before the first heartbeat is treated as healthy
+    /// (startup), since `elapsed - 0 = elapsed` only crosses the threshold once
+    /// the runtime has actually been up longer than the stall window without a
+    /// single supervisor tick — which is itself a real stall.
+    pub fn runtime_stalled(&self) -> bool {
+        let now = self.started_at.elapsed().as_millis() as u64;
+        let last = self
+            .runtime_heartbeat_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) > Self::runtime_stale_after_ms()
     }
 
     /// Load existing machines from persistent database.

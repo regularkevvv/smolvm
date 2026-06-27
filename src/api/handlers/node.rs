@@ -1,5 +1,7 @@
 //! Node-level introspection endpoints.
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{extract::State, Json};
 use std::sync::Arc;
 
@@ -18,10 +20,24 @@ use crate::api::types::CapacityResponse;
     path = "/capacity",
     tag = "Node",
     responses(
-        (status = 200, description = "Live node capacity", body = CapacityResponse)
+        (status = 200, description = "Live node capacity", body = CapacityResponse),
+        (status = 503, description = "Main runtime stalled — node is unschedulable")
     )
 )]
-pub async fn capacity(State(state): State<Arc<ApiState>>) -> Json<CapacityResponse> {
+pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
+    // If the main runtime stopped heartbeating, the lifecycle path (boot/stop/
+    // exec) is wedged even though this loopback door — on its own runtime — can
+    // still answer. Report 503 so the node-agent's existing self-cordon drains
+    // this node instead of the control scheduling onto a black hole. The agent
+    // treats 503 like any poll failure and self-heals once heartbeats resume.
+    if state.runtime_stalled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "main runtime stalled; node unschedulable",
+        )
+            .into_response();
+    }
+
     let (allocated_cpus, allocated_memory_mb) = state.allocated_resources();
     let (used_cpus, used_memory_mb, used_disk_gb) = state.real_utilization();
 
@@ -32,6 +48,7 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Json<CapacityRespon
         used_memory_mb,
         used_disk_gb,
     })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -39,18 +56,44 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
 
+    use axum::body::to_bytes;
+
     #[tokio::test]
     async fn capacity_reports_zero_on_an_idle_node() {
         let dir = tempfile::tempdir().unwrap();
         let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
         let state = Arc::new(ApiState::with_db(db));
+        // A fresh state has heartbeat 0 == "now", so it is not yet stalled.
 
         // No running machines → nothing allocated and nothing in use.
-        let Json(cap) = capacity(State(state)).await;
-        assert_eq!(cap.allocated_cpus, 0);
-        assert_eq!(cap.allocated_memory_mb, 0);
-        assert_eq!(cap.used_cpus, 0.0);
-        assert_eq!(cap.used_memory_mb, 0);
-        assert_eq!(cap.used_disk_gb, 0);
+        let resp = capacity(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let cap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cap["allocated_cpus"], 0);
+        assert_eq!(cap["allocated_memory_mb"], 0);
+        assert_eq!(cap["used_cpus"], 0.0);
+        assert_eq!(cap["used_memory_mb"], 0);
+        assert_eq!(cap["used_disk_gb"], 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_returns_503_when_runtime_heartbeat_is_stale() {
+        // Force an immediate stall window so the missing heartbeat counts as stalled.
+        std::env::set_var("SMOLVM_RUNTIME_STALE_SECS", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+
+        // Let the 1s stall window elapse with no supervisor heartbeat.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let resp = capacity(State(state.clone())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A heartbeat clears the stall and capacity answers 200 again.
+        state.beat_runtime_heartbeat();
+        let resp = capacity(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        std::env::remove_var("SMOLVM_RUNTIME_STALE_SECS");
     }
 }

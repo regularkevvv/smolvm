@@ -64,6 +64,12 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // The tick firing proves the main runtime's timer wheel is
+                    // still being driven — record it so the loopback `/capacity`
+                    // door (on its own runtime) can report the node stalled if
+                    // these ever stop. Bump BEFORE the work below so a slow
+                    // health check doesn't itself register as a stall.
+                    self.state.beat_runtime_heartbeat();
                     // Reap exited VM boot subprocesses (selective, per registered
                     // PID) BEFORE the health check, so a just-crashed VM's zombie
                     // is gone and `is_alive` reports it crashed this same tick.

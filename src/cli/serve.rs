@@ -364,20 +364,54 @@ impl ServeStartCmd {
                     format!("SMOLVM_SERVE_LOCAL_ADDR {local_addr} must be loopback"),
                 ));
             }
-            let local_listener = tokio::net::TcpListener::bind(local_addr)
-                .await
+            // Bind synchronously, then hand the std listener to a DEDICATED
+            // single-thread runtime on its own OS thread. The loopback door's
+            // whole job is liveness (`/capacity`), and it must keep answering
+            // even when the main multi-thread runtime's reactor stalls under
+            // load — which is exactly when the node-agent most needs a truthful
+            // answer. Sharing the main runtime lets a stall silently wedge the
+            // accept loop (a TCP timeout the agent can't distinguish from a dead
+            // node); an isolated reactor turns that into a fast `503` driven by
+            // the runtime-liveness heartbeat (see `ApiState::runtime_stalled`).
+            let std_listener =
+                std::net::TcpListener::bind(local_addr).map_err(smolvm::error::Error::Io)?;
+            std_listener
+                .set_nonblocking(true)
                 .map_err(smolvm::error::Error::Io)?;
             let local_app = app.clone();
-            tracing::info!(address = %local_addr, "starting loopback HTTP door (local node-agent)");
+            tracing::info!(address = %local_addr, "starting loopback HTTP door (local node-agent, isolated runtime)");
             println!(
                 "smolvm local API (loopback, plain) on http://{}",
                 local_addr
             );
-            tokio::spawn(async move {
-                let _ = axum::serve(local_listener, local_app)
-                    .with_graceful_shutdown(shutdown_signal())
-                    .await;
-            });
+            std::thread::Builder::new()
+                .name("smolvm-loopback-api".to_string())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::error!(error = %e, "loopback door runtime failed to build");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        // Register the listener with THIS runtime's reactor.
+                        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::error!(error = %e, "loopback door listener registration failed");
+                                return;
+                            }
+                        };
+                        let _ = axum::serve(listener, local_app)
+                            .with_graceful_shutdown(shutdown_signal())
+                            .await;
+                    });
+                })
+                .map_err(smolvm::error::Error::Io)?;
         }
 
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
