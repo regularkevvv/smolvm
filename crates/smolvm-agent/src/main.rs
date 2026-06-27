@@ -2841,13 +2841,25 @@ fn handle_interactive_run(
         return Ok(());
     }
 
+    // Resolve the container's launch settings from the image's OCI config (with
+    // request overrides). Required to call spawn_interactive_command, so the
+    // interactive path can't drop the image's Env/WorkingDir/User either.
+    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
+        Ok(l) => l,
+        Err(e) => {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(
+                stream,
+                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
+
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
-        &command,
-        &env,
-        workdir.as_deref(),
-        user.as_deref(),
+        &launch,
         &mounts,
         tty,
         persistent_overlay_id.as_deref(),
@@ -2893,36 +2905,83 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// Resolve the command AND working directory for a container run.
+/// The fully-resolved launch settings for an image container: the image's OCI
+/// config (Entrypoint/Cmd, Env, WorkingDir, User) merged with the request.
 ///
-/// If the caller supplied a command, use it verbatim. Otherwise fall back to
-/// the image's OCI `ENTRYPOINT` + `CMD` (read from the stored image config),
-/// so an image can run its own init without the caller having to know it.
-/// Errors if no command was given and the image defines neither.
-///
-/// Also returns the image's `WorkingDir` so the caller can honor it: an image's
-/// `CMD ["node","server.js"]` is relative to its `WORKDIR /app`, and running it
-/// from `/` (the default) fails with "cannot find module". The caller applies
-/// this only when the request did not specify its own workdir.
+/// Fields are private and the ONLY constructor is [`ResolvedLaunch::resolve`],
+/// which performs the merge — and [`write_oci_bundle`], the single path that
+/// creates an OCI container, requires a `&ResolvedLaunch`. So every container
+/// launch necessarily honors the image config: the detached and interactive
+/// paths both go through it, and a *future* launch path won't compile without
+/// resolving. That's what keeps Env/WorkingDir/User from being silently dropped
+/// on some path — the failure mode this type exists to make impossible.
 #[cfg(target_os = "linux")]
-fn resolve_image_command(
-    image: &str,
+struct ResolvedLaunch {
     command: Vec<String>,
-) -> Result<(Vec<String>, Option<String>), Box<dyn std::error::Error>> {
-    let info = storage::query_image(image)?
-        .ok_or_else(|| -> Box<dyn std::error::Error> { format!("image not found: {image}").into() })?;
-    let workdir = info.workdir.clone();
-    if !command.is_empty() {
-        return Ok((command, workdir));
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    user: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl ResolvedLaunch {
+    /// Merge the request's launch params with the image's OCI config:
+    /// - **command**: the request's, else the image's `ENTRYPOINT` + `CMD`
+    ///   (errors if neither exists), so a service-style image runs as authored.
+    /// - **env**: the image's `Env` (notably `PATH`) with the request layered on
+    ///   top — the request wins per key.
+    /// - **workdir / user**: the request's, else the image's — an image `CMD` is
+    ///   relative to its `WORKDIR`, and its `USER` is the uid it expects to run as.
+    fn resolve(
+        image: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!("image not found: {image}").into()
+        })?;
+        let command = if command.is_empty() {
+            let mut resolved = info.entrypoint;
+            resolved.extend(info.cmd);
+            if resolved.is_empty() {
+                return Err(format!(
+                    "no command given and image '{image}' defines no entrypoint or cmd"
+                )
+                .into());
+            }
+            resolved
+        } else {
+            command
+        };
+        Ok(Self {
+            command,
+            env: merge_image_env(info.env, env),
+            workdir: workdir.or(info.workdir),
+            user: user.or(info.user),
+        })
     }
-    let mut resolved = info.entrypoint;
-    resolved.extend(info.cmd);
-    if resolved.is_empty() {
-        return Err(
-            format!("no command given and image '{image}' defines no entrypoint or cmd").into(),
-        );
-    }
-    Ok((resolved, workdir))
+}
+
+/// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
+/// request wins on key conflicts, image entries fill in the rest — matching how
+/// a container runtime composes image + run-time environment.
+#[cfg(target_os = "linux")]
+fn merge_image_env(
+    image_env: Vec<String>,
+    request_env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let request_keys: std::collections::HashSet<&str> =
+        request_env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut merged: Vec<(String, String)> = image_env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(k, _)| !request_keys.contains(*k))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    merged.extend(request_env);
+    merged
 }
 
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
@@ -2935,19 +2994,23 @@ fn resolve_image_command(
 fn write_oci_bundle(
     rootfs_path: &std::path::Path,
     bundle_path: &std::path::Path,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    user: Option<&str>,
+    launch: &ResolvedLaunch,
     mounts: &[(String, String, bool)],
     tty: bool,
     unprivileged: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    let workdir_str = workdir.unwrap_or("/");
-    let identity = oci::resolve_process_identity(rootfs_path, user)?;
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity, unprivileged);
+    let workdir_str = launch.workdir.as_deref().unwrap_or("/");
+    let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
+    let mut spec = oci::OciSpec::new(
+        &launch.command,
+        &launch.env,
+        workdir_str,
+        tty,
+        &identity,
+        unprivileged,
+    );
 
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
@@ -3001,7 +3064,7 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, mut command, env, mut workdir, user, mounts, persistent_overlay_id, unprivileged) =
+    let (image, command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
         match request {
             AgentRequest::Run {
                 image,
@@ -3065,28 +3128,21 @@ fn handle_run_detached(
         }
     };
 
-    // Resolve the command from the image's OCI ENTRYPOINT+CMD when the caller
-    // gave none (so service-style images run as their authors intended), and
-    // honor the image's WorkingDir when the request didn't set one — an image
-    // CMD is relative to its WORKDIR (e.g. `node server.js` in `/app`), so
-    // running it from `/` (the default) would fail with "cannot find module".
-    {
-        let (resolved_command, image_workdir) = match resolve_image_command(&image, command) {
-            Ok(r) => r,
-            Err(e) => {
-                send_response(
-                    stream,
-                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
-                )?;
-                return Ok(());
-            }
-        };
-        command = resolved_command;
-        if workdir.is_none() {
-            workdir = image_workdir;
+    // Resolve the container's launch settings from the image's OCI config
+    // (command, Env, WorkingDir, User) with the request layered on top.
+    // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
+    // silently dropped here or on any other launch path.
+    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
+        Ok(l) => l,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
         }
-        info!(image = %image, command = ?command, workdir = ?workdir, "resolved command + workdir from image config");
-    }
+    };
+    info!(image = %image, command = ?launch.command, workdir = ?launch.workdir, user = ?launch.user, "resolved launch from request + image config");
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
         send_response(
@@ -3128,10 +3184,7 @@ fn handle_run_detached(
     let container_id = match write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        &command,
-        &env,
-        workdir.as_deref(),
-        user.as_deref(),
+        &launch,
         &mounts,
         false,
         unprivileged,
@@ -3319,14 +3372,18 @@ pub fn is_container_running(_container_id: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn spawn_exec_in_container(
     container_id: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    launch: &ResolvedLaunch,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
     use std::sync::atomic::Ordering;
+
+    // An exec joining a running container inherits the same image-resolved env /
+    // workdir as the container's main process.
+    let command: &[String] = &launch.command;
+    let env: &[(String, String)] = &launch.env;
+    let workdir: Option<&str> = launch.workdir.as_deref();
 
     info!(
         container_id = %container_id,
@@ -3466,10 +3523,7 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 #[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    user: Option<&str>,
+    launch: &ResolvedLaunch,
     mounts: &[(String, String, bool)],
     tty: bool,
     persistent_overlay_id: Option<&str>,
@@ -3480,13 +3534,13 @@ fn spawn_interactive_command(
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
-    if command.is_empty() {
+    if launch.command.is_empty() {
         return Err("empty command".into());
     }
 
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
-        return spawn_exec_in_container(&cid, command, env, workdir, tty);
+        return spawn_exec_in_container(&cid, launch, tty);
     }
 
     let rootfs_path = Path::new(rootfs);
@@ -3502,17 +3556,8 @@ fn spawn_interactive_command(
     // Build the OCI bundle (config.json) and get a fresh container ID. When
     // tty=true the spec sets terminal:true and a starting consoleSize, and the
     // PTY master is obtained from crun via --console-socket below.
-    let container_id = write_oci_bundle(
-        rootfs_path,
-        &bundle_path,
-        command,
-        env,
-        workdir,
-        user,
-        mounts,
-        tty,
-        unprivileged,
-    )?;
+    let container_id =
+        write_oci_bundle(rootfs_path, &bundle_path, launch, mounts, tty, unprivileged)?;
 
     // Persist the container ID so subsequent execs join this container.
     // Written before spawn: if spawn fails the ID is stale, but
@@ -3526,7 +3571,7 @@ fn spawn_interactive_command(
     }
 
     info!(
-        command = ?command,
+        command = ?launch.command,
         container_id = %container_id,
         bundle = %bundle_path.display(),
         mounts = mounts.len(),
