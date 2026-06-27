@@ -614,9 +614,19 @@ TROUBLESHOOTING
 For more information: https://github.com/smolvm/smolvm
 EOF
 
-# Generate checksums
+# Generate checksums. Use sha256sum where available (Linux/coreutils, incl.
+# Arch) and fall back to `shasum -a 256` (the macOS default, which has no
+# sha256sum). Both emit the same "<hash>  <file>" format.
 echo "Generating checksums..."
-(cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD=(shasum -a 256)
+else
+    echo "Error: neither sha256sum nor shasum found; cannot generate checksums" >&2
+    exit 1
+fi
+(cd "$DIST_DIR" && "${SHA256_CMD[@]}" smolvm smolvm-bin lib/* > checksums.txt)
 
 # Delete existing tarball. This is because when a new release is created, there could be 
 # tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball

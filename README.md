@@ -14,7 +14,7 @@ smolvm
 Ship and run software with isolation by default.
 
 This is a CLI tool that lets you:
-1. Manage and run custom Linux virtual machines locally with: sub-second cold start, cross-platform (macOS, Linux), elastic memory usage.
+1. Manage and run custom Linux virtual machines locally with: sub-second cold start, cross-platform (macOS, Linux, Windows), elastic memory usage.
 2. Pack a stateful virtual machine into a single file (.smolmachine) to rehydrate on any supported platform.
 
 Install
@@ -29,6 +29,8 @@ curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
 Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases), and place it into `~/.local/share/`.
+
+**Windows:** download the `windows-x86_64` release (bundles `krun.dll` + `libkrunfw.dll`), unzip it, and run `smolvm.exe`. Requires the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (WHP) feature enabled.
 
 Quick Start
 -----------
@@ -129,7 +131,7 @@ More examples: [python](https://github.com/smol-machines/smolvm/tree/main/exampl
 How It Works
 ------------
 
-Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS) or KVM (Linux). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
+Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
 Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
@@ -157,6 +159,7 @@ Platform Support
 | macOS Intel | x86_64 Linux | macOS 11+ (untested) |
 | Linux x86_64 | x86_64 Linux | KVM (`/dev/kvm`) |
 | Linux aarch64 | aarch64 Linux | KVM (`/dev/kvm`) |
+| Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) enabled |
 
 Known Limitations
 -----------------
@@ -166,6 +169,7 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
+* Windows: networking uses the transparent socket layer (TSI) — `--net` gives TCP/UDP and inbound port-forwarding, but virtio-net, GPU acceleration, and fork/snapshot are not available. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
 GPU Acceleration
 ----------------

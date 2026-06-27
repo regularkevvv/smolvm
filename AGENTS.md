@@ -2,6 +2,16 @@
 
 A tool to build and run portable, self-contained virtual machines locally. <200ms boot time. No daemon, no Docker.
 
+## Platform Support
+
+| Host | Guest | Hypervisor | Requirements |
+|------|-------|------------|--------------|
+| macOS Apple Silicon | arm64 Linux | Hypervisor.framework | macOS 11+ |
+| Linux x86_64 / aarch64 | matching Linux | KVM | `/dev/kvm` |
+| Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) | WHP feature enabled |
+
+Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no fork/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
+
 ## Quick Reference
 
 ```bash
@@ -304,6 +314,8 @@ Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an
 ## GPU Acceleration
 
 Enable the host GPU inside a VM with `--gpu`. Guest Vulkan talks to the host GPU via virtio-gpu/Venus; ANGLE uses it as the WebGL/OpenGL ES backend.
+
+Not available on Windows (WHP) — `--gpu` has no effect there.
 
 **Host setup:**
 - macOS — bundled, no extra installs needed.
