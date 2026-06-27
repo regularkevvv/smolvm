@@ -933,8 +933,17 @@ impl ApiState {
     /// reuse, and covers orphan processes not tracked in-memory.
     pub fn is_machine_alive(&self, name: &str) -> bool {
         if let Some(entry) = self.machines.read().get(name) {
-            let entry = entry.lock();
-            entry.manager.is_process_alive()
+            // This runs on the supervisor's heartbeat path, so it must never
+            // block. A `MachineEntry` whose lock is currently held is, by
+            // definition, actively in use (mid agent I/O) — i.e. alive — so we
+            // treat lock contention as "alive" rather than parking the
+            // supervisor on it. Blocking here behind a single busy/stuck
+            // machine would stall the runtime heartbeat and mark the entire
+            // node unschedulable.
+            match entry.try_lock() {
+                Some(entry) => entry.manager.is_process_alive(),
+                None => true,
+            }
         } else {
             false
         }
@@ -956,11 +965,22 @@ where
 {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        if let Some(tid) = trace_id {
-            client.set_trace_id(tid);
-        }
+        // Acquire a connected client under the per-machine lock, then RELEASE
+        // the lock before running the (potentially long, unbounded-blocking)
+        // agent operation. `connect()` returns an owned `AgentClient` over its
+        // own socket, so `op` needs no lock once connected. Holding the
+        // `MachineEntry` lock across blocking agent I/O lets a hung guest agent
+        // pin the lock indefinitely, which blocks the supervisor's liveness
+        // probe (`is_machine_alive`) and stalls the whole runtime heartbeat —
+        // marking the node unschedulable behind a single stuck exec.
+        let mut client = {
+            let entry = entry_clone.lock();
+            let mut client = entry.manager.connect()?;
+            if let Some(tid) = trace_id {
+                client.set_trace_id(tid);
+            }
+            client
+        };
         op(&mut client)
     })
     .await?
@@ -1372,6 +1392,65 @@ mod tests {
             state.remove_machine("remove-test-m1"),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    // REGRESSION (runtime-wedge): the supervisor's liveness probe must NEVER
+    // block on the per-machine `MachineEntry` lock. A machine that is mid
+    // agent-I/O (e.g. a stuck exec) holds that lock; if `is_machine_alive`
+    // blocked on it, one wedged machine would stall the supervisor heartbeat
+    // and mark the whole node unschedulable (the 503/black-hole wedge observed
+    // under concurrent boots). With the entry lock held, `is_machine_alive`
+    // must return promptly, reporting the in-use machine as alive.
+    #[test]
+    fn is_machine_alive_does_not_block_when_entry_locked() {
+        use std::time::Duration;
+
+        let (_dir, state) = temp_api_state();
+        let record = VmRecord::new("busy-m1".into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm("busy-m1", &record).unwrap();
+        let manager = AgentManager::for_vm("busy-m1").unwrap();
+        state.insert_machine(
+            "busy-m1",
+            MachineEntry {
+                manager,
+                mounts: vec![],
+                ports: vec![],
+                resources: ResourceSpec {
+                    cpus: None,
+                    memory_mb: None,
+                    network: None,
+                    gpu: None,
+                    storage_gb: None,
+                    overlay_gb: None,
+                    allowed_cidrs: None,
+                    network_backend: None,
+                },
+                restart: RestartConfig::default(),
+                network: false,
+                secret_refs: Default::default(),
+                source_smolmachine: None,
+            },
+        );
+
+        // Hold the entry lock to simulate an in-flight agent op pinning it.
+        let entry = state.get_machine("busy-m1").unwrap();
+        let held = entry.lock();
+
+        // The probe must finish without waiting on the held lock. If it blocked,
+        // the scoped thread would still be running after the grace period.
+        std::thread::scope(|s| {
+            let h = s.spawn(|| state.is_machine_alive("busy-m1"));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                h.is_finished(),
+                "is_machine_alive blocked on a held MachineEntry lock — would stall the supervisor"
+            );
+            assert!(
+                h.join().unwrap(),
+                "a locked (actively in-use) machine must read as alive"
+            );
+        });
+        drop(held);
     }
 
     // ========================================================================
