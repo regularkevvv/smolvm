@@ -27,6 +27,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// How many orphaned ephemeral VMs `machine run` reaps per boot. Small so the
+/// hot path never stalls on a large backlog; a heavier backlog drains over
+/// successive runs (and other commands sweep without a cap).
+const EPHEMERAL_RUN_SWEEP_CAP: usize = 8;
+
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
 /// net flag, and the original hostname list (for DNS filtering).
 ///
@@ -246,10 +251,15 @@ pub enum MachineCmd {
 
 impl MachineCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Skip orphan cleanup for ephemeral `machine run` — it creates and
-        // immediately destroys its VM, so stale records don't affect it.
-        // Other commands (ls, exec, create, etc.) clean up first.
-        if !matches!(self, MachineCmd::Run(_)) {
+        // Reclaim orphaned ephemeral VMs before doing work. `machine run` uses a
+        // BOUNDED sweep: a workflow that only ever calls `machine run` would
+        // otherwise never reclaim a data dir left by a run whose detached cleanup
+        // helper didn't finish (Ctrl-C / SIGKILL / host sleep mid-run). The cap
+        // keeps the boot hot path from stalling on a large backlog — it drains
+        // over successive runs. Other commands sweep everything.
+        if matches!(self, MachineCmd::Run(_)) {
+            super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
+        } else {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
