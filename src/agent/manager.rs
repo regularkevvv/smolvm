@@ -339,6 +339,46 @@ pub fn vm_dir_hash(name: &str) -> String {
     hex::encode(&digest[..8])
 }
 
+/// Sweep stale readiness markers out of the shared agent rootfs.
+///
+/// Every VM writes a per-VM marker `.smolvm-ready.<hash>` into the *shared*
+/// agent rootfs, where `<hash>` is its data-dir name. `cleanup_marker_files`
+/// removes a VM's own marker on clean teardown, but a crash / SIGKILL / external
+/// reap leaves it behind — and `delete_vm` removes the VM's data dir, not the
+/// marker in the shared rootfs — so the rootfs accumulates one stale marker per
+/// VM ever booted. Under uid isolation those markers are foreign-owned `0600`,
+/// which also broke `pack create` (BUG-151). Remove any marker whose VM data dir
+/// (`vm_cache_root()/<hash>`) no longer exists. The host owns the rootfs
+/// directory, so it can unlink the markers regardless of their file owner.
+/// Best-effort: I/O errors are ignored.
+pub fn prune_orphaned_ready_markers() {
+    if let Ok(rootfs) = AgentManager::default_rootfs_path() {
+        prune_orphaned_ready_markers_in(&rootfs, &vm_cache_root());
+    }
+}
+
+/// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
+fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
+    let prefix = format!("{}.", AGENT_READY_MARKER);
+    let Ok(entries) = std::fs::read_dir(rootfs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(hash) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // A marker with no hash suffix is the shared/legacy `.smolvm-ready`; leave
+        // it. Otherwise the marker is stale iff its VM data dir is gone.
+        if !hash.is_empty() && !vm_cache_root.join(hash).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Create the VM data directory and commit the `name → hash` binding.
 ///
 /// Writes (or verifies) a plaintext `name` file inside the hash directory.
@@ -2311,6 +2351,32 @@ mod tests {
         // Callers rely on this to locate existing VM data across processes.
         assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
         assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
+    }
+
+    #[test]
+    fn prune_removes_only_orphaned_ready_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("agent-rootfs");
+        let cache = tmp.path().join("vms");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // A live VM (its data dir exists) and markers in the shared rootfs.
+        std::fs::create_dir_all(cache.join("aaaa")).unwrap();
+        let live = rootfs.join(format!("{AGENT_READY_MARKER}.aaaa")); // VM exists -> keep
+        let orphan = rootfs.join(format!("{AGENT_READY_MARKER}.bbbb")); // VM gone -> remove
+        let legacy = rootfs.join(AGENT_READY_MARKER); // no hash suffix -> keep
+        let real_file = rootfs.join("bin"); // not a marker -> keep
+        for p in [&live, &orphan, &legacy, &real_file] {
+            std::fs::write(p, b"1").unwrap();
+        }
+
+        prune_orphaned_ready_markers_in(&rootfs, &cache);
+
+        assert!(live.exists(), "marker for a live VM must be kept");
+        assert!(!orphan.exists(), "marker for a deleted VM must be removed");
+        assert!(legacy.exists(), "the hash-less shared marker must be kept");
+        assert!(real_file.exists(), "non-marker files must be untouched");
     }
 
     #[test]

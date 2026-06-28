@@ -1554,6 +1554,12 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         }
     }
 
+    // The VM's readiness marker lives in the *shared* agent rootfs, not its data
+    // dir, so the removal above doesn't take it. Sweep it (and any other markers
+    // orphaned by a crash/kill) now that this VM's data dir is gone, so the
+    // rootfs doesn't accumulate stale markers (which also broke `pack create`).
+    smolvm::agent::prune_orphaned_ready_markers();
+
     println!("Deleted machine: {}", name);
     Ok(())
 }

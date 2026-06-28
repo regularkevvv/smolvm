@@ -26,8 +26,8 @@ pub use launcher::{
 };
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
-    read_egress_telemetry, resolve_disk_image, vm_cache_root, vm_data_dir, vm_dir_hash,
-    vm_uid_registry_dir, AgentManager, AgentState,
+    prune_orphaned_ready_markers, read_egress_telemetry, resolve_disk_image, vm_cache_root,
+    vm_data_dir, vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState,
 };
 
 /// Agent VM name.
