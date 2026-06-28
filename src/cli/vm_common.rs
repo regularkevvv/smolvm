@@ -1967,11 +1967,11 @@ pub fn deregister_ephemeral_vm(name: &str) {
 /// Pure (no I/O) so the reaping policy is unit-testable: given the VM list and a
 /// liveness probe, it returns at most `limit` orphan names in list order. A
 /// non-ephemeral or still-alive record is never returned.
-fn orphaned_ephemeral_names<'a>(
-    vms: &'a [(String, VmRecord)],
+fn orphaned_ephemeral_names(
+    vms: &[(String, VmRecord)],
     is_alive: impl Fn(i32) -> bool,
     limit: usize,
-) -> Vec<&'a str> {
+) -> Vec<&str> {
     let mut out = Vec::new();
     for (name, record) in vms {
         if out.len() >= limit {
