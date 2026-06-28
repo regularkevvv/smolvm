@@ -218,6 +218,16 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         if let Some(ref d) = config.packed_layers_dir {
             read_exec.push(d.clone());
         }
+        // Grant read+exec on the directory libkrun/libkrunfw are actually
+        // dlopen'd from, resolved EXACTLY like the loader (`find_lib_dir`):
+        // `SMOLVM_LIB_DIR` if it holds the libs, else exe-relative bundle paths
+        // (`lib/`, `../../lib/linux-<arch>`, …). Consulting only `SMOLVM_LIB_DIR`
+        // denied the bundled/dev layout — where the libs live in an exe-relative
+        // `lib/` dir and the env var is unset — making `libkrunfw.so` fail to
+        // load under enforce ("cannot open shared object file: Permission denied").
+        if let Some(lib_dir) = smolvm::agent::find_lib_dir() {
+            read_exec.push(lib_dir);
+        }
         if let Some(libdir) = std::env::var_os("SMOLVM_LIB_DIR") {
             read_exec.push(std::path::PathBuf::from(libdir));
         }

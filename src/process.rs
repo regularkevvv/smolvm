@@ -512,6 +512,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         // epoll / poll event loops (virtio, vsock/TSI)
         libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
         libc::SYS_epoll_pwait, libc::SYS_ppoll,
+        // timerfd — the virtio-net host network stack's event loop arms timers
+        // (TCP retransmit/poll) via timerfd; without these the VMM is SIGSYS-killed
+        // at start as soon as a published port enables virtio-net.
+        libc::SYS_timerfd_create, libc::SYS_timerfd_settime, libc::SYS_timerfd_gettime,
         // sockets (vsock/TSI data path, host networking)
         libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
