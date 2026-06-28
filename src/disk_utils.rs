@@ -424,10 +424,19 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
 
     let mut total: u64 = 0;
     let mut buf = vec![0u8; 1024 * 1024];
-    let mut out: Vec<AllocatedRange> = vec![AllocatedRange { file_offset: 0, length: 0 }; 1024];
+    let mut out: Vec<AllocatedRange> = vec![
+        AllocatedRange {
+            file_offset: 0,
+            length: 0
+        };
+        1024
+    ];
     // Query allocated ranges starting at 0; the FSCTL fills as many as fit, and
     // signals ERROR_MORE_DATA when there are more (resume past the last range).
-    let mut query = AllocatedRange { file_offset: 0, length: src_len as i64 };
+    let mut query = AllocatedRange {
+        file_offset: 0,
+        length: src_len as i64,
+    };
     loop {
         let mut returned: u32 = 0;
         // SAFETY: src handle is live; `query` is a valid input record; `out` is a
@@ -444,7 +453,8 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
                 std::ptr::null_mut(),
             )
         };
-        let more = ok == 0 && std::io::Error::last_os_error().raw_os_error() == Some(ERROR_MORE_DATA);
+        let more =
+            ok == 0 && std::io::Error::last_os_error().raw_os_error() == Some(ERROR_MORE_DATA);
         if ok == 0 && !more {
             return Err(std::io::Error::last_os_error());
         }
@@ -578,7 +588,10 @@ mod tests {
             logical_len,
             "clone must preserve logical length"
         );
-        assert_eq!(src_bytes, dst_bytes, "clone must be byte-identical to source");
+        assert_eq!(
+            src_bytes, dst_bytes,
+            "clone must be byte-identical to source"
+        );
         assert_eq!(&dst_bytes[..head.len()], head);
         assert_eq!(&dst_bytes[dst_bytes.len() - tail.len()..], tail);
 
