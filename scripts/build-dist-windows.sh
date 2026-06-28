@@ -5,7 +5,7 @@
 # it runs on a Linux host, cross-compiles smolvm.exe with the mingw-w64 toolchain,
 # and assembles the layout that boots on Windows/WHP — smolvm.exe with krun.dll +
 # libkrunfw.dll beside it (Windows resolves DLLs from the exe's directory), the
-# Linux x86_64 agent-rootfs, and the pre-formatted ext4 disk templates. The guest
+# Linux x86_64 agent-rootfs (as a tarball), and the pre-formatted ext4 disk templates. The guest
 # is Linux, so the rootfs/templates are the same artifacts the linux-x86_64 dist
 # ships; only the host binary + libraries are Windows-specific.
 #
@@ -70,18 +70,25 @@ cp "$EXE" "$DIST_DIR/smolvm.exe"
 cp "$LIB_DIR/krun.dll" "$DIST_DIR/krun.dll"
 cp "$LIB_DIR/libkrunfw.dll" "$DIST_DIR/libkrunfw.dll"
 
-# Linux x86_64 guest rootfs (cp -a preserves the busybox symlinks). The caller
-# must have placed the smolvm-agent binary into the rootfs already — the rootfs
-# artifact itself ships agent-less (the agent is injected per-dist, like the
-# Unix build-dist.sh path).
+# Ship the Linux x86_64 guest rootfs as a TARBALL, not an extracted dir: a `.zip`
+# can't carry the dir tree (busybox symlinks, modes, special files) — that is what
+# broke the first attempt. smolvm.exe extracts `agent-rootfs.tar.gz` on first run
+# via ensure_extracted_rootfs (Windows `tar.exe`; symlinks it can't make are
+# skipped, tolerated by the runtime). The caller must have injected the agent
+# binary into the rootfs already (the rootfs artifact ships agent-less).
 if [[ ! -f "$ROOTFS_SRC/usr/local/bin/smolvm-agent" ]]; then
     echo "Error: target/agent-rootfs is missing usr/local/bin/smolvm-agent." >&2
     echo "       Inject the Linux x86_64 agent into the rootfs before packaging." >&2
     exit 1
 fi
-mkdir -p "$DIST_DIR/agent-rootfs"
-cp -a "$ROOTFS_SRC"/. "$DIST_DIR/agent-rootfs/"
-echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
+# The rootfs is extracted as root in CI; use sudo to read any restricted files,
+# then hand the tarball back to the runner user so the later `zip` can read it.
+TAR_SUDO=""
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then TAR_SUDO="sudo"; fi
+echo "Packing agent-rootfs.tar.gz..."
+$TAR_SUDO tar -czf "$DIST_DIR/agent-rootfs.tar.gz" -C "$ROOTFS_SRC" .
+[[ -n "$TAR_SUDO" ]] && $TAR_SUDO chown "$(id -u):$(id -g)" "$DIST_DIR/agent-rootfs.tar.gz"
+echo "Agent rootfs tarball: $(du -h "$DIST_DIR/agent-rootfs.tar.gz" | cut -f1)"
 
 # --- Pre-formatted ext4 disk templates -------------------------------------
 # Windows has no host mkfs.ext4, so the release ships pre-formatted templates
@@ -138,7 +145,7 @@ EOF
 
 # --- Checksums + zip --------------------------------------------------------
 echo "Generating checksums..."
-( cd "$DIST_DIR" && sha256sum smolvm.exe krun.dll libkrunfw.dll > checksums.txt )
+( cd "$DIST_DIR" && sha256sum smolvm.exe krun.dll libkrunfw.dll agent-rootfs.tar.gz > checksums.txt )
 
 echo "Creating zip..."
 ( cd dist && rm -f "${DIST_NAME}.zip" && zip -qr "${DIST_NAME}.zip" "${DIST_NAME}" )

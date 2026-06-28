@@ -94,6 +94,11 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 
     let candidates = [
         exe_dir.join("lib"),
+        // The Windows release ships krun.dll / libkrunfw.dll directly beside
+        // smolvm.exe (no lib/ subdir, no wrapper to set SMOLVM_LIB_DIR), matching
+        // the convention that Windows resolves DLLs from the executable's own
+        // directory. Harmless on Unix dists, where the libs live in lib/.
+        exe_dir.to_path_buf(),
         exe_dir.join("../lib"),
         exe_dir.join("../../lib"),
         exe_dir.join(format!("../../lib/linux-{}", std::env::consts::ARCH)),

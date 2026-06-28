@@ -719,6 +719,28 @@ impl AgentManager {
             return Self::ensure_extracted_rootfs(Path::new(&tar));
         }
 
+        // Distribution layout: the binary sits next to its rootfs. The macOS /
+        // Linux tarballs use a wrapper script that sets SMOLVM_AGENT_ROOTFS, but
+        // the Windows release ships `smolvm.exe` with no wrapper, so resolve the
+        // rootfs relative to the executable: prefer an already-extracted
+        // `agent-rootfs/` dir, else extract a bundled `agent-rootfs.tar[.gz]`
+        // once (a `.zip` can't carry the Linux dir tree with its symlinks/modes).
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            let dir = exe_dir.join("agent-rootfs");
+            if dir.is_dir() {
+                return Ok(dir);
+            }
+            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+                let tar = exe_dir.join(name);
+                if tar.is_file() {
+                    return Self::ensure_extracted_rootfs(&tar);
+                }
+            }
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
@@ -768,11 +790,23 @@ impl AgentManager {
             .status()
             .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
         if !status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(Error::storage(
-                "extract rootfs tar",
-                format!("tar exited with {status}"),
-            ));
+            // On Windows, `tar` can't recreate the rootfs's busybox symlinks
+            // without symlink privilege (Developer Mode / elevation) and exits
+            // non-zero with warnings — but the real files (notably the agent)
+            // still extract. Treat the result as usable as long as the agent
+            // binary landed; otherwise it's a genuine extraction failure.
+            let agent_present = tmp.join("usr/local/bin/smolvm-agent").exists();
+            if !agent_present {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::storage(
+                    "extract rootfs tar",
+                    format!("tar exited with {status} and the agent binary was not extracted"),
+                ));
+            }
+            tracing::warn!(
+                "rootfs tar extraction exited with {status} (host could not create some \
+                 symlinks); continuing — the agent binary extracted successfully"
+            );
         }
         let _ = std::fs::write(tmp.join(".extracted"), b"");
         // Atomic publish; if another process won the race, just use theirs.
