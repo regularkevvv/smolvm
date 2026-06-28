@@ -286,6 +286,19 @@ impl ApiState {
                 if let Err(e) = self.db.remove_vm(&name) {
                     tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
                 }
+                // Reclaim the data dir too. Removing only the DB record leaks the
+                // machine's storage + overlay images (multi-GB sparse files) — and
+                // since the record is gone, nothing will ever clean them up later.
+                // On a long-lived node that churns/crashes machines this is a slow
+                // disk-fill across server restarts. The `pid.is_some()` guard above
+                // means we only touch machines that were started and then died, not
+                // intentionally-stopped (pid=None) machines whose disks must persist.
+                let dir = crate::agent::vm_data_dir(&name);
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                    }
+                }
                 continue;
             }
 
@@ -1467,6 +1480,12 @@ mod tests {
         record.state = RecordState::Running;
         state.db.insert_vm("dead-machine", &record).unwrap();
 
+        // Give it a data dir with a marker file — reconciliation must reclaim it,
+        // not just the DB record (otherwise the disks leak across restarts).
+        let data_dir = crate::agent::vm_data_dir("dead-machine");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("storage.raw"), b"x").unwrap();
+
         // Verify record exists before load
         assert!(state.db.get_vm("dead-machine").unwrap().is_some());
 
@@ -1478,6 +1497,12 @@ mod tests {
         assert!(
             state.db.get_vm("dead-machine").unwrap().is_none(),
             "dead machine DB record should be removed"
+        );
+
+        // Data dir should be reclaimed too (no disk leak).
+        assert!(
+            !data_dir.exists(),
+            "dead machine data dir should be removed, not leaked"
         );
 
         // Name should be available for reuse
