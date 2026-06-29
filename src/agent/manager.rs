@@ -2012,19 +2012,33 @@ impl AgentManager {
                 );
             }
             let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        } else {
-            tracing::warn!(
-                pid,
-                "skipping kill: PID identity not verified and vsock shutdown failed"
-            );
         }
 
         if process::is_alive(pid) {
+            if !identity_ok {
+                // Kill was skipped (no vsock ack, start-time unverifiable) AND the
+                // process is genuinely still alive — a real orphan/leak risk.
+                tracing::warn!(
+                    pid,
+                    "skipping kill: PID identity not verified and vsock shutdown \
+                     failed; process still alive"
+                );
+            }
             Err(Error::agent(
                 "stop agent",
                 format!("process {} still alive after stop attempts", pid),
             ))
         } else {
+            if !identity_ok {
+                // The vsock connect failed because the VMM was already exiting, so
+                // the skipped SIGKILL was a no-op against an already-dead process.
+                // Benign teardown race (not a leak) — log at debug, not warn.
+                tracing::debug!(
+                    pid,
+                    "skipped kill (identity unverified, vsock shutdown failed); \
+                     process already exited"
+                );
+            }
             Ok(())
         }
     }

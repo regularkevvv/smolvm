@@ -174,7 +174,17 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
 /// Uses verified signals to prevent killing an unrelated process if the
 /// PID was recycled by the OS. Returns true if the process is confirmed
 /// dead (or was never running), false if it may still be alive.
-fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option<u64>) -> bool {
+/// `graceful`: when true (stop), give the guest a SIGTERM grace period to flush
+/// to its persistent overlay before SIGKILL. When false (delete), the machine's
+/// disks are discarded immediately after, so there is nothing to flush — SIGKILL
+/// at once instead of waiting out the guest's graceful shutdown (the bulk of the
+/// ~1.9s DELETE latency on metal).
+fn shutdown_machine_process(
+    name: &str,
+    pid: Option<i32>,
+    pid_start_time: Option<u64>,
+    graceful: bool,
+) -> bool {
     // Try graceful shutdown via vsock first.
     // If vsock connects, this confirms the process is our VM (identity verification).
     let manager = AgentManager::for_vm(name).ok();
@@ -195,7 +205,15 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
         let identity_ok = vsock_confirmed || is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
-            let _ = stop_vm_process(pid, VM_SIGTERM_TIMEOUT, VM_SIGKILL_TIMEOUT);
+            // On delete the disks are removed right after, so skip the SIGTERM
+            // grace and SIGKILL immediately (ZERO grace). On stop keep the grace
+            // so the guest can flush to its persistent overlay first.
+            let sigterm = if graceful {
+                VM_SIGTERM_TIMEOUT
+            } else {
+                Duration::ZERO
+            };
+            let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
@@ -1149,11 +1167,11 @@ pub async fn stop_machine(
                 Ok(()) => true,
                 Err(err) => {
                     tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
-                    shutdown_machine_process(&name_clone, pid, pid_start_time)
+                    shutdown_machine_process(&name_clone, pid, pid_start_time, true)
                 }
             }
         } else {
-            shutdown_machine_process(&name_clone, pid, pid_start_time)
+            shutdown_machine_process(&name_clone, pid, pid_start_time, true)
         };
         if ok {
             // Process is gone — detach this machine's case-sensitive layers
@@ -1254,7 +1272,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     .as_ref()
                     .map(|e| e.lock().manager.stop().is_ok())
                     .unwrap_or(false);
-                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time)
+                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time, true)
             })
             .await
             .unwrap_or(false);
@@ -1325,7 +1343,7 @@ pub async fn delete_machine(
     // Stop if running (in blocking task)
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time);
+        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time, false);
         if ok {
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
