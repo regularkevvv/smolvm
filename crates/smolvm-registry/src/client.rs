@@ -748,7 +748,10 @@ impl RegistryClient {
             if !is_next {
                 continue;
             }
-            let url = url_part.trim().trim_start_matches('<').trim_end_matches('>');
+            let url = url_part
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>');
             if !url.is_empty() {
                 return Some(url.to_string());
             }
@@ -1308,11 +1311,17 @@ mod tests {
 
     #[test]
     fn parse_next_link_ignores_non_next_and_missing() {
-        assert_eq!(RegistryClient::parse_next_link(r#"</v2/_catalog>; rel="prev""#), None);
+        assert_eq!(
+            RegistryClient::parse_next_link(r#"</v2/_catalog>; rel="prev""#),
+            None
+        );
         assert_eq!(RegistryClient::parse_next_link(""), None);
         // Multiple entries: only the rel="next" one is picked.
         let h = r#"</a>; rel="prev", </b?n=2>; rel="next""#;
-        assert_eq!(RegistryClient::parse_next_link(h).as_deref(), Some("/b?n=2"));
+        assert_eq!(
+            RegistryClient::parse_next_link(h).as_deref(),
+            Some("/b?n=2")
+        );
     }
 
     #[test]
