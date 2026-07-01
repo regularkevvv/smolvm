@@ -909,6 +909,17 @@ pub fn start_vm_named(
         }
     }
 
+    // First boot pulls the base image in-guest, subject to the egress filter —
+    // fold the image's registry into the enforced policy so a hostname scope
+    // doesn't block its own pull. Subsequent starts skip the pull, so they keep
+    // the user's scope unwidened.
+    if !record.init_completed {
+        features.allow_image_pull_egress(
+            record.image.as_deref(),
+            features.packed_layers_dir.is_some(),
+        );
+    }
+
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
