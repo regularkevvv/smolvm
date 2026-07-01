@@ -201,6 +201,26 @@ pub fn extract_registry(image: &str) -> String {
     DEFAULT_REGISTRY.to_string()
 }
 
+/// Hosts to add to a hostname egress allow-list so a scoped machine can still
+/// PULL this image in-guest on first boot.
+///
+/// The DNS filter matches exact-or-subdomain, so a single apex covers a
+/// registry's sub-hosts. Docker Hub is the exception: its manifests live under
+/// `docker.io` but blobs are served from a `docker.com` CDN, so both apexes are
+/// needed. Every other registry needs only its own host.
+///
+/// Mirrors the control plane's `source_registry_hosts` so a machine's pull
+/// behaves identically whether launched locally or via smolfleet.
+pub fn registry_pull_hosts(image: &str) -> Vec<String> {
+    match extract_registry(image).as_str() {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => {
+            vec!["docker.io".to_string(), "docker.com".to_string()]
+        }
+        host if host.ends_with("smolmachines.com") => vec!["smolmachines.com".to_string()],
+        host => vec![host.to_string()],
+    }
+}
+
 /// Rewrite an image reference to use a different registry.
 ///
 /// # Examples
@@ -488,6 +508,35 @@ mod tests {
             "registry.example.com"
         );
         assert_eq!(extract_registry("localhost:5000/image"), "localhost:5000");
+    }
+
+    #[test]
+    fn test_registry_pull_hosts_dockerhub_two_apexes() {
+        // Docker Hub serves blobs from a docker.com CDN, so both apexes are
+        // needed; a bare/library ref defaults to Docker Hub.
+        let expect = vec!["docker.io".to_string(), "docker.com".to_string()];
+        assert_eq!(registry_pull_hosts("alpine"), expect);
+        assert_eq!(registry_pull_hosts("library/alpine:3.19"), expect);
+        assert_eq!(registry_pull_hosts("docker.io/library/nginx"), expect);
+        assert_eq!(registry_pull_hosts("registry-1.docker.io/foo/bar"), expect);
+    }
+
+    #[test]
+    fn test_registry_pull_hosts_explicit_registry() {
+        // A single apex covers the registry's sub-hosts via subdomain matching.
+        assert_eq!(registry_pull_hosts("ghcr.io/acme/app:1"), vec!["ghcr.io"]);
+        assert_eq!(
+            registry_pull_hosts("registry.example.com:5000/img"),
+            vec!["registry.example.com:5000"]
+        );
+    }
+
+    #[test]
+    fn test_registry_pull_hosts_smolmachines_apex() {
+        assert_eq!(
+            registry_pull_hosts("registry.smolmachines.com/lib/alpine"),
+            vec!["smolmachines.com"]
+        );
     }
 
     #[test]

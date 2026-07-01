@@ -1072,13 +1072,18 @@ impl RunCmd {
         };
         let uses_packed_layers = packed_layers_dir.is_some();
 
-        let features = smolvm::agent::LaunchFeatures {
+        let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
             ..Default::default()
         };
+
+        // This launch pulls a registry image in-guest, subject to the egress
+        // filter — fold its registry into the enforced policy so a hostname
+        // scope doesn't block its own pull.
+        features.allow_image_pull_egress(image.as_deref(), uses_packed_layers);
 
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
