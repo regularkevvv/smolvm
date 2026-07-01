@@ -345,6 +345,7 @@ impl ApiState {
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
                 allowed_cidrs: record.allowed_cidrs.clone(),
+                allowed_hosts: record.dns_filter_hosts.clone(),
                 network_backend: record.network_backend,
             };
 
@@ -815,6 +816,7 @@ impl ApiState {
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
+        record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         record.network_backend = reg.resources.network_backend;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
@@ -1084,15 +1086,21 @@ where
 pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
+    dns_filter_hosts: Option<Vec<String>>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
-    match machine_name {
+    let mut features = match machine_name {
         Some(name) => features.with_packed_layers(
             &crate::agent::machine_layers_cache_dir(name),
             source_smolmachine,
-        ),
-        None => Ok(features),
-    }
+        )?,
+        None => features,
+    };
+    // Carry the egress hostname allow-list into the boot config; `internal_boot`
+    // starts the DNS filter for these names and learns their answers into the
+    // egress allow-list (parity with the CLI `--allow-host` path).
+    features.dns_filter_hosts = dns_filter_hosts;
+    Ok(features)
 }
 
 /// Ensure a machine is running, starting it if needed.
@@ -1137,7 +1145,11 @@ pub async fn ensure_machine_running(
         let features = if entry.manager.try_connect_existing().is_some() {
             crate::agent::LaunchFeatures::default()
         } else {
-            build_launch_features(entry.manager.name(), entry.source_smolmachine.as_deref())?
+            build_launch_features(
+                entry.manager.name(),
+                entry.source_smolmachine.as_deref(),
+                entry.resources.allowed_hosts.clone(),
+            )?
         };
         entry
             .manager
@@ -1273,6 +1285,9 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
         allowed_cidrs: res.allowed_cidrs,
+        // VmResources has no hostname allow-list; callers that need it graft it
+        // back from the source record (see the MachineEntry reload path).
+        allowed_hosts: None,
         network_backend: res.network_backend,
     }
 }
@@ -1339,6 +1354,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         network: entry.network,
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
+        allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
         egress_bytes,
@@ -1389,6 +1405,7 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            allowed_hosts: None,
             network_backend: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
@@ -1399,6 +1416,19 @@ mod tests {
         // Test with network enabled
         let res = resource_spec_to_vm_resources(&spec, true);
         assert!(res.network);
+    }
+
+    #[test]
+    fn build_launch_features_carries_allowed_hosts() {
+        // The serve-API launch path must forward the egress hostname allow-list
+        // into the boot config, so `internal_boot` starts the DNS filter for it.
+        let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
+        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        assert_eq!(features.dns_filter_hosts, Some(hosts));
+
+        // No hostname policy stays None (unrestricted egress, unchanged behavior).
+        let features = build_launch_features(None, None, None).unwrap();
+        assert_eq!(features.dns_filter_hosts, None);
     }
 
     #[test]
@@ -1439,6 +1469,7 @@ mod tests {
                     storage_gb: None,
                     overlay_gb: None,
                     allowed_cidrs: None,
+                    allowed_hosts: None,
                     network_backend: None,
                 },
                 restart: RestartConfig::default(),
@@ -1500,6 +1531,7 @@ mod tests {
                     storage_gb: None,
                     overlay_gb: None,
                     allowed_cidrs: None,
+                    allowed_hosts: None,
                     network_backend: None,
                 },
                 restart: RestartConfig::default(),

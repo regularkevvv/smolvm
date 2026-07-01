@@ -98,6 +98,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
+        allowed_hosts: record.dns_filter_hosts.clone(),
         // Report the RESOLVED provisioned disk sizes, not the request echo: a
         // machine created without an explicit size still gets a real disk at the
         // node default, and billing/telemetry need the actual allocated GiB, not
@@ -161,7 +162,12 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         manager,
         mounts,
         ports,
-        resources: vm_resources_to_spec(record.vm_resources()),
+        resources: ResourceSpec {
+            // VmResources carries no hostname allow-list, so graft it back from the
+            // record — otherwise a reloaded machine would silently lose allowed_hosts.
+            allowed_hosts: record.dns_filter_hosts.clone(),
+            ..vm_resources_to_spec(record.vm_resources())
+        },
         restart: record.restart.clone(),
         network: record.network,
         secret_refs: record.secret_refs.clone(),
@@ -598,6 +604,7 @@ pub async fn create_machine(
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
+        allowed_hosts: req.allowed_hosts.clone(),
         network_backend: req.network_backend,
     };
 
@@ -837,6 +844,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let dns_filter_hosts = record.dns_filter_hosts.clone();
     let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -846,6 +854,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            dns_filter_hosts,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Forkable start: memfd-back guest RAM and expose a control socket at the
@@ -1040,6 +1049,7 @@ pub async fn fork_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.dns_filter_hosts.clone(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
@@ -1821,6 +1831,7 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            allowed_hosts: None,
             network_backend: None,
             restart: None,
             image: None,
