@@ -3153,48 +3153,114 @@ fn run_with_crun(
 // Overlay mounting helper functions
 // ============================================================================
 
-/// Try to mount overlay with multiple lowerdirs (efficient but requires kernel support).
+/// Mount an overlay with multiple lower layers, appending each layer via the new
+/// mount API (`fsopen`/`fsconfig`/`fsmount`/`move_mount`) instead of shelling out
+/// to `mount(8)`.
+///
+/// Why not `mount -o lowerdir=…`: the `mount(8)` command rejects a `lowerdir=`
+/// value longer than ~255 bytes, so any image with ≥4 layers (each OCI layer path
+/// `/storage/layers/<64-hex>` is ~79 bytes) failed this fast path and fell back to
+/// a slow physical layer-merge on *every* (re)mount. The kernel has no such limit
+/// — verified on the guest kernel (6.12) that a raw `mount(2)` AND this `fsconfig`
+/// path both mount a 599-byte / 8-layer overlay. Passing each layer as its own
+/// `lowerdir+` also sidesteps the classic `mount(2)` PAGE_SIZE option ceiling.
 fn try_mount_overlay_multi_lower(
     lowerdirs: &[String],
     upper_path: &Path,
     work_path: &Path,
     merged_path: &Path,
 ) -> Result<()> {
-    let lowerdir = lowerdirs.join(":");
-
-    // Mount overlay with index=off for compatibility
-    // index=off disables inode index which requires more filesystem features
-    let mount_opts = format!(
-        "lowerdir={},upperdir={},workdir={},index=off",
-        lowerdir,
-        upper_path.display(),
-        work_path.display()
-    );
-
     info!(
         layer_count = lowerdirs.len(),
-        mount_opts_len = mount_opts.len(),
         merged_path = %merged_path.display(),
-        "attempting multi-lowerdir overlay mount"
+        "attempting multi-lowerdir overlay mount (fsconfig API)"
     );
-    debug!(mount_opts = %mount_opts, "overlay mount options");
+    mount_overlay_fsconfig(lowerdirs, upper_path, work_path, merged_path)
+}
 
-    let output = Command::new("mount")
-        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
-        .arg(merged_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+/// Linux implementation of the overlay mount via the new mount API. Requires
+/// `lowerdir+` support (Linux ≥ 6.7); returns `Err` on older kernels (or any other
+/// failure) so the caller falls back to the physical merge.
+#[cfg(target_os = "linux")]
+fn mount_overlay_fsconfig(
+    lowerdirs: &[String],
+    upper_path: &Path,
+    work_path: &Path,
+    merged_path: &Path,
+) -> Result<()> {
+    use rustix::fd::AsFd;
+    use rustix::mount::{
+        fsconfig_create, fsconfig_set_string, fsmount, fsopen, move_mount, FsMountFlags,
+        FsOpenFlags, MountAttrFlags, MoveMountFlags,
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError::new(format!(
-            "multi-lowerdir overlay mount failed: {}",
-            stderr
-        )));
+    let upper = upper_path
+        .to_str()
+        .ok_or_else(|| StorageError::new("upperdir path is not valid UTF-8".to_string()))?;
+    let work = work_path
+        .to_str()
+        .ok_or_else(|| StorageError::new("workdir path is not valid UTF-8".to_string()))?;
+
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
+        .map_err(|e| StorageError::new(format!("fsopen(overlay) failed: {e}")))?;
+
+    // Append each lower layer individually — no single long option string, so
+    // neither the `mount(8)` ~255-byte limit nor the `mount(2)` page limit applies.
+    for lower in lowerdirs {
+        fsconfig_set_string(fs.as_fd(), "lowerdir+", lower.as_str()).map_err(|e| {
+            StorageError::new(format!(
+                "fsconfig lowerdir+={lower} failed (kernel may lack lowerdir+ (<6.7)): {e}"
+            ))
+        })?;
     }
+    fsconfig_set_string(fs.as_fd(), "upperdir", upper)
+        .map_err(|e| StorageError::new(format!("fsconfig upperdir failed: {e}")))?;
+    fsconfig_set_string(fs.as_fd(), "workdir", work)
+        .map_err(|e| StorageError::new(format!("fsconfig workdir failed: {e}")))?;
+    // Preserve prior semantics: index=off disables the inode-index feature.
+    fsconfig_set_string(fs.as_fd(), "index", "off")
+        .map_err(|e| StorageError::new(format!("fsconfig index=off failed: {e}")))?;
+
+    fsconfig_create(fs.as_fd())
+        .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
+
+    let mnt = fsmount(
+        fs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::empty(),
+    )
+    .map_err(|e| StorageError::new(format!("fsmount(overlay) failed: {e}")))?;
+
+    // Attach the freshly-created mount at merged_path (the mount fd itself is the
+    // source, via MOVE_MOUNT_F_EMPTY_PATH).
+    move_mount(
+        mnt.as_fd(),
+        "",
+        rustix::fs::CWD,
+        merged_path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(|e| {
+        StorageError::new(format!(
+            "move_mount to {} failed: {e}",
+            merged_path.display()
+        ))
+    })?;
 
     Ok(())
+}
+
+/// Non-Linux stub: overlayfs is Linux-only, so error and let callers fall back.
+#[cfg(not(target_os = "linux"))]
+fn mount_overlay_fsconfig(
+    _lowerdirs: &[String],
+    _upper_path: &Path,
+    _work_path: &Path,
+    _merged_path: &Path,
+) -> Result<()> {
+    Err(StorageError::new(
+        "overlay mount is only supported on Linux".to_string(),
+    ))
 }
 
 /// Mount overlay by merging layers into a single directory (most compatible).
@@ -4162,5 +4228,45 @@ mod tests {
         std::fs::write(dir.path().join(LAYER_ORDER_FILE), "does-not-exist\n").unwrap();
         let ordered = ordered_packed_layer_names(dir.path()).unwrap();
         assert_eq!(ordered, vec!["aaa".to_string()]);
+    }
+
+    /// Regression for the >255-byte `lowerdir` bug: the fsconfig mount path must
+    /// mount a multi-layer overlay whose joined lower paths far exceed 255 bytes —
+    /// the length the old `mount(8)` shell-out rejected. Needs root + Linux
+    /// overlayfs, so it's `#[ignore]`d; run on a Linux host with:
+    ///   cargo test -p smolvm-agent -- --ignored overlay_fsconfig_mounts_long_lowerdir
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn overlay_fsconfig_mounts_long_lowerdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 8 layers with 64-char names => joined lowerdir ~600 bytes (>255).
+        let mut lowerdirs = Vec::new();
+        for i in 0..8u32 {
+            let d = root.join("layers").join(format!("{i:064}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("f{i}")), b"x").unwrap();
+            lowerdirs.push(d.to_string_lossy().into_owned());
+        }
+        let joined_len: usize = lowerdirs.iter().map(|s| s.len() + 1).sum();
+        assert!(
+            joined_len > 255,
+            "test must exceed the old limit, got {joined_len}"
+        );
+
+        let upper = root.join("upper");
+        let work = root.join("work");
+        let merged = root.join("merged");
+        for p in [&upper, &work, &merged] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        mount_overlay_fsconfig(&lowerdirs, &upper, &work, &merged)
+            .expect("fsconfig overlay mount with a >255B lowerdir should succeed");
+        // The merged view exposes files from every layer.
+        assert!(merged.join("f0").exists());
+        assert!(merged.join("f7").exists());
+        let _ = std::process::Command::new("umount").arg(&merged).status();
     }
 }
