@@ -27,3 +27,7 @@ tar = "0.4"
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.27", features = ["socket", "fs"] }
+# The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
+# us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
+# whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.
+rustix = { version = "1", features = ["mount", "fs"] }

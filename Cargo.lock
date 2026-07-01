@@ -2249,6 +2249,7 @@ dependencies = [
  "libc",
  "nix 0.27.1",
  "parking_lot",
+ "rustix",
  "serde",
  "serde_json",
  "smolvm-protocol",
