@@ -104,6 +104,11 @@ pub struct ResourceSpec {
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames. When set, DNS answers for these names (and their
+    /// subdomains) are learned into the egress allow-list so the machine can reach
+    /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
     /// Network backend: `tsi` (default, outbound-only) or `virtio-net`
     /// (required for published `ports`). Omit for the default (TSI).
     #[serde(default)]
@@ -416,6 +421,10 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames (and their subdomains); DNS answers for these
+    /// names are learned into the egress allow-list.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
     /// Network backend: `tsi` (default, outbound-only) or `virtio-net`.
     /// Published `ports` require `virtio-net` (TSI has no inbound path).
     #[serde(default)]
@@ -511,6 +520,9 @@ pub struct MachineInfo {
     /// Allowed egress CIDRs. Omitted when unrestricted; an empty list denies all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames. Omitted when unset. Echoes back what `create` accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
     /// Storage disk size in GiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 20)]
