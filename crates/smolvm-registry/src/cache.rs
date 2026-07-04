@@ -2,13 +2,30 @@
 //!
 //! Content-addressed storage at `~/.cache/smolvm-registry/blobs/sha256/`.
 //! Blobs are stored by their digest. LRU eviction keeps total size under a
-//! configurable limit (default 2 GB).
+//! configurable limit — default 5 GB, override with `SMOLVM_BLOB_CACHE_MAX_BYTES`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Default maximum cache size: 2 GB.
-const DEFAULT_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
+const DEFAULT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Resolve the blob-cache byte cap from `SMOLVM_BLOB_CACHE_MAX_BYTES`, falling
+/// back to [`DEFAULT_MAX_SIZE`]. A fleet pulling multi-GB `.smolmachine`
+/// artifacts should set this well above the largest artifact (bounded by disk)
+/// so hot worlds are not re-pulled from the registry on every launch.
+fn configured_max_size() -> u64 {
+    parse_cache_limit(std::env::var("SMOLVM_BLOB_CACHE_MAX_BYTES").ok().as_deref())
+}
+
+/// Parse a byte-count cache limit, ignoring absent / unparseable / zero values.
+/// Split out from `configured_max_size` so it is unit-testable without touching
+/// the process-global environment.
+fn parse_cache_limit(val: Option<&str>) -> u64 {
+    val.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_SIZE)
+}
 
 /// True if a cache-dir entry is an in-flight `.partial` download rather than a
 /// finalized blob. A partial is being streamed by an active pull, so it must
@@ -33,7 +50,7 @@ impl BlobCache {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache dir"))?
             .join("smolvm-registry")
             .join("blobs");
-        Self::open(cache_dir, DEFAULT_MAX_SIZE)
+        Self::open(cache_dir, configured_max_size())
     }
 
     /// Open or create a cache at a specific path with a size limit.
@@ -266,6 +283,20 @@ mod tests {
             victim_partial.exists(),
             "eviction deleted another concurrent pull's in-flight .partial (the ENOENT bug)"
         );
+    }
+
+    #[test]
+    fn cache_limit_parses_env_or_defaults() {
+        // Valid byte counts are honored.
+        assert_eq!(
+            parse_cache_limit(Some("10737418240")),
+            10 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_cache_limit(Some("  5000000000 ")), 5_000_000_000);
+        // Absent / unparseable / zero fall back to the default.
+        assert_eq!(parse_cache_limit(None), DEFAULT_MAX_SIZE);
+        assert_eq!(parse_cache_limit(Some("garbage")), DEFAULT_MAX_SIZE);
+        assert_eq!(parse_cache_limit(Some("0")), DEFAULT_MAX_SIZE);
     }
 
     #[test]
