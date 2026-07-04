@@ -423,7 +423,13 @@ pub fn launch_agent_vm_dynamic(
     let storage_format = krun_disk_format(config.storage_path);
     // SAFETY: ctx is valid, block_id and disk_path are valid C strings
     if unsafe {
-        (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), storage_format, false)
+        (krun.add_disk2)(
+            ctx,
+            block_id.as_ptr(),
+            disk_path.as_ptr(),
+            storage_format,
+            false,
+        )
     } < 0
     {
         free_ctx_on_err!("krun_add_disk2 failed");
