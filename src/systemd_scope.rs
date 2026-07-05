@@ -17,9 +17,67 @@
 //! process exits, so machine stop/delete needs no extra teardown.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+
+/// Hard wall-clock bound on any single `busctl` call.
+///
+/// `busctl` is on both VM hot paths — `start` → [`adopt_into_scope`] and
+/// `stop`/delete → [`kill_scope`] — and these run on the request-serving blocking
+/// pool. systemd's `StartTransientUnit`/`KillUnit` can block for MINUTES when a VM
+/// is wedged in an uninterruptible (D) kernel state (its cgroup won't die), and the
+/// call had no timeout — so one stuck VM could pin blocking-pool threads until they
+/// were exhausted, starving `start`/`exec` across the whole node while `/health`
+/// (pure-async, no busctl) stayed green so auto-cordon never fired. This bounds the
+/// call so the thread is freed in seconds; the teardown is retried out-of-band
+/// instead of hanging the node. See the 2026-07-05 worker-1 wedge.
+const BUSCTL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll cadence while waiting for a `busctl` call to finish. Small relative to the
+/// timeout; adds at most one interval of latency to a normal (fast) call.
+const BUSCTL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Run a `busctl` command with a hard wall-clock bound ([`BUSCTL_TIMEOUT`]).
+///
+/// On timeout the child is killed (busctl is a normal userspace process, so it dies
+/// at once, freeing the thread) and a timeout error is returned for the caller to
+/// handle out-of-band — never leaving a request-serving thread pinned on a wedged
+/// systemd. std-only (no libc) so it compiles on every platform the callers do;
+/// busctl's replies are tiny, so leaving stdout/stderr buffered until the poll loop
+/// exits can't fill the pipe.
+fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::agent("vm scope", format!("busctl spawn failed: {e}")))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::agent(
+                        "vm scope",
+                        format!(
+                            "busctl timed out after {}s (systemd/cgroup wedged)",
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(BUSCTL_POLL_INTERVAL);
+            }
+            Err(e) => return Err(Error::agent("vm scope", format!("busctl wait failed: {e}"))),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| Error::agent("vm scope", format!("busctl output failed: {e}")))
+}
 
 /// Resource caps applied to the VM's scope (as systemd unit properties).
 ///
@@ -155,10 +213,9 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     args.extend(props);
     args.push("0".into()); // empty aux array
 
-    let out = Command::new(&busctl)
-        .args(&args)
-        .output()
-        .map_err(|e| Error::agent("vm scope", format!("busctl spawn failed: {e}")))?;
+    let mut cmd = Command::new(&busctl);
+    cmd.args(&args);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -196,20 +253,19 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
         // KillUnit(name: s, who: s, signal: i): SIGKILL (9) every process in the
         // scope ("all"). SIGKILL is uncatchable, so a wedged VM dies immediately;
         // the emptied scope then self-GCs. `ssi` is the busctl arg signature.
-        let out = Command::new(&busctl)
-            .args([
-                "call",
-                "org.freedesktop.systemd1",
-                "/org/freedesktop/systemd1",
-                "org.freedesktop.systemd1.Manager",
-                "KillUnit",
-                "ssi",
-                &name,
-                "all",
-                "9",
-            ])
-            .output()
-            .map_err(|e| Error::agent("vm scope", format!("busctl spawn failed: {e}")))?;
+        let mut cmd = Command::new(&busctl);
+        cmd.args([
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "KillUnit",
+            "ssi",
+            &name,
+            "all",
+            "9",
+        ]);
+        let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
         if out.status.success() {
             tracing::info!(scope = %name, "SIGKILLed VM transient scope (forced teardown)");
             return Ok(true);
@@ -233,6 +289,42 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A wedged busctl (systemd stuck on a dying cgroup) must not pin the thread:
+    // the call is bounded and returns promptly, well under the hang it replaces.
+    #[cfg(unix)]
+    #[test]
+    fn busctl_bounded_kills_a_hung_call() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30"); // stand-in for a busctl call that never returns
+        let start = Instant::now();
+        let out = busctl_bounded(cmd, Duration::from_millis(150));
+        let elapsed = start.elapsed();
+        assert!(
+            out.is_err(),
+            "a call exceeding the bound must error, not hang"
+        );
+        assert!(
+            out.unwrap_err().to_string().contains("timed out"),
+            "the error must identify a timeout"
+        );
+        // Freed in ~the bound, not the child's 30s runtime — a generous ceiling.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bounded call took {elapsed:?}; should return near the 150ms bound"
+        );
+    }
+
+    // A fast call returns its real output and status, unaffected by the bound.
+    #[cfg(unix)]
+    #[test]
+    fn busctl_bounded_returns_fast_call_output() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("ok");
+        let out = busctl_bounded(cmd, Duration::from_secs(5)).expect("fast call");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
 
     #[test]
     fn scope_name_sanitizes_and_suffixes() {
