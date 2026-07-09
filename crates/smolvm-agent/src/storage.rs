@@ -633,27 +633,31 @@ fn archive_signature(archive: &Path) -> Result<String> {
     Ok(format!("{}:{}", meta.len(), mtime))
 }
 
-/// Feed an archive to `cmd`'s stdin, transparently `gunzip`-ing a gzipped outer
-/// archive. Returns the spawned `gunzip` child (if any) to wait on afterwards.
-fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<std::process::Child>> {
+/// Feed an archive to `cmd`'s stdin, transparently decompressing a gzip- OR
+/// zstd-compressed outer archive first. A compressed archive is expanded to a
+/// temp file whose handle is returned so the caller keeps it alive until `cmd`
+/// has consumed it; a plain archive streams straight through. This handles zstd,
+/// which the old `gunzip`-only path silently mangled.
+fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<tempfile::NamedTempFile>> {
     let file = std::fs::File::open(archive)?;
-    if !is_gzip(archive)? {
+    if !is_compressed(archive)? {
         cmd.stdin(Stdio::from(file));
         return Ok(None);
     }
-    let mut gunzip = Command::new("gunzip")
-        .arg("-c")
-        .stdin(file)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {e}")))?;
-    let out = gunzip
-        .stdout
-        .take()
-        .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
-    cmd.stdin(Stdio::from(out));
-    Ok(Some(gunzip))
+    // Expand to a temp file, then feed that. `docker save` archives are a local
+    // dev-import path, so the extra copy is cheap and avoids threading a
+    // streaming decompressor into a subprocess's stdin. The guest ships no zstd
+    // tool, so decompression is done in-process.
+    let mut reader = decompress_layer_reader(file)?;
+    let mut tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| StorageError::new(format!("failed to create temp file: {e}")))?;
+    std::io::copy(&mut reader, tmp.as_file_mut())
+        .map_err(|e| StorageError::new(format!("failed to decompress archive: {e}")))?;
+    let reopened = tmp
+        .reopen()
+        .map_err(|e| StorageError::new(format!("failed to reopen temp file: {e}")))?;
+    cmd.stdin(Stdio::from(reopened));
+    Ok(Some(tmp))
 }
 
 /// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
@@ -670,7 +674,8 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
         // reason — e.g. "file manifest.json not found in tar" for an empty or
         // truncated archive — instead of a misleading guess.
         .stderr(Stdio::piped());
-    let gunzip = pipe_archive_into(&mut crane, archive)?;
+    // Held alive until crane has consumed it (the decompressed input, if any).
+    let _archive_tmp = pipe_archive_into(&mut crane, archive)?;
 
     let mut crane_child = crane
         .spawn()
@@ -697,9 +702,6 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
     let crane_status = crane_child
         .wait()
         .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
-    if let Some(mut g) = gunzip {
-        let _ = g.wait();
-    }
 
     if !crane_status.success() {
         // crane's stderr is a single short line; reading it after the process
@@ -748,13 +750,11 @@ fn extract_tar_member(archive: &Path, member: &str) -> Result<Vec<u8>> {
     tar.args(["-x", "-O", "-f", "-"])
         .arg(member)
         .stderr(Stdio::null());
-    let gunzip = pipe_archive_into(&mut tar, archive)?;
+    // Held alive until tar has consumed it (the decompressed input, if any).
+    let _archive_tmp = pipe_archive_into(&mut tar, archive)?;
     let out = tar
         .output()
         .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
-    if let Some(mut g) = gunzip {
-        let _ = g.wait();
-    }
     if !out.status.success() || out.stdout.is_empty() {
         return Err(StorageError::new(format!(
             "could not read '{member}' from archive"
@@ -763,14 +763,14 @@ fn extract_tar_member(archive: &Path, member: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Whether a file begins with the gzip magic bytes (`1f 8b`).
-fn is_gzip(path: &Path) -> Result<bool> {
+/// Whether a file begins with a supported compression magic — gzip (`1f 8b`) or
+/// zstd (`28 b5 2f fd`).
+fn is_compressed(path: &Path) -> Result<bool> {
     use std::io::Read;
-    let mut magic = [0u8; 2];
-    match std::fs::File::open(path)?.read(&mut magic) {
-        Ok(2) => Ok(magic == [0x1f, 0x8b]),
-        _ => Ok(false),
-    }
+    let mut magic = [0u8; 4];
+    let n = std::fs::File::open(path)?.read(&mut magic).unwrap_or(0);
+    Ok((n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+        || (n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd]))
 }
 
 /// Read `Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User` from a recovered image
@@ -1448,9 +1448,47 @@ fn set_overlay_opaque(_dir: &Path) -> std::io::Result<()> {
 ///   skipped rather than failing; overlayfs resolves the real file at runtime.
 ///
 /// Requires `CAP_MKNOD` + `CAP_SYS_ADMIN`, which the agent has as guest PID 1.
+/// Wrap a layer stream so gzip- AND zstd-compressed layers are transparently
+/// decompressed; an already-plain tar passes through. OCI layers are `+gzip` or
+/// (what `skopeo` and `smolvm pack` emit by default) `+zstd`. Detection is by
+/// magic bytes, so it's correct regardless of the manifest mediaType or the
+/// source — registry pull, local pack, or docker-save import — and needs no
+/// external tool in the guest rootfs.
+fn decompress_layer_reader<'a>(
+    mut inner: impl std::io::Read + 'a,
+) -> std::io::Result<Box<dyn std::io::Read + 'a>> {
+    use std::io::Read;
+    // Peek the compression magic without consuming it: read up to 4 bytes, then
+    // chain them back in front of the rest of the stream.
+    let mut magic = [0u8; 4];
+    let mut n = 0;
+    while n < magic.len() {
+        match inner.read(&mut magic[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    let stream = std::io::Cursor::new(magic[..n].to_vec()).chain(inner);
+    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        Ok(Box::new(flate2::read::GzDecoder::new(stream)))
+    } else if n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        // Pure-Rust zstd decoder — the C `zstd` crate can't link against musl
+        // (see the note in Cargo.toml).
+        let dec = ruzstd::StreamingDecoder::new(stream)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Box::new(dec))
+    } else {
+        // Uncompressed tar (or unrecognized) — pass through untouched.
+        Ok(Box::new(stream))
+    }
+}
+
 fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    // Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
+    // transparently so a zstd layer no longer breaks extraction.
+    let reader = decompress_layer_reader(reader)?;
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
@@ -1750,59 +1788,45 @@ where
             .spawn()
             .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
 
-        // Decompress with busybox `gunzip` and extract with our OCI-aware
-        // extractor. Keeping gzip external avoids linking a decompressor crate
-        // into the size-sensitive agent; reading the stream to EOF also drives
-        // the crane -> gunzip pipeline.
+        // Extract straight from crane's stdout. `extract_oci_layer` transparently
+        // decompresses gzip- OR zstd-compressed layers in-process (the guest
+        // ships no zstd tool, and the old external `gunzip` pipe silently failed
+        // on every zstd layer). Reading the stream to EOF also drives the crane
+        // fetch to completion.
         let crane_stdout = crane
             .stdout
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let mut gunzip = Command::new("gunzip")
-            .arg("-c")
-            .stdin(crane_stdout)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {}", e)))?;
+        let extract_result = extract_oci_layer(crane_stdout, &layer_dir);
 
-        let gunzip_stdout = gunzip
-            .stdout
-            .take()
-            .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
-
-        let extract_result = extract_oci_layer(gunzip_stdout, &layer_dir);
-
-        let gunzip_status = gunzip
-            .wait()
-            .map_err(|e| StorageError::new(format!("failed to wait for gunzip: {}", e)))?;
         let crane_status = crane
             .wait()
             .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
 
-        // crane failure (network/auth) is the most useful error to surface, and
-        // it manifests downstream as a truncated stream, so check it first.
         let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
         let _ = std::fs::remove_file(&crane_stderr_path);
         let crane_stderr = crane_stderr.trim();
 
-        let layer_failure = if !crane_status.success() {
-            if crane_stderr.is_empty() {
-                Some(format!("crane blob failed for layer {}", layer_digest))
-            } else {
-                Some(format!(
-                    "crane blob failed for layer {}: {}",
-                    layer_digest, crane_stderr
-                ))
-            }
+        // Order matters. A genuine crane fetch failure (network/auth) prints a
+        // real message to its stderr, so surface that first. Otherwise, if
+        // extraction failed, THAT is the real cause — a crane that exited
+        // non-zero with empty stderr is just the SIGPIPE from us closing the pipe
+        // when extraction stopped reading (the exact trap that made every zstd
+        // layer look like "crane blob failed" when the real problem was that the
+        // old pipeline couldn't decompress it).
+        let layer_failure = if !crane_status.success() && !crane_stderr.is_empty() {
+            Some(format!(
+                "crane blob failed for layer {}: {}",
+                layer_digest, crane_stderr
+            ))
         } else if let Err(e) = extract_result {
             Some(format!(
                 "layer extraction failed for layer {}: {}",
                 layer_digest, e
             ))
-        } else if !gunzip_status.success() {
-            Some(format!("gunzip failed for layer {}", layer_digest))
+        } else if !crane_status.success() {
+            Some(format!("crane blob failed for layer {}", layer_digest))
         } else {
             None
         };
@@ -3810,6 +3834,54 @@ mod tests {
     /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
     /// need root, so skip when not privileged (the live guest is PID 1 root).
     /// Linux-only: the syscalls and overlayfs semantics don't exist on macOS.
+    #[test]
+    fn extract_oci_layer_decompresses_gzip_and_zstd() {
+        use std::io::Write;
+
+        // A minimal single-file tar, owned by the current uid/gid so extraction
+        // (which preserves ownership) succeeds without root.
+        let uid = unsafe { libc::getuid() } as u64;
+        let gid = unsafe { libc::getgid() } as u64;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let body = b"hello from a layer";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("greeting.txt").unwrap();
+            header.set_size(body.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_uid(uid);
+            header.set_gid(gid);
+            header.set_cksum();
+            builder.append(&header, &body[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let extract = |bytes: &[u8]| -> Vec<u8> {
+            let dir = tempfile::tempdir().unwrap();
+            extract_oci_layer(bytes, dir.path()).expect("extraction should succeed");
+            std::fs::read(dir.path().join("greeting.txt")).unwrap()
+        };
+
+        // Plain tar passes through unchanged.
+        assert_eq!(extract(&tar_buf), b"hello from a layer");
+
+        // gzip-compressed layer.
+        let gz = {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&tar_buf).unwrap();
+            enc.finish().unwrap()
+        };
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+        assert_eq!(extract(&gz), b"hello from a layer");
+
+        // zstd-compressed layer — the format that broke every library-image pull.
+        let zst = zstd::stream::encode_all(&tar_buf[..], 0).unwrap();
+        assert_eq!(&zst[..4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
+        assert_eq!(extract(&zst), b"hello from a layer");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn extract_oci_layer_applies_whiteouts() {
