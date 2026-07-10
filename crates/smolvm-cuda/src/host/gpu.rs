@@ -455,6 +455,9 @@ impl Backend for GpuBackend {
         Ok((free as u64, total as u64))
     }
 
+    // The shared-memory data channel is Linux-only (`crate::shm`); on other
+    // platforms these fall back to the trait's not-supported default.
+    #[cfg(target_os = "linux")]
     fn memcpy_shm_htod(&mut self, dptr: u64, offset: u64, size: u64) -> CuResult<()> {
         // Read straight from the shared region (no bytes over the socket) and
         // DMA to the GPU — one copy instead of three.
@@ -470,6 +473,7 @@ impl Backend for GpuBackend {
             ))
         }
     }
+    #[cfg(target_os = "linux")]
     fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64) -> CuResult<()> {
         let region = crate::shm::get_or_create().ok_or(super::CUDA_ERROR_NOT_FOUND)?;
         let dst = region
