@@ -353,6 +353,39 @@ env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
 ```
 
 For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).
+
+## CUDA (experimental)
+
+`--cuda` remotes guest CUDA **Driver-API** calls to the host NVIDIA GPU over
+vsock — separate from `--gpu` (Vulkan graphics). The host needs a working
+NVIDIA driver (`libcuda.so.1` + loaded kernel module); no CUDA toolkit is
+required on host or guest. Enable with `--cuda` on `machine run`/`create`, or
+`cuda = true` in a Smolfile.
+
+Guest programs reach the GPU through the drop-in driver library built from
+[`crates/smolvm-cuda-shim`](crates/smolvm-cuda-shim) (a `cdylib` with soname
+`libcuda.so.1`). Mount or install it in the guest and unmodified Driver-API
+programs work with no code changes:
+
+```bash
+cargo build --release -p smolvm-cuda-shim   # → target/release/libcuda.so
+mkdir -p /tmp/shim && cp target/release/libcuda.so /tmp/shim/libcuda.so.1
+
+smolvm machine run --net --cuda -v /tmp/shim:/opt/shim:ro --image debian:bookworm-slim -- \
+  sh -c 'gcc myapp.c -o myapp -L/opt/shim -l:libcuda.so.1 && LD_LIBRARY_PATH=/opt/shim ./myapp'
+```
+
+Covered surface: init/device queries (name, attributes, uuid, total/free mem),
+contexts (incl. the primary-context flow the CUDA runtime uses), module
+load/unload (PTX, cubin, fatbin), mem alloc/free/HtoD/DtoH/DtoD/memset,
+kernel launch (param sizes come from the host via `cuFuncGetParamInfo`,
+CUDA 12.4+ drivers), streams, events, `cuGetProcAddress`. All work executes
+synchronously host-side; `*Async` calls complete before returning (permitted
+by the CUDA contract). Not yet covered: the Runtime API (`libcudart`)/
+cuBLAS/cuDNN, per-thread context juggling, `extra`-style launch params.
+
+Without an NVIDIA driver the host serves a CPU-emulation backend (test-only:
+it knows the `vecadd` test kernel), so the transport stays testable anywhere.
 ## Secrets
 
 smolvm stores no secret material. A secret is a *reference* to a value that
