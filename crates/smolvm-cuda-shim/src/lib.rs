@@ -31,6 +31,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use smolvm_cuda::client::{Client, CudaRpcError};
+mod driver_stubs;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::io::{Read, Write};
@@ -134,13 +135,42 @@ struct ShimState {
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
 
+/// Establish the server connection + primary context if not already done.
+/// Idempotent. Called from `cuInit` and lazily from any driver call — the real
+/// driver treats `cuInit` as process-global, but this shim is a separate library
+/// (and separate connection) from our `libcudart` shim, so a consumer that only
+/// initialized CUDA through the runtime API never called *our* `cuInit`. Lazily
+/// connecting on first use makes any driver entry point self-initializing.
+fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
+    if guard.is_some() {
+        return Ok(());
+    }
+    let stream = connect()?;
+    let mut client = Client::new(stream);
+    if let Err(e) = client.init() {
+        return Err(match e {
+            CudaRpcError::Cuda(code) => code as c_int,
+            _ => CUDA_ERROR_NO_DEVICE,
+        });
+    }
+    *guard = Some(ShimState {
+        client,
+        param_sizes: HashMap::new(),
+        primary_ctx: HashMap::new(),
+        ctx_stack: Vec::new(),
+    });
+    Ok(())
+}
+
 /// Run `f` against the connected client, translating errors to `CUresult`.
+/// Auto-connects on first use (see [`ensure_connected`]).
 fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, CudaRpcError>) -> Result<T, c_int> {
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return Err(CUDA_ERROR_UNKNOWN),
     };
-    let state = guard.as_mut().ok_or(CUDA_ERROR_NOT_INITIALIZED)?;
+    ensure_connected(&mut guard)?;
+    let state = guard.as_mut().expect("connected");
     f(state).map_err(|e| match e {
         CudaRpcError::Cuda(code) => code as c_int,
         CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => CUDA_ERROR_UNKNOWN,
@@ -172,27 +202,7 @@ pub extern "C" fn cuInit(_flags: c_uint) -> c_int {
         Ok(g) => g,
         Err(_) => return CUDA_ERROR_UNKNOWN,
     };
-    if guard.is_some() {
-        return CUDA_SUCCESS; // idempotent, like the real driver
-    }
-    let stream = match connect() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let mut client = Client::new(stream);
-    if let Err(e) = client.init() {
-        return match e {
-            CudaRpcError::Cuda(code) => code as c_int,
-            _ => CUDA_ERROR_NO_DEVICE,
-        };
-    }
-    *guard = Some(ShimState {
-        client,
-        param_sizes: HashMap::new(),
-        primary_ctx: HashMap::new(),
-        ctx_stack: Vec::new(),
-    });
-    CUDA_SUCCESS
+    ret(ensure_connected(&mut guard))
 }
 
 /// Undocumented internal driver interface tables, keyed by a 16-byte UUID.
@@ -270,6 +280,25 @@ pub extern "C" fn cuDeviceGetAttribute(pi: *mut c_int, attrib: c_int, device: c_
     )
 }
 
+/// Deprecated capability query PyTorch still calls at init. Forwards the two
+/// compute-capability attributes (MAJOR=75, MINOR=76).
+#[no_mangle]
+pub extern "C" fn cuDeviceComputeCapability(
+    major: *mut c_int,
+    minor: *mut c_int,
+    device: c_int,
+) -> c_int {
+    let r = with_state(|s| {
+        let maj = s.client.device_get_attribute(75, device)?;
+        let min = s.client.device_get_attribute(76, device)?;
+        Ok((maj, min))
+    });
+    ret(r.and_then(|(maj, min)| unsafe {
+        out(major, maj)?;
+        out(minor, min)
+    }))
+}
+
 #[no_mangle]
 pub extern "C" fn cuDeviceGetUuid(uuid: *mut u8, device: c_int) -> c_int {
     if uuid.is_null() {
@@ -326,33 +355,38 @@ pub extern "C" fn cuCtxDestroy_v2(ctx: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cuCtxSetCurrent(ctx: *mut c_void) -> c_int {
-    match STATE.lock() {
-        Ok(mut g) => match g.as_mut() {
-            Some(s) => {
-                s.ctx_stack.pop();
-                if !ctx.is_null() {
-                    s.ctx_stack.push(ctx as u64);
-                }
-                CUDA_SUCCESS
-            }
-            None => CUDA_ERROR_NOT_INITIALIZED,
-        },
-        Err(_) => CUDA_ERROR_UNKNOWN,
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return CUDA_ERROR_UNKNOWN,
+    };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
     }
+    let s = g.as_mut().expect("connected");
+    s.ctx_stack.pop();
+    if !ctx.is_null() {
+        s.ctx_stack.push(ctx as u64);
+    }
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn cuCtxGetCurrent(pctx: *mut *mut c_void) -> c_int {
-    match STATE.lock() {
-        Ok(g) => match g.as_ref() {
-            Some(s) => {
-                let cur = s.ctx_stack.last().copied().unwrap_or(0);
-                ret(unsafe { out(pctx, cur as *mut c_void) })
-            }
-            None => CUDA_ERROR_NOT_INITIALIZED,
-        },
-        Err(_) => CUDA_ERROR_UNKNOWN,
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return CUDA_ERROR_UNKNOWN,
+    };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
     }
+    let cur = g
+        .as_ref()
+        .expect("connected")
+        .ctx_stack
+        .last()
+        .copied()
+        .unwrap_or(0);
+    ret(unsafe { out(pctx, cur as *mut c_void) })
 }
 
 #[no_mangle]
@@ -360,48 +394,48 @@ pub extern "C" fn cuCtxPushCurrent_v2(ctx: *mut c_void) -> c_int {
     if ctx.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    match STATE.lock() {
-        Ok(mut g) => match g.as_mut() {
-            Some(s) => {
-                s.ctx_stack.push(ctx as u64);
-                CUDA_SUCCESS
-            }
-            None => CUDA_ERROR_NOT_INITIALIZED,
-        },
-        Err(_) => CUDA_ERROR_UNKNOWN,
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return CUDA_ERROR_UNKNOWN,
+    };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
     }
+    g.as_mut().expect("connected").ctx_stack.push(ctx as u64);
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn cuCtxPopCurrent_v2(pctx: *mut *mut c_void) -> c_int {
-    match STATE.lock() {
-        Ok(mut g) => match g.as_mut() {
-            Some(s) => match s.ctx_stack.pop() {
-                Some(h) => {
-                    if !pctx.is_null() {
-                        unsafe { *pctx = h as *mut c_void };
-                    }
-                    CUDA_SUCCESS
-                }
-                None => CUDA_ERROR_INVALID_CONTEXT,
-            },
-            None => CUDA_ERROR_NOT_INITIALIZED,
-        },
-        Err(_) => CUDA_ERROR_UNKNOWN,
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return CUDA_ERROR_UNKNOWN,
+    };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
+    }
+    match g.as_mut().expect("connected").ctx_stack.pop() {
+        Some(h) => {
+            if !pctx.is_null() {
+                unsafe { *pctx = h as *mut c_void };
+            }
+            CUDA_SUCCESS
+        }
+        None => CUDA_ERROR_INVALID_CONTEXT,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cuCtxGetDevice(device: *mut c_int) -> c_int {
     // Single-device model: the current context always belongs to device 0.
-    match STATE.lock() {
-        Ok(g) => match g.as_ref() {
-            Some(s) if !s.ctx_stack.is_empty() => ret(unsafe { out(device, 0) }),
-            Some(_) => CUDA_ERROR_INVALID_CONTEXT,
-            None => CUDA_ERROR_NOT_INITIALIZED,
-        },
-        Err(_) => CUDA_ERROR_UNKNOWN,
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return CUDA_ERROR_UNKNOWN,
+    };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
     }
+    ret(unsafe { out(device, 0) })
 }
 
 #[no_mangle]
@@ -459,13 +493,18 @@ pub extern "C" fn cuDevicePrimaryCtxGetState(
     flags: *mut c_uint,
     active: *mut c_int,
 ) -> c_int {
-    let is_active = match STATE.lock() {
-        Ok(g) => match g.as_ref() {
-            Some(s) => s.primary_ctx.contains_key(&device),
-            None => return CUDA_ERROR_NOT_INITIALIZED,
-        },
+    let mut g = match STATE.lock() {
+        Ok(g) => g,
         Err(_) => return CUDA_ERROR_UNKNOWN,
     };
+    if let Err(e) = ensure_connected(&mut g) {
+        return e;
+    }
+    let is_active = g
+        .as_ref()
+        .expect("connected")
+        .primary_ctx
+        .contains_key(&device);
     if !flags.is_null() {
         unsafe { *flags = 0 };
     }
@@ -1007,4 +1046,72 @@ pub extern "C" fn cuGetProcAddress(
     flags: u64,
 ) -> c_int {
     cuGetProcAddress_v2(symbol, pfn, cuda_version, flags, std::ptr::null_mut())
+}
+
+// ---- driver symbols PyTorch's stack links (exported so the shim loads) -------
+// None are called during basic CUDA init; JIT-link (cuLink*), cooperative
+// launch, and Hopper TMA (cuTensorMapEncodeTiled) are unused on sm_86 forwarding.
+const CU_ERROR_NOT_SUPPORTED: c_int = 801;
+#[no_mangle]
+pub extern "C" fn cuLinkCreate_v2() -> c_int {
+    CU_ERROR_NOT_SUPPORTED
+}
+#[no_mangle]
+pub extern "C" fn cuLinkAddData_v2() -> c_int {
+    CU_ERROR_NOT_SUPPORTED
+}
+#[no_mangle]
+pub extern "C" fn cuLinkComplete() -> c_int {
+    CU_ERROR_NOT_SUPPORTED
+}
+// These write out-params that callers (PyTorch's launch config) divide by, so a
+// bare NOT_SUPPORTED stub (leaving the out uninitialized) causes a divide-by-zero
+// crash. Return plausible values instead.
+#[no_mangle]
+pub extern "C" fn cuFuncGetAttribute(pi: *mut c_int, attrib: c_int, _func: *mut c_void) -> c_int {
+    // CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK=0 → 1024; else 0.
+    if !pi.is_null() {
+        unsafe { *pi = if attrib == 0 { 1024 } else { 0 } };
+    }
+    CUDA_SUCCESS
+}
+#[no_mangle]
+pub extern "C" fn cuFuncSetAttribute() -> c_int {
+    CUDA_SUCCESS
+}
+#[no_mangle]
+pub extern "C" fn cuLaunchCooperativeKernel() -> c_int {
+    CU_ERROR_NOT_SUPPORTED
+}
+#[no_mangle]
+pub extern "C" fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+    num_blocks: *mut c_int,
+    _func: *mut c_void,
+    block_size: c_int,
+    _dynamic_smem: usize,
+) -> c_int {
+    let bs = block_size.max(1);
+    if !num_blocks.is_null() {
+        unsafe { *num_blocks = (2048 / bs).clamp(1, 32) };
+    }
+    CUDA_SUCCESS
+}
+#[no_mangle]
+pub extern "C" fn cuTensorMapEncodeTiled() -> c_int {
+    CU_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    num_blocks: *mut c_int,
+    _func: *mut c_void,
+    block_size: c_int,
+    _dyn_smem: usize,
+    _flags: c_uint,
+) -> c_int {
+    let bs = block_size.max(1);
+    if !num_blocks.is_null() {
+        unsafe { *num_blocks = (2048 / bs).clamp(1, 32) }
+    }
+    CUDA_SUCCESS
 }

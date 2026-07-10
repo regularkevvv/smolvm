@@ -99,6 +99,12 @@ pub struct GpuBackend {
     /// Code-generated dispatch tables (library id → handlers), loaded on first use.
     cublas_gen: Option<gen_cublas::GenLib>,
     cudnn_gen: Option<gen_cudnn::GenLib>,
+    /// cuDNN v8 backend (graph) API forwarder — PyTorch's convolution path.
+    cudnn_backend: Option<CudnnBackend>,
+    /// cuBLASLt matmul forwarder — PyTorch's `cublasLtMatmul` linear-layer path.
+    cublaslt: Option<CublasLt>,
+    /// Legacy cuDNN batch-norm (Ex) forwarder — PyTorch's `BatchNorm2d` path.
+    cudnn_bn: Option<CudnnBn>,
     /// Host mappings of guest RAM, each `(gpa_start, host_va, len)`, for
     /// zero-copy `memcpy_gpa_*` (via `krun_get_guest_ram`). Empty outside a
     /// microVM / on older libkrun. Guest RAM is usually split into a low and a
@@ -139,6 +145,11 @@ mod gen_cudnn {
 /// Library ids on the `LibCall` wire (must match the generated `LIB_ID`).
 const LIB_CUBLAS: u8 = 1;
 const LIB_CUDNN: u8 = 2;
+/// cuDNN v8 backend (graph) API — hand-marshaled, not codegen (opaque
+/// descriptors + typed attribute arrays).
+const LIB_CUDNN_BACKEND: u8 = 3;
+const LIB_CUBLASLT: u8 = 4;
+const LIB_CUDNN_BN: u8 = 5;
 
 /// Hand-declared cuBLAS entry points (subset). `cublasStatus_t` is an enum (i32).
 struct Cublas {
@@ -284,6 +295,9 @@ impl GpuBackend {
                 cublas: None,
                 cublas_gen: None,
                 cudnn_gen: None,
+                cudnn_backend: None,
+                cublaslt: None,
+                cudnn_bn: None,
                 guest_ram: Vec::new(),
                 registered: Vec::new(),
                 guest_ram_pin_tried: false,
@@ -806,6 +820,769 @@ fn chk_cublas(st: c_int) -> CuResult<()> {
     }
 }
 
+/// Byte size of one element of a `cudnnBackendAttributeType_t`. PyTorch's conv
+/// graph uses handles/pointers (8), enums/int32/float (4), int64/double (8),
+/// bool/char (1). Everything else defaults to a 4-byte enum.
+fn cudnn_elem_size(attr_type: i32) -> usize {
+    match attr_type {
+        0 | 3 | 5 | 6 | 15 => 8, // HANDLE, INT64, DOUBLE, VOID_PTR, BACKEND_DESCRIPTOR
+        2 | 24 => 1,             // BOOLEAN, CHAR
+        26 => 16,                // FRACTION
+        _ => 4,                  // DATA_TYPE / enums / FLOAT / INT32 / ...
+    }
+}
+
+/// The 6-function cuDNN v8 **backend (graph) API** PyTorch uses for convolution.
+/// Descriptors and device pointers passing through are the server's real host
+/// pointers (opaque to the guest), so attribute arrays forward as raw bytes.
+struct CudnnBackend {
+    _lib: Library,
+    create: unsafe extern "C" fn(c_int, *mut *mut c_void) -> c_int,
+    destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+    set_attr: unsafe extern "C" fn(*mut c_void, c_int, c_int, i64, *const c_void) -> c_int,
+    get_attr: unsafe extern "C" fn(*mut c_void, c_int, c_int, i64, *mut i64, *mut c_void) -> c_int,
+    finalize: unsafe extern "C" fn(*mut c_void) -> c_int,
+    execute: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int,
+}
+
+impl CudnnBackend {
+    fn load() -> Result<CudnnBackend, String> {
+        let path = std::env::var("SMOLVM_CUDNN_LIB").unwrap_or_else(|_| "libcudnn.so".into());
+        unsafe {
+            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let b = CudnnBackend {
+                create: sym(&lib, b"cudnnBackendCreateDescriptor\0")?,
+                destroy: sym(&lib, b"cudnnBackendDestroyDescriptor\0")?,
+                set_attr: sym(&lib, b"cudnnBackendSetAttribute\0")?,
+                get_attr: sym(&lib, b"cudnnBackendGetAttribute\0")?,
+                finalize: sym(&lib, b"cudnnBackendFinalize\0")?,
+                execute: sym(&lib, b"cudnnBackendExecute\0")?,
+                _lib: lib,
+            };
+            Ok(b)
+        }
+    }
+
+    /// `func` selects the entry point; `args` is the hand-packed little-endian
+    /// argument blob (see the guest shim). Returns `(cudnnStatus, out_bytes)`.
+    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+        let rd_u64 = |a: &[u8], o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
+        let rd_i32 = |a: &[u8], o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
+        let rd_i64 = |a: &[u8], o: usize| i64::from_le_bytes(a[o..o + 8].try_into().unwrap());
+        match func {
+            0 => {
+                // create(type) -> handle
+                let ty = rd_i32(args, 0);
+                let mut desc: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { (self.create)(ty, &mut desc) };
+                (st, (desc as u64).to_le_bytes().to_vec())
+            }
+            1 => {
+                let desc = rd_u64(args, 0) as *mut c_void;
+                (unsafe { (self.destroy)(desc) }, Vec::new())
+            }
+            2 => {
+                // set_attr(desc, name, type, count, elements...)
+                let desc = rd_u64(args, 0) as *mut c_void;
+                let name = rd_i32(args, 8);
+                let ty = rd_i32(args, 12);
+                let count = rd_i64(args, 16);
+                let elems = &args[24..];
+                let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
+                (st, Vec::new())
+            }
+            3 => {
+                // get_attr(desc, name, type, requestedCount, input_bytes) -> count + bytes.
+                // For descriptor-array attributes the caller pre-creates the
+                // descriptors and passes their handles in; cuDNN populates them
+                // in place. So seed the buffer with the forwarded input.
+                let desc = rd_u64(args, 0) as *mut c_void;
+                let name = rd_i32(args, 8);
+                let ty = rd_i32(args, 12);
+                let req = rd_i64(args, 16);
+                let cap = (req.max(0) as usize) * cudnn_elem_size(ty);
+                let input = &args[24..];
+                let mut buf = vec![0u8; cap];
+                let seed = input.len().min(cap);
+                buf[..seed].copy_from_slice(&input[..seed]);
+                let mut count: i64 = 0;
+                let ptr = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    buf.as_mut_ptr().cast()
+                };
+                let st = unsafe { (self.get_attr)(desc, name, ty, req, &mut count, ptr) };
+                let n = (count.max(0) as usize) * cudnn_elem_size(ty);
+                let mut out = count.to_le_bytes().to_vec();
+                out.extend_from_slice(&buf[..n.min(buf.len())]);
+                (st, out)
+            }
+            4 => {
+                let desc = rd_u64(args, 0) as *mut c_void;
+                (unsafe { (self.finalize)(desc) }, Vec::new())
+            }
+            5 => {
+                // execute(handle, plan, variantPack)
+                let handle = rd_u64(args, 0) as *mut c_void;
+                let plan = rd_u64(args, 8) as *mut c_void;
+                let vpack = rd_u64(args, 16) as *mut c_void;
+                (unsafe { (self.execute)(handle, plan, vpack) }, Vec::new())
+            }
+            _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
+        }
+    }
+}
+
+/// The 11-function cuBLASLt matmul API PyTorch uses for linear layers.
+/// Descriptors, layouts, preferences and device pointers passing through are the
+/// server's real host pointers (opaque to the guest); scalars, attribute buffers
+/// and the opaque algo blob forward as raw little-endian bytes. The "light
+/// handle" is the connection's real cuBLAS handle (torch reuses it), forwarded as
+/// a handle just like every other pointer.
+struct CublasLt {
+    _lib: Library,
+    matmul: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        usize,
+        *mut c_void,
+    ) -> c_int,
+    algo_get_heuristic: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        c_int,
+        *mut c_void,
+        *mut c_int,
+    ) -> c_int,
+    desc_create: unsafe extern "C" fn(*mut *mut c_void, c_int, c_int) -> c_int,
+    desc_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+    desc_set_attr: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize) -> c_int,
+    layout_create: unsafe extern "C" fn(*mut *mut c_void, c_int, u64, u64, i64) -> c_int,
+    layout_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+    layout_set_attr: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize) -> c_int,
+    pref_create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
+    pref_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+    pref_set_attr: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize) -> c_int,
+    // Standalone callers (not PyTorch, which reuses the cuBLAS handle) create a
+    // dedicated cuBLASLt handle.
+    lt_create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
+    lt_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+}
+
+impl CublasLt {
+    fn load() -> Result<CublasLt, String> {
+        // cuBLASLt ships in its own soname; fall back to the cuBLAS path's dir.
+        let path = std::env::var("SMOLVM_CUBLASLT_LIB").unwrap_or_else(|_| "libcublasLt.so".into());
+        unsafe {
+            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let b = CublasLt {
+                matmul: sym(&lib, b"cublasLtMatmul\0")?,
+                algo_get_heuristic: sym(&lib, b"cublasLtMatmulAlgoGetHeuristic\0")?,
+                desc_create: sym(&lib, b"cublasLtMatmulDescCreate\0")?,
+                desc_destroy: sym(&lib, b"cublasLtMatmulDescDestroy\0")?,
+                desc_set_attr: sym(&lib, b"cublasLtMatmulDescSetAttribute\0")?,
+                layout_create: sym(&lib, b"cublasLtMatrixLayoutCreate\0")?,
+                layout_destroy: sym(&lib, b"cublasLtMatrixLayoutDestroy\0")?,
+                layout_set_attr: sym(&lib, b"cublasLtMatrixLayoutSetAttribute\0")?,
+                pref_create: sym(&lib, b"cublasLtMatmulPreferenceCreate\0")?,
+                pref_destroy: sym(&lib, b"cublasLtMatmulPreferenceDestroy\0")?,
+                pref_set_attr: sym(&lib, b"cublasLtMatmulPreferenceSetAttribute\0")?,
+                lt_create: sym(&lib, b"cublasLtCreate\0")?,
+                lt_destroy: sym(&lib, b"cublasLtDestroy\0")?,
+                _lib: lib,
+            };
+            Ok(b)
+        }
+    }
+
+    /// `func` selects the entry point; `args` is the hand-packed little-endian
+    /// argument blob (see the guest shim). Returns `(cublasStatus, out_bytes)`.
+    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+        // sizeof(cublasLtMatmulHeuristicResult_t): algo[64] + workspaceSize(8)
+        // + state(4) + wavesCount(4) + reserved[4](16) = 96 bytes.
+        const HEUR_RESULT_SZ: usize = 96;
+        let rd_u64 = |o: usize| u64::from_le_bytes(args[o..o + 8].try_into().unwrap());
+        let rd_i64 = |o: usize| i64::from_le_bytes(args[o..o + 8].try_into().unwrap());
+        let rd_i32 = |o: usize| i32::from_le_bytes(args[o..o + 4].try_into().unwrap());
+        match func {
+            0 => {
+                // desc_create(computeType, scaleType) -> handle
+                let compute = rd_i32(0);
+                let scale = rd_i32(4);
+                let mut d: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { (self.desc_create)(&mut d, compute, scale) };
+                (st, (d as u64).to_le_bytes().to_vec())
+            }
+            1 => (
+                unsafe { (self.desc_destroy)(rd_u64(0) as *mut c_void) },
+                Vec::new(),
+            ),
+            2 => {
+                // desc_set_attr(desc, attr, buf, size)
+                let desc = rd_u64(0) as *mut c_void;
+                let attr = rd_i32(8);
+                let buf = &args[12..];
+                let st =
+                    unsafe { (self.desc_set_attr)(desc, attr, buf.as_ptr().cast(), buf.len()) };
+                (st, Vec::new())
+            }
+            3 => {
+                // layout_create(type, rows, cols, ld) -> handle
+                let ty = rd_i32(0);
+                let rows = rd_u64(4);
+                let cols = rd_u64(12);
+                let ld = rd_i64(20);
+                let mut l: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { (self.layout_create)(&mut l, ty, rows, cols, ld) };
+                (st, (l as u64).to_le_bytes().to_vec())
+            }
+            4 => (
+                unsafe { (self.layout_destroy)(rd_u64(0) as *mut c_void) },
+                Vec::new(),
+            ),
+            5 => {
+                let layout = rd_u64(0) as *mut c_void;
+                let attr = rd_i32(8);
+                let buf = &args[12..];
+                let st =
+                    unsafe { (self.layout_set_attr)(layout, attr, buf.as_ptr().cast(), buf.len()) };
+                (st, Vec::new())
+            }
+            6 => {
+                // pref_create() -> handle
+                let mut p: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { (self.pref_create)(&mut p) };
+                (st, (p as u64).to_le_bytes().to_vec())
+            }
+            7 => (
+                unsafe { (self.pref_destroy)(rd_u64(0) as *mut c_void) },
+                Vec::new(),
+            ),
+            8 => {
+                let pref = rd_u64(0) as *mut c_void;
+                let attr = rd_i32(8);
+                let buf = &args[12..];
+                let st =
+                    unsafe { (self.pref_set_attr)(pref, attr, buf.as_ptr().cast(), buf.len()) };
+                (st, Vec::new())
+            }
+            9 => {
+                // algo_get_heuristic(light, opDesc, A, B, C, D, pref, requested)
+                //   -> returnCount + returnCount * heuristicResult structs.
+                let light = rd_u64(0) as *mut c_void;
+                let op = rd_u64(8) as *mut c_void;
+                let a = rd_u64(16) as *mut c_void;
+                let b = rd_u64(24) as *mut c_void;
+                let c = rd_u64(32) as *mut c_void;
+                let d = rd_u64(40) as *mut c_void;
+                let pref = rd_u64(48) as *mut c_void;
+                let requested = rd_i32(56).max(0);
+                let mut results = vec![0u8; requested as usize * HEUR_RESULT_SZ];
+                let mut count: c_int = 0;
+                let st = unsafe {
+                    (self.algo_get_heuristic)(
+                        light,
+                        op,
+                        a,
+                        b,
+                        c,
+                        d,
+                        pref,
+                        requested,
+                        results.as_mut_ptr().cast(),
+                        &mut count,
+                    )
+                };
+                let n = (count.max(0) as usize) * HEUR_RESULT_SZ;
+                let mut out = (count as i64).to_le_bytes().to_vec();
+                out.extend_from_slice(&results[..n.min(results.len())]);
+                (st, out)
+            }
+            10 => {
+                // matmul(light, desc, alpha[16], A, Adesc, B, Bdesc, beta[16],
+                //   C, Cdesc, D, Ddesc, algo[64], workspace, wsSize, stream)
+                let light = rd_u64(0) as *mut c_void;
+                let desc = rd_u64(8) as *mut c_void;
+                let alpha = &args[16..32];
+                let a = rd_u64(32) as *mut c_void;
+                let adesc = rd_u64(40) as *mut c_void;
+                let b = rd_u64(48) as *mut c_void;
+                let bdesc = rd_u64(56) as *mut c_void;
+                let beta = &args[64..80];
+                let c = rd_u64(80) as *mut c_void;
+                let cdesc = rd_u64(88) as *mut c_void;
+                let dd = rd_u64(96) as *mut c_void;
+                let ddesc = rd_u64(104) as *mut c_void;
+                let algo = &args[112..176];
+                let algo_present = rd_u64(176) != 0;
+                let workspace = rd_u64(184) as *mut c_void;
+                let ws_size = rd_u64(192) as usize;
+                let stream = rd_u64(200) as *mut c_void;
+                let algo_ptr = if algo_present {
+                    algo.as_ptr().cast()
+                } else {
+                    std::ptr::null()
+                };
+                let st = unsafe {
+                    (self.matmul)(
+                        light,
+                        desc,
+                        alpha.as_ptr().cast(),
+                        a,
+                        adesc,
+                        b,
+                        bdesc,
+                        beta.as_ptr().cast(),
+                        c,
+                        cdesc,
+                        dd,
+                        ddesc,
+                        algo_ptr,
+                        workspace,
+                        ws_size,
+                        stream,
+                    )
+                };
+                (st, Vec::new())
+            }
+            11 => {
+                let mut h: *mut c_void = std::ptr::null_mut();
+                let st = unsafe { (self.lt_create)(&mut h) };
+                (st, (h as u64).to_le_bytes().to_vec())
+            }
+            12 => (
+                unsafe { (self.lt_destroy)(rd_u64(0) as *mut c_void) },
+                Vec::new(),
+            ),
+            _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
+        }
+    }
+}
+
+/// Little-endian cursor over a hand-packed argument blob (host side of the
+/// batchnorm forwarder). Mirrors the guest shim's packing exactly.
+struct Cur<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+impl Cur<'_> {
+    fn take(&mut self, n: usize) -> &[u8] {
+        let s = &self.b[self.p..self.p + n];
+        self.p += n;
+        s
+    }
+    fn i32(&mut self) -> i32 {
+        i32::from_le_bytes(self.take(4).try_into().unwrap())
+    }
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take(8).try_into().unwrap())
+    }
+    fn f32(&mut self) -> f32 {
+        f32::from_le_bytes(self.take(4).try_into().unwrap())
+    }
+    fn f64(&mut self) -> f64 {
+        f64::from_le_bytes(self.take(8).try_into().unwrap())
+    }
+    fn ptr(&mut self) -> *mut c_void {
+        self.u64() as *mut c_void
+    }
+}
+
+/// The legacy cuDNN **batch-norm (Ex) + N-D tensor descriptor** API PyTorch uses
+/// for `BatchNorm2d`. Tensor/activation descriptors and device pointers are the
+/// server's real host pointers; alpha/beta are float scalars, epsilon/factor are
+/// doubles, and the N-D descriptor's dim/stride arrays forward as raw i32s.
+#[allow(clippy::type_complexity)]
+struct CudnnBn {
+    _lib: Library,
+    set_nd: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const c_int, *const c_int) -> c_int,
+    derive_bn: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> c_int,
+    fwd_infer: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        f64,
+    ) -> c_int,
+    fwd_train_ex: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        f64,
+        *mut c_void,
+        *mut c_void,
+        f64,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        usize,
+        *mut c_void,
+        usize,
+    ) -> c_int,
+    bwd_ex: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        f64,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        usize,
+        *mut c_void,
+        usize,
+    ) -> c_int,
+    ws_train: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut usize,
+    ) -> c_int,
+    ws_bwd: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut usize,
+    ) -> c_int,
+    reserve: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+        *mut usize,
+    ) -> c_int,
+}
+
+impl CudnnBn {
+    fn load() -> Result<CudnnBn, String> {
+        let path = std::env::var("SMOLVM_CUDNN_LIB").unwrap_or_else(|_| "libcudnn.so".into());
+        unsafe {
+            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let b = CudnnBn {
+                set_nd: sym(&lib, b"cudnnSetTensorNdDescriptor\0")?,
+                derive_bn: sym(&lib, b"cudnnDeriveBNTensorDescriptor\0")?,
+                fwd_infer: sym(&lib, b"cudnnBatchNormalizationForwardInference\0")?,
+                fwd_train_ex: sym(&lib, b"cudnnBatchNormalizationForwardTrainingEx\0")?,
+                bwd_ex: sym(&lib, b"cudnnBatchNormalizationBackwardEx\0")?,
+                ws_train: sym(
+                    &lib,
+                    b"cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize\0",
+                )?,
+                ws_bwd: sym(&lib, b"cudnnGetBatchNormalizationBackwardExWorkspaceSize\0")?,
+                reserve: sym(
+                    &lib,
+                    b"cudnnGetBatchNormalizationTrainingExReserveSpaceSize\0",
+                )?,
+                _lib: lib,
+            };
+            Ok(b)
+        }
+    }
+
+    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+        let mut c = Cur { b: args, p: 0 };
+        match func {
+            0 => {
+                // set_nd(desc, dataType, nbDims, dimA[], strideA[])
+                let desc = c.ptr();
+                let dtype = c.i32();
+                let nb = c.i32();
+                let n = nb.max(0) as usize;
+                let dims: Vec<c_int> = (0..n).map(|_| c.i32()).collect();
+                let strides: Vec<c_int> = (0..n).map(|_| c.i32()).collect();
+                let st = unsafe { (self.set_nd)(desc, dtype, nb, dims.as_ptr(), strides.as_ptr()) };
+                (st, Vec::new())
+            }
+            1 => {
+                let derived = c.ptr();
+                let xdesc = c.ptr();
+                let mode = c.i32();
+                (
+                    unsafe { (self.derive_bn)(derived, xdesc, mode) },
+                    Vec::new(),
+                )
+            }
+            2 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let alpha = c.f32();
+                let beta = c.f32();
+                let xdesc = c.ptr();
+                let x = c.ptr();
+                let ydesc = c.ptr();
+                let y = c.ptr();
+                let bndesc = c.ptr();
+                let scale = c.ptr();
+                let bias = c.ptr();
+                let mean = c.ptr();
+                let var = c.ptr();
+                let eps = c.f64();
+                let st = unsafe {
+                    (self.fwd_infer)(
+                        handle,
+                        mode,
+                        (&alpha as *const f32).cast(),
+                        (&beta as *const f32).cast(),
+                        xdesc,
+                        x.cast_const(),
+                        ydesc,
+                        y,
+                        bndesc,
+                        scale.cast_const(),
+                        bias.cast_const(),
+                        mean.cast_const(),
+                        var.cast_const(),
+                        eps,
+                    )
+                };
+                (st, Vec::new())
+            }
+            3 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let bn_ops = c.i32();
+                let alpha = c.f32();
+                let beta = c.f32();
+                let xdesc = c.ptr();
+                let x = c.ptr();
+                let zdesc = c.ptr();
+                let z = c.ptr();
+                let ydesc = c.ptr();
+                let y = c.ptr();
+                let bndesc = c.ptr();
+                let scale = c.ptr();
+                let bias = c.ptr();
+                let factor = c.f64();
+                let run_mean = c.ptr();
+                let run_var = c.ptr();
+                let eps = c.f64();
+                let save_mean = c.ptr();
+                let save_ivar = c.ptr();
+                let act = c.ptr();
+                let ws = c.ptr();
+                let ws_sz = c.u64() as usize;
+                let rs = c.ptr();
+                let rs_sz = c.u64() as usize;
+                let st = unsafe {
+                    (self.fwd_train_ex)(
+                        handle,
+                        mode,
+                        bn_ops,
+                        (&alpha as *const f32).cast(),
+                        (&beta as *const f32).cast(),
+                        xdesc,
+                        x.cast_const(),
+                        zdesc,
+                        z.cast_const(),
+                        ydesc,
+                        y,
+                        bndesc,
+                        scale.cast_const(),
+                        bias.cast_const(),
+                        factor,
+                        run_mean,
+                        run_var,
+                        eps,
+                        save_mean,
+                        save_ivar,
+                        act,
+                        ws,
+                        ws_sz,
+                        rs,
+                        rs_sz,
+                    )
+                };
+                (st, Vec::new())
+            }
+            4 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let bn_ops = c.i32();
+                let alpha_d = c.f32();
+                let beta_d = c.f32();
+                let alpha_p = c.f32();
+                let beta_p = c.f32();
+                let xdesc = c.ptr();
+                let x = c.ptr();
+                let ydesc = c.ptr();
+                let y = c.ptr();
+                let dydesc = c.ptr();
+                let dy = c.ptr();
+                let dzdesc = c.ptr();
+                let dz = c.ptr();
+                let dxdesc = c.ptr();
+                let dx = c.ptr();
+                let dbndesc = c.ptr();
+                let scale = c.ptr();
+                let bias = c.ptr();
+                let dscale = c.ptr();
+                let dbias = c.ptr();
+                let eps = c.f64();
+                let save_mean = c.ptr();
+                let save_ivar = c.ptr();
+                let act = c.ptr();
+                let ws = c.ptr();
+                let ws_sz = c.u64() as usize;
+                let rs = c.ptr();
+                let rs_sz = c.u64() as usize;
+                let st = unsafe {
+                    (self.bwd_ex)(
+                        handle,
+                        mode,
+                        bn_ops,
+                        (&alpha_d as *const f32).cast(),
+                        (&beta_d as *const f32).cast(),
+                        (&alpha_p as *const f32).cast(),
+                        (&beta_p as *const f32).cast(),
+                        xdesc,
+                        x.cast_const(),
+                        ydesc,
+                        y.cast_const(),
+                        dydesc,
+                        dy.cast_const(),
+                        dzdesc,
+                        dz,
+                        dxdesc,
+                        dx,
+                        dbndesc,
+                        scale.cast_const(),
+                        bias.cast_const(),
+                        dscale,
+                        dbias,
+                        eps,
+                        save_mean.cast_const(),
+                        save_ivar.cast_const(),
+                        act,
+                        ws,
+                        ws_sz,
+                        rs,
+                        rs_sz,
+                    )
+                };
+                (st, Vec::new())
+            }
+            5 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let bn_ops = c.i32();
+                let xdesc = c.ptr();
+                let zdesc = c.ptr();
+                let ydesc = c.ptr();
+                let bndesc = c.ptr();
+                let act = c.ptr();
+                let mut size: usize = 0;
+                let st = unsafe {
+                    (self.ws_train)(
+                        handle, mode, bn_ops, xdesc, zdesc, ydesc, bndesc, act, &mut size,
+                    )
+                };
+                (st, (size as u64).to_le_bytes().to_vec())
+            }
+            6 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let bn_ops = c.i32();
+                let xdesc = c.ptr();
+                let ydesc = c.ptr();
+                let dydesc = c.ptr();
+                let dzdesc = c.ptr();
+                let dxdesc = c.ptr();
+                let bndesc = c.ptr();
+                let act = c.ptr();
+                let mut size: usize = 0;
+                let st = unsafe {
+                    (self.ws_bwd)(
+                        handle, mode, bn_ops, xdesc, ydesc, dydesc, dzdesc, dxdesc, bndesc, act,
+                        &mut size,
+                    )
+                };
+                (st, (size as u64).to_le_bytes().to_vec())
+            }
+            7 => {
+                let handle = c.ptr();
+                let mode = c.i32();
+                let bn_ops = c.i32();
+                let act = c.ptr();
+                let xdesc = c.ptr();
+                let mut size: usize = 0;
+                let st = unsafe { (self.reserve)(handle, mode, bn_ops, act, xdesc, &mut size) };
+                (st, (size as u64).to_le_bytes().to_vec())
+            }
+            _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
+        }
+    }
+}
+
 impl Drop for GpuBackend {
     fn drop(&mut self) {
         // Release any guest-RAM pins this backend took so the next connection can
@@ -958,6 +1735,42 @@ impl GpuBackend {
                     }
                 }
                 Ok(self.cudnn_gen.as_ref().unwrap().dispatch(func, args))
+            }
+            LIB_CUDNN_BACKEND => {
+                if self.cudnn_backend.is_none() {
+                    match CudnnBackend::load() {
+                        Ok(b) => self.cudnn_backend = Some(b),
+                        Err(e) => {
+                            tracing_note(&e);
+                            return Err(super::CUDA_ERROR_NOT_FOUND);
+                        }
+                    }
+                }
+                Ok(self.cudnn_backend.as_ref().unwrap().dispatch(func, args))
+            }
+            LIB_CUBLASLT => {
+                if self.cublaslt.is_none() {
+                    match CublasLt::load() {
+                        Ok(b) => self.cublaslt = Some(b),
+                        Err(e) => {
+                            tracing_note(&e);
+                            return Err(super::CUDA_ERROR_NOT_FOUND);
+                        }
+                    }
+                }
+                Ok(self.cublaslt.as_ref().unwrap().dispatch(func, args))
+            }
+            LIB_CUDNN_BN => {
+                if self.cudnn_bn.is_none() {
+                    match CudnnBn::load() {
+                        Ok(b) => self.cudnn_bn = Some(b),
+                        Err(e) => {
+                            tracing_note(&e);
+                            return Err(super::CUDA_ERROR_NOT_FOUND);
+                        }
+                    }
+                }
+                Ok(self.cudnn_bn.as_ref().unwrap().dispatch(func, args))
             }
             _ => Err(super::CUDA_ERROR_NOT_FOUND),
         }

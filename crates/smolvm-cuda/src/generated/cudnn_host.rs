@@ -154,6 +154,7 @@ struct GenCur<'a> { b: &'a [u8], p: usize }
 impl GenCur<'_> {
     fn take(&mut self, n: usize) -> [u8; 8] { let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }
     fn i32(&mut self) -> i32 { i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }
+    fn i64(&mut self) -> i64 { i64::from_le_bytes(self.take(8)) }
     fn u64(&mut self) -> u64 { u64::from_le_bytes(self.take(8)) }
     fn f32(&mut self) -> f32 { f32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }
     fn f64(&mut self) -> f64 { f64::from_le_bytes(self.take(8)) }

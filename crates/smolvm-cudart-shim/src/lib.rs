@@ -30,6 +30,7 @@
 #![allow(non_snake_case)]
 
 use smolvm_cuda::client::{Client, CudaRpcError};
+mod cublas_stubs;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -281,7 +282,7 @@ pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
-    set_last(unsafe { out(version, 11080) })
+    set_last(unsafe { out(version, 12040) })
 }
 
 // ---- memory -----------------------------------------------------------------
@@ -768,6 +769,489 @@ pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
     })
 }
 
+// ---- device queries, events, stream/mempool surface (PyTorch runtime API) ----
+//
+// Most of this is forward-to-host or no-op: the host serves every connection on
+// one thread in call order, so stream/event ordering is implicit and query
+// APIs (stream/event "ready?", capture status) can answer synchronously.
+
+// CUdevice_attribute values used to assemble cudaDeviceProp.
+const A_MAX_THREADS_PER_BLOCK: i32 = 1;
+const A_MAX_BLOCK_DIM_X: i32 = 2;
+const A_MAX_BLOCK_DIM_Y: i32 = 3;
+const A_MAX_BLOCK_DIM_Z: i32 = 4;
+const A_MAX_GRID_DIM_X: i32 = 5;
+const A_MAX_GRID_DIM_Y: i32 = 6;
+const A_MAX_GRID_DIM_Z: i32 = 7;
+const A_MAX_SHMEM_PER_BLOCK: i32 = 8;
+const A_TOTAL_CONST_MEM: i32 = 9;
+const A_WARP_SIZE: i32 = 10;
+const A_MAX_REGS_PER_BLOCK: i32 = 12;
+const A_MP_COUNT: i32 = 16;
+const A_MAX_THREADS_PER_MP: i32 = 39;
+const A_COMPUTE_MAJOR: i32 = 75;
+const A_COMPUTE_MINOR: i32 = 76;
+const A_MAX_SHMEM_PER_MP: i32 = 81;
+const A_MAX_REGS_PER_MP: i32 = 82;
+
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int {
+    set_last(
+        match with_client(|c| c.device_get_attribute(attr, device)) {
+            Ok(v) => unsafe { out(value, v) },
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int {
+    set_last(match with_client(|c| c.mem_get_info()) {
+        Ok((f, t)) => unsafe {
+            let _ = out(free, f as usize);
+            out(total, t as usize)
+        },
+        Err(e) => e,
+    })
+}
+
+/// `cudaDeviceProp` (CUDA 12.x prefix). Only the fields PyTorch reads are set;
+/// the caller's ~1 KiB struct is zeroed first so the rest is well-defined.
+#[repr(C)]
+struct CudaDeviceProp {
+    name: [u8; 256],
+    uuid: [u8; 16], // cudaUUID_t — MUST be here or every field below is 16B off
+    luid: [u8; 8],
+    luid_device_node_mask: c_uint,
+    total_global_mem: usize,
+    shared_mem_per_block: usize,
+    regs_per_block: c_int,
+    warp_size: c_int,
+    mem_pitch: usize,
+    max_threads_per_block: c_int,
+    max_threads_dim: [c_int; 3],
+    max_grid_size: [c_int; 3],
+    total_const_mem: usize,
+    major: c_int,
+    minor: c_int,
+    texture_alignment: usize,
+    texture_pitch_alignment: usize,
+    multi_processor_count: c_int,
+    integrated: c_int,
+    can_map_host_memory: c_int,
+    _tex_surf: [c_int; 63], // maxTexture*/maxSurface* block (offsets kept, unused)
+    surface_alignment: usize,
+    concurrent_kernels: c_int,
+    ecc_enabled: c_int,
+    pci_bus_id: c_int,
+    pci_device_id: c_int,
+    pci_domain_id: c_int,
+    tcc_driver: c_int,
+    async_engine_count: c_int,
+    unified_addressing: c_int,
+    memory_bus_width: c_int,
+    l2_cache_size: c_int,
+    persisting_l2_cache_max_size: c_int,
+    max_threads_per_multiprocessor: c_int,
+    stream_priorities_supported: c_int,
+    global_l1_cache_supported: c_int,
+    local_l1_cache_supported: c_int,
+    shared_mem_per_multiprocessor: usize,
+    regs_per_multiprocessor: c_int,
+    managed_memory: c_int,
+    is_multi_gpu_board: c_int,
+    multi_gpu_board_group_id: c_int,
+    host_native_atomic_supported: c_int,
+    pageable_memory_access: c_int,
+    concurrent_managed_access: c_int,
+    compute_preemption_supported: c_int,
+    can_use_host_pointer_for_registered_mem: c_int,
+    cooperative_launch: c_int,
+    shared_mem_per_block_optin: usize,
+    pageable_memory_access_uses_host_page_tables: c_int,
+    direct_managed_mem_access_from_host: c_int,
+    max_blocks_per_multiprocessor: c_int,
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -> c_int {
+    if prop.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // Zero the caller's whole 12.x cudaDeviceProp (~1032 bytes) first, then fill
+    // the prefix fields we know. Trailing fields stay a defined zero.
+    unsafe { std::ptr::write_bytes(prop as *mut u8, 0, 1032) };
+    set_last(
+        with_state(|s| {
+            let a = |s: &mut ShimState, attr: i32, dflt: i32| {
+                s.client.device_get_attribute(attr, device).unwrap_or(dflt)
+            };
+            let name = s.client.device_get_name(device).unwrap_or_default();
+            let total = s.client.device_total_mem(device).unwrap_or(0);
+            let major = a(s, A_COMPUTE_MAJOR, 8);
+            let minor = a(s, A_COMPUTE_MINOR, 6);
+            let mp = a(s, A_MP_COUNT, 1);
+            let max_tpb = a(s, A_MAX_THREADS_PER_BLOCK, 1024);
+            let warp = a(s, A_WARP_SIZE, 32);
+            let shmem_blk = a(s, A_MAX_SHMEM_PER_BLOCK, 49152);
+            let regs_blk = a(s, A_MAX_REGS_PER_BLOCK, 65536);
+            let max_tpm = a(s, A_MAX_THREADS_PER_MP, 1536);
+            let shmem_mp = a(s, A_MAX_SHMEM_PER_MP, 102400);
+            let regs_mp = a(s, A_MAX_REGS_PER_MP, 65536);
+            let const_mem = a(s, A_TOTAL_CONST_MEM, 65536);
+            let (bx, by, bz) = (
+                a(s, A_MAX_BLOCK_DIM_X, 1024),
+                a(s, A_MAX_BLOCK_DIM_Y, 1024),
+                a(s, A_MAX_BLOCK_DIM_Z, 64),
+            );
+            let (gx, gy, gz) = (
+                a(s, A_MAX_GRID_DIM_X, 2147483647),
+                a(s, A_MAX_GRID_DIM_Y, 65535),
+                a(s, A_MAX_GRID_DIM_Z, 65535),
+            );
+            // SAFETY: `prop` points at a caller-provided cudaDeviceProp we zeroed.
+            let p = unsafe { &mut *(prop as *mut CudaDeviceProp) };
+            let nb = name.as_bytes();
+            let n = nb.len().min(255);
+            p.name[..n].copy_from_slice(&nb[..n]);
+            p.total_global_mem = total as usize;
+            p.shared_mem_per_block = shmem_blk as usize;
+            p.regs_per_block = regs_blk;
+            p.warp_size = warp;
+            p.max_threads_per_block = max_tpb;
+            p.max_threads_dim = [bx, by, bz];
+            p.max_grid_size = [gx, gy, gz];
+            p.total_const_mem = const_mem as usize;
+            p.major = major;
+            p.minor = minor;
+            p.multi_processor_count = mp;
+            p.can_map_host_memory = 1;
+            p.concurrent_kernels = 1;
+            p.unified_addressing = 1;
+            p.max_threads_per_multiprocessor = max_tpm;
+            p.stream_priorities_supported = 1;
+            p.global_l1_cache_supported = 1;
+            p.local_l1_cache_supported = 1;
+            p.shared_mem_per_multiprocessor = shmem_mp as usize;
+            p.regs_per_multiprocessor = regs_mp;
+            p.managed_memory = 1;
+            p.concurrent_managed_access = 1;
+            p.cooperative_launch = 1;
+            p.compute_preemption_supported = 1;
+            p.shared_mem_per_block_optin = shmem_mp as usize;
+            p.max_blocks_per_multiprocessor = 16;
+            // The hand-built struct tail diverges from CUDA 12.4's cudaDeviceProp
+            // by a few bytes, so PyTorch reads multiProcessorCount /
+            // maxThreadsPerMultiProcessor as 0 and divides by zero in its RNG
+            // launch config. Write those two at their verified real offsets.
+            unsafe {
+                let base = prop as *mut u8;
+                base.add(388).cast::<c_int>().write_unaligned(mp);
+                base.add(624).cast::<c_int>().write_unaligned(max_tpm);
+            }
+            Ok(())
+        })
+        .err()
+        .unwrap_or(CUDA_SUCCESS),
+    )
+}
+
+// ---- events (forward to host) -----------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn cudaEventCreate(event: *mut *mut c_void) -> c_int {
+    set_last(match with_client(|c| c.event_create(0)) {
+        Ok(h) => unsafe { out(event, h as *mut c_void) },
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int {
+    set_last(match with_client(|c| c.event_create(flags)) {
+        Ok(h) => unsafe { out(event, h as *mut c_void) },
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaEventDestroy(event: *mut c_void) -> c_int {
+    set_last(match with_client(|c| c.event_destroy(event as u64)) {
+        Ok(()) => CUDA_SUCCESS,
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int {
+    set_last(
+        match with_client(|c| c.event_record(event as u64, stream as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaEventRecordWithFlags(
+    event: *mut c_void,
+    stream: *mut c_void,
+    _flags: c_uint,
+) -> c_int {
+    cudaEventRecord(event, stream)
+}
+#[no_mangle]
+pub extern "C" fn cudaEventSynchronize(event: *mut c_void) -> c_int {
+    set_last(match with_client(|c| c.event_synchronize(event as u64)) {
+        Ok(()) => CUDA_SUCCESS,
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaEventQuery(_event: *mut c_void) -> c_int {
+    // Serving thread runs work in call order, so a recorded event is complete.
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaEventElapsedTime(
+    ms: *mut f32,
+    start: *mut c_void,
+    end: *mut c_void,
+) -> c_int {
+    set_last(
+        match with_client(|c| c.event_elapsed_time(start as u64, end as u64)) {
+            Ok(t) => unsafe { out(ms, t) },
+            Err(e) => e,
+        },
+    )
+}
+
+// ---- streams: priorities, capture queries, callbacks ------------------------
+
+#[no_mangle]
+pub extern "C" fn cudaStreamCreateWithPriority(
+    stream: *mut *mut c_void,
+    flags: c_uint,
+    _priority: c_int,
+) -> c_int {
+    set_last(match with_client(|c| c.stream_create(flags)) {
+        Ok(h) => unsafe { out(stream, h as *mut c_void) },
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaStreamWaitEvent(
+    _stream: *mut c_void,
+    _event: *mut c_void,
+    _flags: c_uint,
+) -> c_int {
+    set_last(CUDA_SUCCESS) // in-order execution on the serving thread
+}
+#[no_mangle]
+pub extern "C" fn cudaStreamQuery(_stream: *mut c_void) -> c_int {
+    set_last(CUDA_SUCCESS) // always idle: prior work already ran
+}
+#[no_mangle]
+pub extern "C" fn cudaStreamIsCapturing(_stream: *mut c_void, status: *mut c_int) -> c_int {
+    set_last(unsafe { out(status, 0) }) // cudaStreamCaptureStatusNone
+}
+#[no_mangle]
+pub extern "C" fn cudaStreamGetCaptureInfo_v2(
+    _stream: *mut c_void,
+    status: *mut c_int,
+    id: *mut u64,
+    _graph: *mut *mut c_void,
+    _deps: *mut *mut *const c_void,
+    _num_deps: *mut usize,
+) -> c_int {
+    unsafe {
+        let _ = out(status, 0);
+        if !id.is_null() {
+            let _ = out(id, 0u64);
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaThreadExchangeStreamCaptureMode(_mode: *mut c_int) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+/// `cudaStreamCallback_t` = `void (*)(cudaStream_t, cudaError_t, void*)`.
+type StreamCallback = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void);
+#[no_mangle]
+pub extern "C" fn cudaStreamAddCallback(
+    stream: *mut c_void,
+    callback: Option<StreamCallback>,
+    user_data: *mut c_void,
+    _flags: c_uint,
+) -> c_int {
+    // Work up to here has already run, so invoke the callback immediately.
+    if let Some(cb) = callback {
+        unsafe { cb(stream, CUDA_SUCCESS, user_data) };
+    }
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetStreamPriorityRange(
+    least: *mut c_int,
+    greatest: *mut c_int,
+) -> c_int {
+    unsafe {
+        if !least.is_null() {
+            let _ = out(least, 0);
+        }
+        if !greatest.is_null() {
+            let _ = out(greatest, 0);
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
+
+// ---- async malloc / mempool (map to sync alloc; pool stubs) ------------------
+
+#[no_mangle]
+pub extern "C" fn cudaMallocAsync(
+    dev_ptr: *mut *mut c_void,
+    size: usize,
+    _stream: *mut c_void,
+) -> c_int {
+    cudaMalloc(dev_ptr, size)
+}
+#[no_mangle]
+pub extern "C" fn cudaFreeAsync(dev_ptr: *mut c_void, _stream: *mut c_void) -> c_int {
+    cudaFree(dev_ptr)
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, _device: c_int) -> c_int {
+    // No pool support; hand back a sentinel so callers that only stash it are ok.
+    set_last(unsafe { out(pool, std::ptr::without_provenance_mut(1)) })
+}
+#[no_mangle]
+pub extern "C" fn cudaMemPoolSetAttribute(
+    _pool: *mut c_void,
+    _attr: c_int,
+    _value: *mut c_void,
+) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaMemPoolGetAttribute(
+    _pool: *mut c_void,
+    _attr: c_int,
+    _value: *mut c_void,
+) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaMemPoolSetAccess(
+    _pool: *mut c_void,
+    _desc: *const c_void,
+    _count: usize,
+) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaMemPoolTrimTo(_pool: *mut c_void, _min_bytes_to_keep: usize) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+
+// ---- pointer / func attributes, occupancy, host register, peer, misc --------
+
+/// `cudaPointerAttributes` (CUDA 12.x): `{ int type; int device; void* devPtr;
+/// void* hostPtr; }`.
+#[repr(C)]
+struct CudaPointerAttributes {
+    memory_type: c_int,
+    device: c_int,
+    device_pointer: *mut c_void,
+    host_pointer: *mut c_void,
+}
+#[no_mangle]
+pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void) -> c_int {
+    if attr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // cudaMemoryTypeDevice=2 if we allocated it on the device, else Host=1.
+    let is_dev = with_state(|s| Ok(s.dev_allocs.contains(&(ptr as u64)))).unwrap_or(false);
+    // SAFETY: caller-provided cudaPointerAttributes.
+    let a = unsafe { &mut *(attr as *mut CudaPointerAttributes) };
+    a.memory_type = if is_dev { 2 } else { 1 };
+    a.device = 0;
+    a.device_pointer = if is_dev {
+        ptr as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    };
+    a.host_pointer = if is_dev {
+        std::ptr::null_mut()
+    } else {
+        ptr as *mut c_void
+    };
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void) -> c_int {
+    if attr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // cudaFuncAttributes prefix: sharedSizeBytes, constSizeBytes, localSizeBytes
+    // (size_t) then maxThreadsPerBlock, numRegs, ptxVersion, binaryVersion (int).
+    unsafe {
+        std::ptr::write_bytes(attr as *mut u8, 0, 72);
+        let ints = (attr as *mut u8).add(24) as *mut c_int;
+        *ints = 1024; // maxThreadsPerBlock
+        *ints.add(2) = 86; // ptxVersion (sm_86)
+        *ints.add(3) = 86; // binaryVersion
+    }
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaFuncSetAttribute(_func: *const c_void, _attr: c_int, _value: c_int) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    num_blocks: *mut c_int,
+    _func: *const c_void,
+    block_size: c_int,
+    _dynamic_smem: usize,
+    _flags: c_uint,
+) -> c_int {
+    // Coarse estimate: 2048 threads/SM cap divided by the block size, ≥1.
+    let bs = block_size.max(1);
+    set_last(unsafe { out(num_blocks, (2048 / bs).clamp(1, 32)) })
+}
+#[no_mangle]
+pub extern "C" fn cudaHostRegister(_ptr: *mut c_void, _size: usize, _flags: c_uint) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaHostUnregister(_ptr: *mut c_void) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaHostGetDevicePointer(
+    p_device: *mut *mut c_void,
+    host: *mut c_void,
+    _flags: c_uint,
+) -> c_int {
+    set_last(unsafe { out(p_device, host) }) // unified addressing
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceCanAccessPeer(can: *mut c_int, _device: c_int, _peer: c_int) -> c_int {
+    set_last(unsafe { out(can, 0) }) // single device
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceEnablePeerAccess(_peer: c_int, _flags: c_uint) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, _device: c_int) -> c_int {
+    let id = b"0000:01:00.0\0";
+    if !buf.is_null() && len > 0 {
+        let n = (len as usize - 1).min(id.len() - 1);
+        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr() as *const c_char, buf, n) };
+        unsafe { *buf.add(n) = 0 };
+    }
+    set_last(CUDA_SUCCESS)
+}
+
 // ---- kernel registration + launch -------------------------------------------
 
 /// `__fatBinC_Wrapper_t`: what `__cudaRegisterFatBinary` receives. `data` points
@@ -824,6 +1308,14 @@ pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c
 
 #[no_mangle]
 pub extern "C" fn __cudaRegisterFatBinaryEnd(_handle: *mut *mut c_void) {}
+
+/// Called by some CUDA-compiled modules (e.g. torchvision's `_C.so`) during
+/// their static init. The real runtime returns `char` 1 (module usable); we do
+/// the same — registration proper happens via `__cudaRegisterFunction`.
+#[no_mangle]
+pub extern "C" fn __cudaInitModule(_fat_cubin_handle: *mut *mut c_void) -> c_char {
+    1
+}
 
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -929,43 +1421,87 @@ pub extern "C" fn cudaLaunchKernel(
     shared_mem: usize,
     stream: *mut c_void,
 ) -> c_int {
-    set_last(
-        with_state(|s| {
-            let rec = s
-                .funcs
-                .get(&(func as usize))
-                .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-            let fid = rec.fid;
-            let sizes = rec.param_sizes.clone();
-            // Reconstruct one byte-blob per kernel argument from `args[i]`.
-            let params: Vec<Vec<u8>> = if sizes.is_empty() {
-                Vec::new()
-            } else if args.is_null() {
-                return Err(CUDA_ERROR_INVALID_VALUE);
-            } else {
-                let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
-                sizes
-                    .iter()
-                    .zip(ptrs)
-                    .map(|(&sz, &p)| {
-                        unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
-                    })
-                    .collect()
-            };
-            s.client
-                .launch_kernel(
-                    fid,
-                    [grid.x, grid.y, grid.z],
-                    [block.x, block.y, block.z],
-                    shared_mem as u32,
-                    stream as u64,
-                    &params,
-                )
-                .map_err(map_err)
-        })
-        .err()
-        .unwrap_or(CUDA_SUCCESS),
-    )
+    set_last(do_launch(
+        func,
+        [grid.x, grid.y, grid.z],
+        [block.x, block.y, block.z],
+        shared_mem,
+        stream as u64,
+        args,
+    ))
+}
+
+/// Shared launch path for both `cudaLaunchKernel` and `cudaLaunchKernelExC`:
+/// look up the registered function, gather its argument blobs, forward.
+fn do_launch(
+    func: *const c_void,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem: usize,
+    stream: u64,
+    args: *mut *mut c_void,
+) -> c_int {
+    with_state(|s| {
+        let rec = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+        let fid = rec.fid;
+        let sizes = rec.param_sizes.clone();
+        // Reconstruct one byte-blob per kernel argument from `args[i]`.
+        let params: Vec<Vec<u8>> = if sizes.is_empty() {
+            Vec::new()
+        } else if args.is_null() {
+            return Err(CUDA_ERROR_INVALID_VALUE);
+        } else {
+            let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
+            sizes
+                .iter()
+                .zip(ptrs)
+                .map(|(&sz, &p)| {
+                    unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
+                })
+                .collect()
+        };
+        s.client
+            .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
+            .map_err(map_err)
+    })
+    .err()
+    .unwrap_or(CUDA_SUCCESS)
+}
+
+/// `cudaLaunchConfig_t` (CUDA 12): grid/block dims, dynamic shared bytes, stream,
+/// then an attribute array we ignore (cluster dims etc. are not forwarded).
+#[repr(C)]
+struct CudaLaunchConfig {
+    grid_dim: Dim3,
+    block_dim: Dim3,
+    dynamic_smem_bytes: usize,
+    stream: *mut c_void,
+    attrs: *mut c_void,
+    num_attrs: c_uint,
+}
+
+#[no_mangle]
+pub extern "C" fn cudaLaunchKernelExC(
+    config: *const c_void,
+    func: *const c_void,
+    args: *mut *mut c_void,
+) -> c_int {
+    if config.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // SAFETY: caller passes a valid cudaLaunchConfig_t.
+    let c = unsafe { &*(config as *const CudaLaunchConfig) };
+    set_last(do_launch(
+        func,
+        [c.grid_dim.x, c.grid_dim.y, c.grid_dim.z],
+        [c.block_dim.x, c.block_dim.y, c.block_dim.z],
+        c.dynamic_smem_bytes,
+        c.stream as u64,
+        args,
+    ))
 }
 
 // CUDA 12.0+ launch path. nvcc-generated stubs resolve a "kernel handle" via
@@ -1129,4 +1665,771 @@ mod gen_cudnn {
     #![allow(non_snake_case, clippy::unnecessary_cast, unused_mut, dead_code)]
     use super::{c_int, c_void, with_client};
     include!("generated/cudnn_guest.rs");
+}
+
+// ---- cuDNN v8 backend (graph) API — PyTorch's convolution path --------------
+// Forwarded via the generic LibCall transport under a dedicated lib id. Opaque
+// descriptors + device pointers passing through are the server's real host
+// pointers, so attribute arrays ship as raw bytes sized by the attribute type.
+const LIB_CUDNN_BACKEND: u8 = 3;
+
+/// Byte size of one `cudnnBackendAttributeType_t` element (must match host).
+fn cudnn_be_elem_size(t: c_int) -> usize {
+    match t {
+        0 | 3 | 5 | 6 | 15 => 8, // HANDLE, INT64, DOUBLE, VOID_PTR, BACKEND_DESCRIPTOR
+        2 | 24 => 1,             // BOOLEAN, CHAR
+        26 => 16,                // FRACTION
+        _ => 4,                  // DATA_TYPE / enums / FLOAT / INT32 / ...
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendCreateDescriptor(
+    descriptor_type: c_int,
+    descriptor: *mut *mut c_void,
+) -> c_int {
+    if descriptor.is_null() {
+        return 2000; // CUDNN_STATUS_BAD_PARAM
+    }
+    let a = descriptor_type.to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 0, a)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
+            unsafe { *descriptor = h as *mut c_void };
+            0
+        }
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendDestroyDescriptor(descriptor: *mut c_void) -> c_int {
+    let a = (descriptor as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 1, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendSetAttribute(
+    descriptor: *mut c_void,
+    attribute_name: c_int,
+    attribute_type: c_int,
+    element_count: i64,
+    array_of_elements: *const c_void,
+) -> c_int {
+    let n = (element_count.max(0) as usize) * cudnn_be_elem_size(attribute_type);
+    let mut a = Vec::with_capacity(24 + n);
+    a.extend_from_slice(&(descriptor as u64).to_le_bytes());
+    a.extend_from_slice(&attribute_name.to_le_bytes());
+    a.extend_from_slice(&attribute_type.to_le_bytes());
+    a.extend_from_slice(&element_count.to_le_bytes());
+    if n > 0 && !array_of_elements.is_null() {
+        a.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(array_of_elements as *const u8, n)
+        });
+    }
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 2, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendGetAttribute(
+    descriptor: *mut c_void,
+    attribute_name: c_int,
+    attribute_type: c_int,
+    requested_element_count: i64,
+    element_count: *mut i64,
+    array_of_elements: *mut c_void,
+) -> c_int {
+    let cap = (requested_element_count.max(0) as usize) * cudnn_be_elem_size(attribute_type);
+    let mut a = Vec::with_capacity(24 + cap);
+    a.extend_from_slice(&(descriptor as u64).to_le_bytes());
+    a.extend_from_slice(&attribute_name.to_le_bytes());
+    a.extend_from_slice(&attribute_type.to_le_bytes());
+    a.extend_from_slice(&requested_element_count.to_le_bytes());
+    // Seed with current contents: descriptor-array gets pass pre-created handles.
+    if cap > 0 && !array_of_elements.is_null() {
+        a.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(array_of_elements as *const u8, cap)
+        });
+    }
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 3, a)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            let cnt = i64::from_le_bytes(out[..8].try_into().unwrap());
+            if !element_count.is_null() {
+                unsafe { *element_count = cnt };
+            }
+            let bytes = &out[8..];
+            if !array_of_elements.is_null() && !bytes.is_empty() {
+                let cap =
+                    (requested_element_count.max(0) as usize) * cudnn_be_elem_size(attribute_type);
+                let n = bytes.len().min(cap);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), array_of_elements as *mut u8, n)
+                };
+            }
+            0
+        }
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendFinalize(descriptor: *mut c_void) -> c_int {
+    let a = (descriptor as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 4, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnBackendExecute(
+    handle: *mut c_void,
+    execution_plan: *mut c_void,
+    variant_pack: *mut c_void,
+) -> c_int {
+    let mut a = Vec::with_capacity(24);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(execution_plan as u64).to_le_bytes());
+    a.extend_from_slice(&(variant_pack as u64).to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 5, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+// ---- cuBLASLt matmul API — PyTorch's linear-layer path -----------------------
+// Forwarded via the generic LibCall transport. Descriptors, layouts, preferences
+// and device pointers are the server's real host pointers (opaque handles here);
+// the opaque 64-byte algo blob and attribute buffers ship as raw bytes. The
+// "light handle" is the connection's cuBLAS handle, which torch reuses for Lt.
+const LIB_CUBLASLT: u8 = 4;
+const CUBLAS_STATUS_SUCCESS: c_int = 0;
+const CUBLAS_STATUS_NOT_INITIALIZED: c_int = 1;
+/// sizeof(cublasLtMatmulHeuristicResult_t): algo[64]+workspaceSize(8)+state(4)
+/// +wavesCount(4)+reserved[4](16). Must match the host.
+const LT_HEUR_RESULT_SZ: usize = 96;
+
+#[no_mangle]
+pub extern "C" fn cublasLtCreate(light_handle: *mut *mut c_void) -> c_int {
+    if light_handle.is_null() {
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 11, Vec::new())) {
+        Ok((0, out)) if out.len() >= 8 => {
+            unsafe {
+                *light_handle = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
+            };
+            CUBLAS_STATUS_SUCCESS
+        }
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtDestroy(light_handle: *mut c_void) -> c_int {
+    let a = (light_handle as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 12, a)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulDescCreate(
+    matmul_desc: *mut *mut c_void,
+    compute_type: c_int,
+    scale_type: c_int,
+) -> c_int {
+    if matmul_desc.is_null() {
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+    let mut a = Vec::with_capacity(8);
+    a.extend_from_slice(&compute_type.to_le_bytes());
+    a.extend_from_slice(&scale_type.to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 0, a)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            unsafe {
+                *matmul_desc = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
+            };
+            CUBLAS_STATUS_SUCCESS
+        }
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulDescDestroy(matmul_desc: *mut c_void) -> c_int {
+    let a = (matmul_desc as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 1, a)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+/// Pack an opaque descriptor/layout/preference SetAttribute call: the attribute
+/// buffer forwards verbatim (device pointers inside it stay coherent).
+fn lt_set_attr(
+    func: u16,
+    handle: *mut c_void,
+    attr: c_int,
+    buf: *const c_void,
+    size: usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(12 + size);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&attr.to_le_bytes());
+    if size > 0 && !buf.is_null() {
+        a.extend_from_slice(unsafe { std::slice::from_raw_parts(buf as *const u8, size) });
+    }
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, func, a)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulDescSetAttribute(
+    matmul_desc: *mut c_void,
+    attr: c_int,
+    buf: *const c_void,
+    size_in_bytes: usize,
+) -> c_int {
+    lt_set_attr(2, matmul_desc, attr, buf, size_in_bytes)
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatrixLayoutCreate(
+    mat_layout: *mut *mut c_void,
+    data_type: c_int,
+    rows: u64,
+    cols: u64,
+    ld: i64,
+) -> c_int {
+    if mat_layout.is_null() {
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+    let mut a = Vec::with_capacity(28);
+    a.extend_from_slice(&data_type.to_le_bytes());
+    a.extend_from_slice(&rows.to_le_bytes());
+    a.extend_from_slice(&cols.to_le_bytes());
+    a.extend_from_slice(&ld.to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 3, a)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            unsafe {
+                *mat_layout = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
+            };
+            CUBLAS_STATUS_SUCCESS
+        }
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatrixLayoutDestroy(mat_layout: *mut c_void) -> c_int {
+    let a = (mat_layout as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 4, a)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatrixLayoutSetAttribute(
+    mat_layout: *mut c_void,
+    attr: c_int,
+    buf: *const c_void,
+    size_in_bytes: usize,
+) -> c_int {
+    lt_set_attr(5, mat_layout, attr, buf, size_in_bytes)
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulPreferenceCreate(pref: *mut *mut c_void) -> c_int {
+    if pref.is_null() {
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 6, Vec::new())) {
+        Ok((0, out)) if out.len() >= 8 => {
+            unsafe { *pref = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void };
+            CUBLAS_STATUS_SUCCESS
+        }
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulPreferenceDestroy(pref: *mut c_void) -> c_int {
+    let a = (pref as u64).to_le_bytes().to_vec();
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 7, a)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtMatmulPreferenceSetAttribute(
+    pref: *mut c_void,
+    attr: c_int,
+    buf: *const c_void,
+    size_in_bytes: usize,
+) -> c_int {
+    lt_set_attr(8, pref, attr, buf, size_in_bytes)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cublasLtMatmulAlgoGetHeuristic(
+    light_handle: *mut c_void,
+    operation_desc: *mut c_void,
+    a_desc: *mut c_void,
+    b_desc: *mut c_void,
+    c_desc: *mut c_void,
+    d_desc: *mut c_void,
+    preference: *mut c_void,
+    requested_algo_count: c_int,
+    heuristic_results_array: *mut c_void,
+    return_algo_count: *mut c_int,
+) -> c_int {
+    let mut a = Vec::with_capacity(60);
+    a.extend_from_slice(&(light_handle as u64).to_le_bytes());
+    a.extend_from_slice(&(operation_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(a_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(b_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(c_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(d_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(preference as u64).to_le_bytes());
+    a.extend_from_slice(&requested_algo_count.to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 9, a)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            let count = i64::from_le_bytes(out[..8].try_into().unwrap()).max(0) as usize;
+            if !return_algo_count.is_null() {
+                unsafe { *return_algo_count = count as c_int };
+            }
+            let bytes = &out[8..];
+            if !heuristic_results_array.is_null() {
+                let n = bytes.len().min(count * LT_HEUR_RESULT_SZ);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        heuristic_results_array as *mut u8,
+                        n,
+                    )
+                };
+            }
+            CUBLAS_STATUS_SUCCESS
+        }
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cublasLtMatmul(
+    light_handle: *mut c_void,
+    compute_desc: *mut c_void,
+    alpha: *const c_void,
+    a: *const c_void,
+    a_desc: *mut c_void,
+    b: *const c_void,
+    b_desc: *mut c_void,
+    beta: *const c_void,
+    c: *const c_void,
+    c_desc: *mut c_void,
+    d: *mut c_void,
+    d_desc: *mut c_void,
+    algo: *const c_void,
+    workspace: *mut c_void,
+    workspace_size_in_bytes: usize,
+    stream: *mut c_void,
+) -> c_int {
+    // alpha/beta are host scalars sized by the desc's scale type (≤16 bytes for
+    // any real/complex type); forward a fixed 16-byte window so either fits.
+    let read16 = |p: *const c_void| -> [u8; 16] {
+        let mut v = [0u8; 16];
+        if !p.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(p as *const u8, v.as_mut_ptr(), 16) };
+        }
+        v
+    };
+    let algo_bytes = {
+        let mut v = [0u8; 64];
+        if !algo.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(algo as *const u8, v.as_mut_ptr(), 64) };
+        }
+        v
+    };
+    let mut buf = Vec::with_capacity(208);
+    buf.extend_from_slice(&(light_handle as u64).to_le_bytes());
+    buf.extend_from_slice(&(compute_desc as u64).to_le_bytes());
+    buf.extend_from_slice(&read16(alpha));
+    buf.extend_from_slice(&(a as u64).to_le_bytes());
+    buf.extend_from_slice(&(a_desc as u64).to_le_bytes());
+    buf.extend_from_slice(&(b as u64).to_le_bytes());
+    buf.extend_from_slice(&(b_desc as u64).to_le_bytes());
+    buf.extend_from_slice(&read16(beta));
+    buf.extend_from_slice(&(c as u64).to_le_bytes());
+    buf.extend_from_slice(&(c_desc as u64).to_le_bytes());
+    buf.extend_from_slice(&(d as u64).to_le_bytes());
+    buf.extend_from_slice(&(d_desc as u64).to_le_bytes());
+    buf.extend_from_slice(&algo_bytes);
+    buf.extend_from_slice(&(if algo.is_null() { 0u64 } else { 1u64 }).to_le_bytes());
+    buf.extend_from_slice(&(workspace as u64).to_le_bytes());
+    buf.extend_from_slice(&(workspace_size_in_bytes as u64).to_le_bytes());
+    buf.extend_from_slice(&(stream as u64).to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUBLASLT, 10, buf)) {
+        Ok((st, _)) => st,
+        Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
+    }
+}
+
+// ---- Legacy cuDNN batch-norm (Ex) + N-D descriptor — BatchNorm2d path --------
+// Forwarded via the generic LibCall transport. Descriptors and device pointers
+// are the server's real host pointers; alpha/beta are float scalars, epsilon and
+// the averaging factor are doubles, and the N-D descriptor's dim/stride arrays
+// forward as raw i32s.
+const LIB_CUDNN_BN: u8 = 5;
+
+/// A valid, static message pointer for `cudnnGetErrorString`. The real function
+/// returns `const char*`; torch dereferences it when formatting errors, so a
+/// stub that returned an int caused a segfault. The exact text is cosmetic.
+#[no_mangle]
+pub extern "C" fn cudnnGetErrorString(_status: c_int) -> *const c_char {
+    b"cudnn status (forwarded by smolvm)\0".as_ptr() as *const c_char
+}
+
+/// Read a host float behind a `*const c_void` (cuDNN alpha/beta), 0.0 if null.
+fn bn_f32(p: *const c_void) -> f32 {
+    if p.is_null() {
+        0.0
+    } else {
+        unsafe { *(p as *const f32) }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnSetTensorNdDescriptor(
+    tensor_desc: *mut c_void,
+    data_type: c_int,
+    nb_dims: c_int,
+    dim_a: *const c_int,
+    stride_a: *const c_int,
+) -> c_int {
+    let n = nb_dims.max(0) as usize;
+    let mut a = Vec::with_capacity(16 + n * 8);
+    a.extend_from_slice(&(tensor_desc as u64).to_le_bytes());
+    a.extend_from_slice(&data_type.to_le_bytes());
+    a.extend_from_slice(&nb_dims.to_le_bytes());
+    for arr in [dim_a, stride_a] {
+        for i in 0..n {
+            let v = if arr.is_null() {
+                0
+            } else {
+                unsafe { *arr.add(i) }
+            };
+            a.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 0, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudnnBatchNormalizationForwardInference(
+    handle: *mut c_void,
+    mode: c_int,
+    alpha: *const c_void,
+    beta: *const c_void,
+    x_desc: *mut c_void,
+    x: *const c_void,
+    y_desc: *mut c_void,
+    y: *mut c_void,
+    bn_desc: *mut c_void,
+    bn_scale: *const c_void,
+    bn_bias: *const c_void,
+    est_mean: *const c_void,
+    est_var: *const c_void,
+    epsilon: f64,
+) -> c_int {
+    let mut a = Vec::with_capacity(96);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_f32(alpha).to_le_bytes());
+    a.extend_from_slice(&bn_f32(beta).to_le_bytes());
+    for p in [
+        x_desc as u64,
+        x as u64,
+        y_desc as u64,
+        y as u64,
+        bn_desc as u64,
+        bn_scale as u64,
+        bn_bias as u64,
+        est_mean as u64,
+        est_var as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    a.extend_from_slice(&epsilon.to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 2, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudnnBatchNormalizationForwardTrainingEx(
+    handle: *mut c_void,
+    mode: c_int,
+    bn_ops: c_int,
+    alpha: *const c_void,
+    beta: *const c_void,
+    x_desc: *mut c_void,
+    x: *const c_void,
+    z_desc: *mut c_void,
+    z: *const c_void,
+    y_desc: *mut c_void,
+    y: *mut c_void,
+    bn_desc: *mut c_void,
+    bn_scale: *const c_void,
+    bn_bias: *const c_void,
+    factor: f64,
+    run_mean: *mut c_void,
+    run_var: *mut c_void,
+    epsilon: f64,
+    save_mean: *mut c_void,
+    save_ivar: *mut c_void,
+    act_desc: *mut c_void,
+    workspace: *mut c_void,
+    ws_size: usize,
+    reserve: *mut c_void,
+    reserve_size: usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(200);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_ops.to_le_bytes());
+    a.extend_from_slice(&bn_f32(alpha).to_le_bytes());
+    a.extend_from_slice(&bn_f32(beta).to_le_bytes());
+    for p in [
+        x_desc as u64,
+        x as u64,
+        z_desc as u64,
+        z as u64,
+        y_desc as u64,
+        y as u64,
+        bn_desc as u64,
+        bn_scale as u64,
+        bn_bias as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    a.extend_from_slice(&factor.to_le_bytes());
+    a.extend_from_slice(&(run_mean as u64).to_le_bytes());
+    a.extend_from_slice(&(run_var as u64).to_le_bytes());
+    a.extend_from_slice(&epsilon.to_le_bytes());
+    for p in [
+        save_mean as u64,
+        save_ivar as u64,
+        act_desc as u64,
+        workspace as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    a.extend_from_slice(&(ws_size as u64).to_le_bytes());
+    a.extend_from_slice(&(reserve as u64).to_le_bytes());
+    a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 3, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudnnBatchNormalizationBackwardEx(
+    handle: *mut c_void,
+    mode: c_int,
+    bn_ops: c_int,
+    alpha_d: *const c_void,
+    beta_d: *const c_void,
+    alpha_p: *const c_void,
+    beta_p: *const c_void,
+    x_desc: *mut c_void,
+    x: *const c_void,
+    y_desc: *mut c_void,
+    y: *const c_void,
+    dy_desc: *mut c_void,
+    dy: *const c_void,
+    dz_desc: *mut c_void,
+    dz: *mut c_void,
+    dx_desc: *mut c_void,
+    dx: *mut c_void,
+    d_bn_desc: *mut c_void,
+    bn_scale: *const c_void,
+    bn_bias: *const c_void,
+    d_bn_scale: *mut c_void,
+    d_bn_bias: *mut c_void,
+    epsilon: f64,
+    saved_mean: *const c_void,
+    saved_ivar: *const c_void,
+    act_desc: *mut c_void,
+    workspace: *mut c_void,
+    ws_size: usize,
+    reserve: *mut c_void,
+    reserve_size: usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(256);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_ops.to_le_bytes());
+    a.extend_from_slice(&bn_f32(alpha_d).to_le_bytes());
+    a.extend_from_slice(&bn_f32(beta_d).to_le_bytes());
+    a.extend_from_slice(&bn_f32(alpha_p).to_le_bytes());
+    a.extend_from_slice(&bn_f32(beta_p).to_le_bytes());
+    for p in [
+        x_desc as u64,
+        x as u64,
+        y_desc as u64,
+        y as u64,
+        dy_desc as u64,
+        dy as u64,
+        dz_desc as u64,
+        dz as u64,
+        dx_desc as u64,
+        dx as u64,
+        d_bn_desc as u64,
+        bn_scale as u64,
+        bn_bias as u64,
+        d_bn_scale as u64,
+        d_bn_bias as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    a.extend_from_slice(&epsilon.to_le_bytes());
+    for p in [
+        saved_mean as u64,
+        saved_ivar as u64,
+        act_desc as u64,
+        workspace as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    a.extend_from_slice(&(ws_size as u64).to_le_bytes());
+    a.extend_from_slice(&(reserve as u64).to_le_bytes());
+    a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
+    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 4, a)) {
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+/// Shared tail for the three `Get...Size` queries: forward the packed args and
+/// write the returned `size_t` through `size_out`.
+fn bn_size_call(func: u16, args: Vec<u8>, size_out: *mut usize) -> c_int {
+    match with_client(|c| c.lib_call(LIB_CUDNN_BN, func, args)) {
+        Ok((0, out)) if out.len() >= 8 => {
+            if !size_out.is_null() {
+                unsafe { *size_out = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize };
+            }
+            0
+        }
+        Ok((st, _)) => st,
+        Err(_) => 1,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+    handle: *mut c_void,
+    mode: c_int,
+    bn_ops: c_int,
+    x_desc: *mut c_void,
+    z_desc: *mut c_void,
+    y_desc: *mut c_void,
+    bn_desc: *mut c_void,
+    act_desc: *mut c_void,
+    size_out: *mut usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(56);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_ops.to_le_bytes());
+    for p in [
+        x_desc as u64,
+        z_desc as u64,
+        y_desc as u64,
+        bn_desc as u64,
+        act_desc as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    bn_size_call(5, a, size_out)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+    handle: *mut c_void,
+    mode: c_int,
+    bn_ops: c_int,
+    x_desc: *mut c_void,
+    y_desc: *mut c_void,
+    dy_desc: *mut c_void,
+    dz_desc: *mut c_void,
+    dx_desc: *mut c_void,
+    d_bn_desc: *mut c_void,
+    act_desc: *mut c_void,
+    size_out: *mut usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(64);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_ops.to_le_bytes());
+    for p in [
+        x_desc as u64,
+        y_desc as u64,
+        dy_desc as u64,
+        dz_desc as u64,
+        dx_desc as u64,
+        d_bn_desc as u64,
+        act_desc as u64,
+    ] {
+        a.extend_from_slice(&p.to_le_bytes());
+    }
+    bn_size_call(6, a, size_out)
+}
+
+#[no_mangle]
+pub extern "C" fn cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+    handle: *mut c_void,
+    mode: c_int,
+    bn_ops: c_int,
+    act_desc: *mut c_void,
+    x_desc: *mut c_void,
+    size_out: *mut usize,
+) -> c_int {
+    let mut a = Vec::with_capacity(40);
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&mode.to_le_bytes());
+    a.extend_from_slice(&bn_ops.to_le_bytes());
+    a.extend_from_slice(&(act_desc as u64).to_le_bytes());
+    a.extend_from_slice(&(x_desc as u64).to_le_bytes());
+    bn_size_call(7, a, size_out)
 }

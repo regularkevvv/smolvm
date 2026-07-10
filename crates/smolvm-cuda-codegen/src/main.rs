@@ -108,6 +108,33 @@ fn cublas_spec() -> Lib {
             i("ldc"),
         ],
     };
+    // Strided-batched GEMM (PyTorch's `bmm`): same as gemm plus per-operand
+    // strides (i64) and a batch count.
+    let s64 = |n| p(n, "i64", Scalar("i64"));
+    let gemm_strided = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            i("transa"),
+            i("transb"),
+            i("m"),
+            i("n"),
+            i("k"),
+            p("alpha", leak(format!("*const {ety}")), HostInScalar(ety)),
+            p("A", leak(format!("*const {ety}")), DevPtr),
+            i("lda"),
+            s64("strideA"),
+            p("B", leak(format!("*const {ety}")), DevPtr),
+            i("ldb"),
+            s64("strideB"),
+            p("beta", leak(format!("*const {ety}")), HostInScalar(ety)),
+            p("C", leak(format!("*mut {ety}")), DevPtr),
+            i("ldc"),
+            s64("strideC"),
+            i("batchCount"),
+        ],
+    };
     Lib {
         name: "cublas",
         id: 1,
@@ -125,6 +152,107 @@ fn cublas_spec() -> Lib {
             },
             gemm("cublasSgemm_v2", "cublasSgemm_v2", "f32"),
             gemm("cublasDgemm_v2", "cublasDgemm_v2", "f64"),
+            gemm_strided(
+                "cublasSgemmStridedBatched",
+                "cublasSgemmStridedBatched",
+                "f32",
+            ),
+            gemm_strided(
+                "cublasDgemmStridedBatched",
+                "cublasDgemmStridedBatched",
+                "f64",
+            ),
+            // Stream + config that PyTorch sets up before a matmul.
+            Fun {
+                sym: "cublasSetStream_v2",
+                real: "cublasSetStream_v2",
+                params: vec![handle(), p("stream", "*mut c_void", Handle)],
+            },
+            Fun {
+                sym: "cublasSetWorkspace_v2",
+                real: "cublasSetWorkspace_v2",
+                params: vec![
+                    handle(),
+                    p("workspace", "*mut c_void", DevPtr),
+                    p("size", "usize", Scalar("u64")),
+                ],
+            },
+            Fun {
+                sym: "cublasSetMathMode",
+                real: "cublasSetMathMode",
+                params: vec![handle(), i("mode")],
+            },
+            Fun {
+                sym: "cublasGetMathMode",
+                real: "cublasGetMathMode",
+                params: vec![handle(), p("mode", "*mut c_int", HostOutScalar("i32"))],
+            },
+            Fun {
+                sym: "cublasGetProperty",
+                real: "cublasGetProperty",
+                params: vec![
+                    i("prop_type"),
+                    p("value", "*mut c_int", HostOutScalar("i32")),
+                ],
+            },
+            // cublasGemmEx — PyTorch's general GEMM. alpha/beta are the compute
+            // type (f32 for the common CUBLAS_COMPUTE_32F path).
+            Fun {
+                sym: "cublasGemmEx",
+                real: "cublasGemmEx",
+                params: vec![
+                    handle(),
+                    i("transa"),
+                    i("transb"),
+                    i("m"),
+                    i("n"),
+                    i("k"),
+                    p("alpha", "*const f32", HostInScalar("f32")),
+                    p("A", "*const c_void", DevPtr),
+                    i("Atype"),
+                    i("lda"),
+                    p("B", "*const c_void", DevPtr),
+                    i("Btype"),
+                    i("ldb"),
+                    p("beta", "*const f32", HostInScalar("f32")),
+                    p("C", "*mut c_void", DevPtr),
+                    i("Ctype"),
+                    i("ldc"),
+                    i("computeType"),
+                    i("algo"),
+                ],
+            },
+            // cublasGemmStridedBatchedEx — PyTorch's mixed-precision batched GEMM
+            // (fp16/bf16 `bmm`). alpha/beta are the compute type (f32 common path).
+            Fun {
+                sym: "cublasGemmStridedBatchedEx",
+                real: "cublasGemmStridedBatchedEx",
+                params: vec![
+                    handle(),
+                    i("transa"),
+                    i("transb"),
+                    i("m"),
+                    i("n"),
+                    i("k"),
+                    p("alpha", "*const f32", HostInScalar("f32")),
+                    p("A", "*const c_void", DevPtr),
+                    i("Atype"),
+                    i("lda"),
+                    s64("strideA"),
+                    p("B", "*const c_void", DevPtr),
+                    i("Btype"),
+                    i("ldb"),
+                    s64("strideB"),
+                    p("beta", "*const f32", HostInScalar("f32")),
+                    p("C", "*mut c_void", DevPtr),
+                    i("Ctype"),
+                    i("ldc"),
+                    s64("strideC"),
+                    i("batchCount"),
+                    i("computeType"),
+                    i("algo"),
+                ],
+            },
         ],
     }
 }
@@ -453,7 +581,7 @@ fn gen_host(lib: &Lib) -> String {
     // A tiny cursor with the scalar readers the generated code uses.
     let _ = writeln!(
         s,
-        "struct GenCur<'a> {{ b: &'a [u8], p: usize }}\nimpl GenCur<'_> {{\n    fn take(&mut self, n: usize) -> [u8; 8] {{ let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }}\n    fn i32(&mut self) -> i32 {{ i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn u64(&mut self) -> u64 {{ u64::from_le_bytes(self.take(8)) }}\n    fn f32(&mut self) -> f32 {{ f32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn f64(&mut self) -> f64 {{ f64::from_le_bytes(self.take(8)) }}\n}}"
+        "struct GenCur<'a> {{ b: &'a [u8], p: usize }}\nimpl GenCur<'_> {{\n    fn take(&mut self, n: usize) -> [u8; 8] {{ let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }}\n    fn i32(&mut self) -> i32 {{ i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn i64(&mut self) -> i64 {{ i64::from_le_bytes(self.take(8)) }}\n    fn u64(&mut self) -> u64 {{ u64::from_le_bytes(self.take(8)) }}\n    fn f32(&mut self) -> f32 {{ f32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn f64(&mut self) -> f64 {{ f64::from_le_bytes(self.take(8)) }}\n}}"
     );
     s
 }
