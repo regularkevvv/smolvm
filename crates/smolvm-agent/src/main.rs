@@ -4808,6 +4808,14 @@ fn handle_run(
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
 
+    // SSH agent forwarding: make SSH_AUTH_SOCK part of the command env so it
+    // survives the keep-alive `crun exec` path (#542), which runs commands with
+    // this env rather than the keep-alive container's own. No-op when forwarding
+    // is off; harmless on the fresh-container path.
+    let mut env = env.to_vec();
+    ssh_agent::inject_into_env(&mut env);
+    let env = &env[..];
+
     // On a persistent machine, run inside the long-lived keep-alive container so
     // backgrounded processes survive across execs. Fall back to a fresh container
     // if the keep-alive can't be established, so exec never breaks outright.

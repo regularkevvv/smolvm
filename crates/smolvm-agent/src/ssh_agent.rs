@@ -61,10 +61,56 @@ fn inject_into_container_if(spec: &mut crate::oci::OciSpec, enabled: bool) {
     spec.add_env("SSH_AUTH_SOCK", GUEST_SSH_AUTH_SOCK);
 }
 
+/// Add `SSH_AUTH_SOCK` to a command's env list when forwarding is enabled.
+///
+/// [`inject_into_container`] wires the socket + env into a *container spec*, but a
+/// command run via `crun exec` into the persistent keep-alive container — the path
+/// non-interactive exec + run take since #542 — gets a fresh process env, not the
+/// container's, so the spec injection never reaches it. This wires the variable
+/// into that exec/run env. No-op when disabled; never overrides an existing value
+/// (e.g. a user-supplied `-e SSH_AUTH_SOCK`).
+pub fn inject_into_env(env: &mut Vec<(String, String)>) {
+    inject_into_env_if(env, is_enabled());
+}
+
+/// Testable core of [`inject_into_env`].
+fn inject_into_env_if(env: &mut Vec<(String, String)>, enabled: bool) {
+    if enabled && !env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK") {
+        env.push(("SSH_AUTH_SOCK".to_string(), GUEST_SSH_AUTH_SOCK.to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::oci::{OciSpec, ProcessIdentity};
+
+    // Regression guard for #542: non-interactive exec + run go through the
+    // keep-alive container's `crun exec`, whose process env is built fresh (not
+    // inherited from the container), so SSH_AUTH_SOCK must be injected into that
+    // env explicitly — the container-spec injection alone doesn't reach it.
+    #[test]
+    fn inject_into_env_adds_ssh_auth_sock_only_when_enabled() {
+        // Enabled → injected.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        inject_into_env_if(&mut env, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SSH_AUTH_SOCK" && v == GUEST_SSH_AUTH_SOCK),
+            "SSH_AUTH_SOCK must be injected into the exec/run env when forwarding is enabled"
+        );
+
+        // Disabled → no-op.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        inject_into_env_if(&mut env, false);
+        assert!(!env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"));
+
+        // Never overrides a user-supplied value.
+        let mut env = vec![("SSH_AUTH_SOCK".to_string(), "/custom.sock".to_string())];
+        inject_into_env_if(&mut env, true);
+        assert_eq!(env.iter().filter(|(k, _)| k == "SSH_AUTH_SOCK").count(), 1);
+        assert_eq!(env[0].1, "/custom.sock");
+    }
 
     #[test]
     fn inject_is_noop_when_disabled() {
