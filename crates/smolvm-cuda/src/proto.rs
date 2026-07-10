@@ -26,16 +26,34 @@ pub enum Op {
     DeviceGetCount = 0x02,
     DeviceGetName = 0x03,
     DeviceTotalMem = 0x04,
+    DriverGetVersion = 0x05,
+    DeviceGetAttribute = 0x06,
+    DeviceGetUuid = 0x07,
     CtxCreate = 0x10,
     CtxDestroy = 0x11,
+    PrimaryCtxRetain = 0x12,
+    PrimaryCtxRelease = 0x13,
     ModuleLoadData = 0x20,
     ModuleGetFunction = 0x21,
+    ModuleUnload = 0x22,
+    FuncGetParamInfo = 0x23,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
     MemcpyDtoH = 0x33,
+    MemcpyDtoD = 0x34,
+    MemsetD8 = 0x35,
+    MemGetInfo = 0x36,
     LaunchKernel = 0x40,
     CtxSynchronize = 0x50,
+    StreamCreate = 0x60,
+    StreamDestroy = 0x61,
+    StreamSynchronize = 0x62,
+    EventCreate = 0x70,
+    EventDestroy = 0x71,
+    EventRecord = 0x72,
+    EventSynchronize = 0x73,
+    EventElapsedTime = 0x74,
 }
 
 impl Op {
@@ -45,16 +63,34 @@ impl Op {
             0x02 => Op::DeviceGetCount,
             0x03 => Op::DeviceGetName,
             0x04 => Op::DeviceTotalMem,
+            0x05 => Op::DriverGetVersion,
+            0x06 => Op::DeviceGetAttribute,
+            0x07 => Op::DeviceGetUuid,
             0x10 => Op::CtxCreate,
             0x11 => Op::CtxDestroy,
+            0x12 => Op::PrimaryCtxRetain,
+            0x13 => Op::PrimaryCtxRelease,
             0x20 => Op::ModuleLoadData,
             0x21 => Op::ModuleGetFunction,
+            0x22 => Op::ModuleUnload,
+            0x23 => Op::FuncGetParamInfo,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
             0x33 => Op::MemcpyDtoH,
+            0x34 => Op::MemcpyDtoD,
+            0x35 => Op::MemsetD8,
+            0x36 => Op::MemGetInfo,
             0x40 => Op::LaunchKernel,
             0x50 => Op::CtxSynchronize,
+            0x60 => Op::StreamCreate,
+            0x61 => Op::StreamDestroy,
+            0x62 => Op::StreamSynchronize,
+            0x70 => Op::EventCreate,
+            0x71 => Op::EventDestroy,
+            0x72 => Op::EventRecord,
+            0x73 => Op::EventSynchronize,
+            0x74 => Op::EventElapsedTime,
             _ => return None,
         })
     }
@@ -71,11 +107,25 @@ pub enum Request {
     DeviceTotalMem {
         device: i32,
     },
+    DriverGetVersion,
+    DeviceGetAttribute {
+        attrib: i32,
+        device: i32,
+    },
+    DeviceGetUuid {
+        device: i32,
+    },
     CtxCreate {
         device: i32,
     },
     CtxDestroy {
         ctx: u64,
+    },
+    PrimaryCtxRetain {
+        device: i32,
+    },
+    PrimaryCtxRelease {
+        device: i32,
     },
     ModuleLoadData {
         image: Vec<u8>,
@@ -83,6 +133,14 @@ pub enum Request {
     ModuleGetFunction {
         module: u64,
         name: String,
+    },
+    ModuleUnload {
+        module: u64,
+    },
+    /// Per-parameter byte sizes of `function`'s kernel arguments, in declaration
+    /// order — what a generic client needs to serialize `kernelParams` blobs.
+    FuncGetParamInfo {
+        function: u64,
     },
     MemAlloc {
         bytes: u64,
@@ -98,9 +156,21 @@ pub enum Request {
         dptr: u64,
         bytes: u64,
     },
+    MemcpyDtoD {
+        dst: u64,
+        src: u64,
+        bytes: u64,
+    },
+    MemsetD8 {
+        dptr: u64,
+        value: u8,
+        bytes: u64,
+    },
+    MemGetInfo,
     /// Launch `function` with the given geometry. `params` is one byte-blob per
     /// kernel argument, in order — the host rebuilds the `void*[]` the Driver
-    /// API expects by pointing at local copies of each blob.
+    /// API expects by pointing at local copies of each blob. `stream` is an
+    /// opaque stream id (0 = the default stream).
     LaunchKernel {
         function: u64,
         grid: [u32; 3],
@@ -110,10 +180,37 @@ pub enum Request {
         params: Vec<Vec<u8>>,
     },
     CtxSynchronize,
+    StreamCreate {
+        flags: u32,
+    },
+    StreamDestroy {
+        stream: u64,
+    },
+    StreamSynchronize {
+        stream: u64,
+    },
+    EventCreate {
+        flags: u32,
+    },
+    EventDestroy {
+        event: u64,
+    },
+    /// Record `event` on `stream` (0 = the default stream).
+    EventRecord {
+        event: u64,
+        stream: u64,
+    },
+    EventSynchronize {
+        event: u64,
+    },
+    EventElapsedTime {
+        start: u64,
+        end: u64,
+    },
 }
 
 /// A decoded successful response body (the `status == 0` payload).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     /// No return value beyond status (Init, CtxDestroy, MemFree, Memcpy*, Launch, Sync).
     Ok,
@@ -123,6 +220,10 @@ pub enum Response {
     Handle(u64),
     Dptr(u64),
     Data(Vec<u8>),
+    /// Two u64s (MemGetInfo: free, total).
+    Pair(u64, u64),
+    /// Milliseconds (EventElapsedTime). f32 bits on the wire.
+    Millis(f32),
 }
 
 // ---- low-level primitives -------------------------------------------------
@@ -244,6 +345,16 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::DeviceTotalMem as u8);
             w_i32(&mut b, *device);
         }
+        Request::DriverGetVersion => w_u8(&mut b, Op::DriverGetVersion as u8),
+        Request::DeviceGetAttribute { attrib, device } => {
+            w_u8(&mut b, Op::DeviceGetAttribute as u8);
+            w_i32(&mut b, *attrib);
+            w_i32(&mut b, *device);
+        }
+        Request::DeviceGetUuid { device } => {
+            w_u8(&mut b, Op::DeviceGetUuid as u8);
+            w_i32(&mut b, *device);
+        }
         Request::CtxCreate { device } => {
             w_u8(&mut b, Op::CtxCreate as u8);
             w_i32(&mut b, *device);
@@ -251,6 +362,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::CtxDestroy { ctx } => {
             w_u8(&mut b, Op::CtxDestroy as u8);
             w_u64(&mut b, *ctx);
+        }
+        Request::PrimaryCtxRetain { device } => {
+            w_u8(&mut b, Op::PrimaryCtxRetain as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::PrimaryCtxRelease { device } => {
+            w_u8(&mut b, Op::PrimaryCtxRelease as u8);
+            w_i32(&mut b, *device);
         }
         Request::ModuleLoadData { image } => {
             w_u8(&mut b, Op::ModuleLoadData as u8);
@@ -260,6 +379,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::ModuleGetFunction as u8);
             w_u64(&mut b, *module);
             w_str(&mut b, name);
+        }
+        Request::ModuleUnload { module } => {
+            w_u8(&mut b, Op::ModuleUnload as u8);
+            w_u64(&mut b, *module);
+        }
+        Request::FuncGetParamInfo { function } => {
+            w_u8(&mut b, Op::FuncGetParamInfo as u8);
+            w_u64(&mut b, *function);
         }
         Request::MemAlloc { bytes } => {
             w_u8(&mut b, Op::MemAlloc as u8);
@@ -279,6 +406,19 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *dptr);
             w_u64(&mut b, *bytes);
         }
+        Request::MemcpyDtoD { dst, src, bytes } => {
+            w_u8(&mut b, Op::MemcpyDtoD as u8);
+            w_u64(&mut b, *dst);
+            w_u64(&mut b, *src);
+            w_u64(&mut b, *bytes);
+        }
+        Request::MemsetD8 { dptr, value, bytes } => {
+            w_u8(&mut b, Op::MemsetD8 as u8);
+            w_u64(&mut b, *dptr);
+            w_u8(&mut b, *value);
+            w_u64(&mut b, *bytes);
+        }
+        Request::MemGetInfo => w_u8(&mut b, Op::MemGetInfo as u8),
         Request::LaunchKernel {
             function,
             grid,
@@ -303,6 +443,40 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             }
         }
         Request::CtxSynchronize => w_u8(&mut b, Op::CtxSynchronize as u8),
+        Request::StreamCreate { flags } => {
+            w_u8(&mut b, Op::StreamCreate as u8);
+            w_u32(&mut b, *flags);
+        }
+        Request::StreamDestroy { stream } => {
+            w_u8(&mut b, Op::StreamDestroy as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::StreamSynchronize { stream } => {
+            w_u8(&mut b, Op::StreamSynchronize as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::EventCreate { flags } => {
+            w_u8(&mut b, Op::EventCreate as u8);
+            w_u32(&mut b, *flags);
+        }
+        Request::EventDestroy { event } => {
+            w_u8(&mut b, Op::EventDestroy as u8);
+            w_u64(&mut b, *event);
+        }
+        Request::EventRecord { event, stream } => {
+            w_u8(&mut b, Op::EventRecord as u8);
+            w_u64(&mut b, *event);
+            w_u64(&mut b, *stream);
+        }
+        Request::EventSynchronize { event } => {
+            w_u8(&mut b, Op::EventSynchronize as u8);
+            w_u64(&mut b, *event);
+        }
+        Request::EventElapsedTime { start, end } => {
+            w_u8(&mut b, Op::EventElapsedTime as u8);
+            w_u64(&mut b, *start);
+            w_u64(&mut b, *end);
+        }
     }
     b
 }
@@ -315,13 +489,23 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
         Op::DeviceTotalMem => Request::DeviceTotalMem { device: c.i32()? },
+        Op::DriverGetVersion => Request::DriverGetVersion,
+        Op::DeviceGetAttribute => Request::DeviceGetAttribute {
+            attrib: c.i32()?,
+            device: c.i32()?,
+        },
+        Op::DeviceGetUuid => Request::DeviceGetUuid { device: c.i32()? },
         Op::CtxCreate => Request::CtxCreate { device: c.i32()? },
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
+        Op::PrimaryCtxRetain => Request::PrimaryCtxRetain { device: c.i32()? },
+        Op::PrimaryCtxRelease => Request::PrimaryCtxRelease { device: c.i32()? },
         Op::ModuleLoadData => Request::ModuleLoadData { image: c.bytes()? },
         Op::ModuleGetFunction => Request::ModuleGetFunction {
             module: c.u64()?,
             name: c.string()?,
         },
+        Op::ModuleUnload => Request::ModuleUnload { module: c.u64()? },
+        Op::FuncGetParamInfo => Request::FuncGetParamInfo { function: c.u64()? },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
@@ -332,6 +516,17 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             dptr: c.u64()?,
             bytes: c.u64()?,
         },
+        Op::MemcpyDtoD => Request::MemcpyDtoD {
+            dst: c.u64()?,
+            src: c.u64()?,
+            bytes: c.u64()?,
+        },
+        Op::MemsetD8 => Request::MemsetD8 {
+            dptr: c.u64()?,
+            value: c.u8()?,
+            bytes: c.u64()?,
+        },
+        Op::MemGetInfo => Request::MemGetInfo,
         Op::LaunchKernel => {
             let function = c.u64()?;
             let grid = [c.u32()?, c.u32()?, c.u32()?];
@@ -353,6 +548,20 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             }
         }
         Op::CtxSynchronize => Request::CtxSynchronize,
+        Op::StreamCreate => Request::StreamCreate { flags: c.u32()? },
+        Op::StreamDestroy => Request::StreamDestroy { stream: c.u64()? },
+        Op::StreamSynchronize => Request::StreamSynchronize { stream: c.u64()? },
+        Op::EventCreate => Request::EventCreate { flags: c.u32()? },
+        Op::EventDestroy => Request::EventDestroy { event: c.u64()? },
+        Op::EventRecord => Request::EventRecord {
+            event: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::EventSynchronize => Request::EventSynchronize { event: c.u64()? },
+        Op::EventElapsedTime => Request::EventElapsedTime {
+            start: c.u64()?,
+            end: c.u64()?,
+        },
     })
 }
 
@@ -369,6 +578,11 @@ pub fn encode_response(status: i32, resp: &Response) -> Vec<u8> {
             Response::Name(s) => w_str(&mut b, s),
             Response::Bytes(v) | Response::Handle(v) | Response::Dptr(v) => w_u64(&mut b, *v),
             Response::Data(d) => w_bytes(&mut b, d),
+            Response::Pair(a, z) => {
+                w_u64(&mut b, *a);
+                w_u64(&mut b, *z);
+            }
+            Response::Millis(ms) => w_u32(&mut b, ms.to_bits()),
         }
     }
     b
@@ -383,19 +597,33 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         return Ok((status, Response::Ok));
     }
     let body = match op {
-        Op::DeviceGetCount => Response::Count(c.i32()?),
+        Op::DeviceGetCount | Op::DriverGetVersion | Op::DeviceGetAttribute => {
+            Response::Count(c.i32()?)
+        }
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
-        Op::CtxCreate => Response::Handle(c.u64()?),
+        Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
+        Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
-        Op::MemcpyDtoH => Response::Data(c.bytes()?),
+        Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo => Response::Data(c.bytes()?),
+        Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
+        Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
         Op::Init
         | Op::CtxDestroy
+        | Op::PrimaryCtxRelease
+        | Op::ModuleUnload
         | Op::MemFree
         | Op::MemcpyHtoD
+        | Op::MemcpyDtoD
+        | Op::MemsetD8
         | Op::LaunchKernel
-        | Op::CtxSynchronize => Response::Ok,
+        | Op::CtxSynchronize
+        | Op::StreamDestroy
+        | Op::StreamSynchronize
+        | Op::EventDestroy
+        | Op::EventRecord
+        | Op::EventSynchronize => Response::Ok,
     };
     Ok((status, body))
 }
@@ -448,6 +676,67 @@ mod tests {
             ],
         });
         roundtrip(Request::CtxSynchronize);
+    }
+
+    #[test]
+    fn extended_request_roundtrips() {
+        roundtrip(Request::DriverGetVersion);
+        roundtrip(Request::DeviceGetAttribute {
+            attrib: 75,
+            device: 0,
+        });
+        roundtrip(Request::DeviceGetUuid { device: 0 });
+        roundtrip(Request::PrimaryCtxRetain { device: 0 });
+        roundtrip(Request::PrimaryCtxRelease { device: 0 });
+        roundtrip(Request::ModuleUnload { module: 7 });
+        roundtrip(Request::FuncGetParamInfo { function: 9 });
+        roundtrip(Request::MemcpyDtoD {
+            dst: 0x2000,
+            src: 0x1000,
+            bytes: 64,
+        });
+        roundtrip(Request::MemsetD8 {
+            dptr: 0x1000,
+            value: 0xAB,
+            bytes: 128,
+        });
+        roundtrip(Request::MemGetInfo);
+        roundtrip(Request::StreamCreate { flags: 1 });
+        roundtrip(Request::StreamDestroy { stream: 3 });
+        roundtrip(Request::StreamSynchronize { stream: 3 });
+        roundtrip(Request::EventCreate { flags: 0 });
+        roundtrip(Request::EventDestroy { event: 4 });
+        roundtrip(Request::EventRecord {
+            event: 4,
+            stream: 0,
+        });
+        roundtrip(Request::EventSynchronize { event: 4 });
+        roundtrip(Request::EventElapsedTime { start: 4, end: 5 });
+    }
+
+    #[test]
+    fn extended_response_roundtrips() {
+        for (op, resp) in [
+            (Op::DriverGetVersion, Response::Count(13000)),
+            (Op::DeviceGetAttribute, Response::Count(1024)),
+            (Op::DeviceGetUuid, Response::Data(vec![0u8; 16])),
+            (Op::PrimaryCtxRetain, Response::Handle(11)),
+            (
+                Op::FuncGetParamInfo,
+                Response::Data(vec![8, 0, 0, 0, 4, 0, 0, 0]),
+            ),
+            (Op::MemGetInfo, Response::Pair(6 << 30, 8 << 30)),
+            (Op::StreamCreate, Response::Handle(21)),
+            (Op::EventCreate, Response::Handle(22)),
+            (Op::EventElapsedTime, Response::Millis(1.25)),
+            (Op::ModuleUnload, Response::Ok),
+            (Op::MemsetD8, Response::Ok),
+        ] {
+            let enc = encode_response(0, &resp);
+            let (status, dec) = decode_response(op, &enc).expect("decode");
+            assert_eq!(status, 0);
+            assert_eq!(dec, resp);
+        }
     }
 
     #[test]

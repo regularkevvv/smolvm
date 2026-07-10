@@ -177,4 +177,136 @@ impl<S: Read + Write> Client<S> {
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)
             .map(|_| ())
     }
+
+    pub fn driver_get_version(&mut self) -> Result<i32> {
+        match self.call(&Request::DriverGetVersion, Op::DriverGetVersion)? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_get_attribute(&mut self, attrib: i32, device: i32) -> Result<i32> {
+        match self.call(
+            &Request::DeviceGetAttribute { attrib, device },
+            Op::DeviceGetAttribute,
+        )? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_get_uuid(&mut self, device: i32) -> Result<[u8; 16]> {
+        match self.call(&Request::DeviceGetUuid { device }, Op::DeviceGetUuid)? {
+            Response::Data(d) if d.len() == 16 => {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&d);
+                Ok(uuid)
+            }
+            _ => Err(CudaRpcError::Protocol("expected 16-byte Data")),
+        }
+    }
+
+    pub fn primary_ctx_retain(&mut self, device: i32) -> Result<u64> {
+        match self.call(&Request::PrimaryCtxRetain { device }, Op::PrimaryCtxRetain)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn primary_ctx_release(&mut self, device: i32) -> Result<()> {
+        self.call(
+            &Request::PrimaryCtxRelease { device },
+            Op::PrimaryCtxRelease,
+        )
+        .map(|_| ())
+    }
+
+    pub fn module_unload(&mut self, module: u64) -> Result<()> {
+        self.call(&Request::ModuleUnload { module }, Op::ModuleUnload)
+            .map(|_| ())
+    }
+
+    /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
+    pub fn func_get_param_info(&mut self, function: u64) -> Result<Vec<u32>> {
+        match self.call(
+            &Request::FuncGetParamInfo { function },
+            Op::FuncGetParamInfo,
+        )? {
+            Response::Data(d) if d.len() % 4 == 0 => Ok(d
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()),
+            _ => Err(CudaRpcError::Protocol("expected u32-array Data")),
+        }
+    }
+
+    pub fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        self.call(&Request::MemcpyDtoD { dst, src, bytes }, Op::MemcpyDtoD)
+            .map(|_| ())
+    }
+
+    pub fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> Result<()> {
+        self.call(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
+            .map(|_| ())
+    }
+
+    /// Returns `(free, total)` device memory in bytes.
+    pub fn mem_get_info(&mut self) -> Result<(u64, u64)> {
+        match self.call(&Request::MemGetInfo, Op::MemGetInfo)? {
+            Response::Pair(free, total) => Ok((free, total)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
+    }
+
+    pub fn stream_create(&mut self, flags: u32) -> Result<u64> {
+        match self.call(&Request::StreamCreate { flags }, Op::StreamCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn stream_destroy(&mut self, stream: u64) -> Result<()> {
+        self.call(&Request::StreamDestroy { stream }, Op::StreamDestroy)
+            .map(|_| ())
+    }
+
+    pub fn stream_synchronize(&mut self, stream: u64) -> Result<()> {
+        self.call(
+            &Request::StreamSynchronize { stream },
+            Op::StreamSynchronize,
+        )
+        .map(|_| ())
+    }
+
+    pub fn event_create(&mut self, flags: u32) -> Result<u64> {
+        match self.call(&Request::EventCreate { flags }, Op::EventCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn event_destroy(&mut self, event: u64) -> Result<()> {
+        self.call(&Request::EventDestroy { event }, Op::EventDestroy)
+            .map(|_| ())
+    }
+
+    pub fn event_record(&mut self, event: u64, stream: u64) -> Result<()> {
+        self.call(&Request::EventRecord { event, stream }, Op::EventRecord)
+            .map(|_| ())
+    }
+
+    pub fn event_synchronize(&mut self, event: u64) -> Result<()> {
+        self.call(&Request::EventSynchronize { event }, Op::EventSynchronize)
+            .map(|_| ())
+    }
+
+    pub fn event_elapsed_time(&mut self, start: u64, end: u64) -> Result<f32> {
+        match self.call(
+            &Request::EventElapsedTime { start, end },
+            Op::EventElapsedTime,
+        )? {
+            Response::Millis(ms) => Ok(ms),
+            _ => Err(CudaRpcError::Protocol("expected Millis")),
+        }
+    }
 }
