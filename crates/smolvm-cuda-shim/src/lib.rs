@@ -195,6 +195,23 @@ pub extern "C" fn cuInit(_flags: c_uint) -> c_int {
     CUDA_SUCCESS
 }
 
+/// Undocumented internal driver interface tables, keyed by a 16-byte UUID.
+/// NVIDIA's CUDA runtime (`libcudart`) requires several of these to complete
+/// its context bootstrap; their layout and function ABIs are private and not
+/// part of the public Driver API this shim implements. Returning "not
+/// supported" (and logging the UUID under trace) makes the boundary explicit:
+/// a pure `libcuda` shim cannot host NVIDIA's runtime — that needs remoting at
+/// the `libcudart` level instead. See docs/cuda-support-plan.md (Phase 4).
+#[no_mangle]
+pub extern "C" fn cuGetExportTable(_table: *mut *const c_void, uuid: *const c_void) -> c_int {
+    if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() && !uuid.is_null() {
+        let b = unsafe { std::slice::from_raw_parts(uuid as *const u8, 16) };
+        let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        eprintln!("[shim] cuGetExportTable uuid={hex} -> NOT_SUPPORTED");
+    }
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
 #[no_mangle]
 pub extern "C" fn cuDriverGetVersion(version: *mut c_int) -> c_int {
     // Queryable before cuInit, per the driver's contract.
@@ -403,7 +420,20 @@ pub extern "C" fn cuDevicePrimaryCtxRetain(pctx: *mut *mut c_void, device: c_int
         Ok(h)
     });
     match r {
-        Ok(h) => ret(unsafe { out(pctx, h as *mut c_void) }),
+        Ok(h) => {
+            let rc = ret(unsafe { out(pctx, h as *mut c_void) });
+            if rc == CUDA_SUCCESS {
+                if let Ok(mut g) = STATE.lock() {
+                    if let Some(s) = g.as_mut() {
+                        // The host binds the retained primary context current on
+                        // its serving thread; mirror that in the guest's
+                        // process-global current-context view.
+                        s.ctx_stack.push(h);
+                    }
+                }
+            }
+            rc
+        }
         Err(code) => code,
     }
 }
@@ -882,15 +912,40 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuEventElapsedTime" => cuEventElapsedTime,
         "cuGetErrorName" => cuGetErrorName,
         "cuGetErrorString" => cuGetErrorString,
-        "cuGetProcAddress" => cuGetProcAddress_v2,
+        "cuGetExportTable" => cuGetExportTable,
+        // NB: cuGetProcAddress is resolved by `resolve_proc` (version-dependent
+        // v1 vs v2 ABI), never through this table — see the note there.
     }
+}
+
+/// Resolve a driver symbol to a function pointer, honoring the caller's CUDA
+/// version for entry points whose C ABI changed across revisions.
+///
+/// `cuGetProcAddress` is the load-bearing case: its own signature gained a
+/// fifth `symbolStatus` parameter in CUDA 12.0 (the `_v2` form). A CUDA 11.x
+/// runtime resolves "cuGetProcAddress" and then *calls the result with the
+/// 4-argument v1 convention*. Handing back the v2 pointer there makes it read
+/// an uninitialized fifth argument and write through it — a crash on the very
+/// first bootstrap call. So serve v1 below 12000 and v2 at/above it.
+fn resolve_proc(name: &str, cuda_version: c_int) -> Option<*mut c_void> {
+    let base = name.trim_end_matches("_v3").trim_end_matches("_v2");
+    if base == "cuGetProcAddress" {
+        // An explicit "_v2" request always wants v2; a bare request follows the
+        // caller's version.
+        return Some(if name.ends_with("_v2") || cuda_version >= 12000 {
+            cuGetProcAddress_v2 as *mut c_void
+        } else {
+            cuGetProcAddress as *mut c_void
+        });
+    }
+    proc_table(base)
 }
 
 #[no_mangle]
 pub extern "C" fn cuGetProcAddress_v2(
     symbol: *const c_char,
     pfn: *mut *mut c_void,
-    _cuda_version: c_int,
+    cuda_version: c_int,
     _flags: u64,
     symbol_status: *mut c_int,
 ) -> c_int {
@@ -901,10 +956,9 @@ pub extern "C" fn cuGetProcAddress_v2(
         Ok(n) => n,
         Err(_) => return CUDA_ERROR_INVALID_VALUE,
     };
-    // Strip any explicit version suffix: the table serves one implementation
-    // per entry point regardless of the requested revision.
-    let base = name.trim_end_matches("_v3").trim_end_matches("_v2");
-    match proc_table(base) {
+    let resolved = resolve_proc(name, cuda_version);
+    trace_proc(name, resolved.is_some());
+    match resolved {
         Some(f) => {
             unsafe { *pfn = f };
             if !symbol_status.is_null() {
@@ -919,6 +973,29 @@ pub extern "C" fn cuGetProcAddress_v2(
             }
             CUDA_ERROR_NOT_FOUND
         }
+    }
+}
+
+/// When `SMOLVM_CUDA_SHIM_TRACE` is set, log each cuGetProcAddress lookup and
+/// whether the shim served it — the fastest way to enumerate the surface a
+/// given CUDA runtime needs. No-op otherwise.
+fn trace_proc(name: &str, hit: bool) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ENABLED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=on, 2=off
+    let on = match ENABLED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+            ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    };
+    if on {
+        eprintln!(
+            "[shim] cuGetProcAddress {name} -> {}",
+            if hit { "hit" } else { "MISS" }
+        );
     }
 }
 

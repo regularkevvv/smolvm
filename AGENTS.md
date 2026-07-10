@@ -381,8 +381,17 @@ load/unload (PTX, cubin, fatbin), mem alloc/free/HtoD/DtoH/DtoD/memset,
 kernel launch (param sizes come from the host via `cuFuncGetParamInfo`,
 CUDA 12.4+ drivers), streams, events, `cuGetProcAddress`. All work executes
 synchronously host-side; `*Async` calls complete before returning (permitted
-by the CUDA contract). Not yet covered: the Runtime API (`libcudart`)/
-cuBLAS/cuDNN, per-thread context juggling, `extra`-style launch params.
+by the CUDA contract).
+
+**This covers programs written against the Driver API (the `cu*` C API), not
+the Runtime API.** A program built with `nvcc` (or PyTorch, RAPIDS, etc.) links
+NVIDIA's `libcudart`, which bootstraps by requesting a *private* internal
+driver interface via `cuGetExportTable` (a versioned UUID whose function ABIs
+are undocumented). A pure `libcuda` shim cannot provide it, so `libcudart`
+aborts during context init. Hosting Runtime-API workloads therefore requires
+remoting at the `libcudart` level instead — a separate, larger effort (see
+`docs/cuda-support-plan.md`, Phase 4). Set `SMOLVM_CUDA_SHIM_TRACE=1` to log
+which driver entry points a program resolves through the shim.
 
 Without an NVIDIA driver the host serves a CPU-emulation backend (test-only:
 it knows the `vecadd` test kernel), so the transport stays testable anywhere.
