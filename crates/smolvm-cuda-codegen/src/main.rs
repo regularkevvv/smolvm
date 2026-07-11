@@ -264,6 +264,36 @@ fn cublas_spec() -> Lib {
                     i("algo"),
                 ],
             },
+            // cublasGemmBatchedEx — pointer-array batched GEMM (llama.cpp's
+            // ggml-cuda attention batching). The A/B/C arrays are arrays OF
+            // device pointers living in device memory, so they forward as
+            // plain device pointers.
+            Fun {
+                sym: "cublasGemmBatchedEx",
+                real: "cublasGemmBatchedEx",
+                params: vec![
+                    handle(),
+                    i("transa"),
+                    i("transb"),
+                    i("m"),
+                    i("n"),
+                    i("k"),
+                    p("alpha", "*const f32", HostInScalar("f32")),
+                    p("Aarray", "*const c_void", DevPtr),
+                    i("Atype"),
+                    i("lda"),
+                    p("Barray", "*const c_void", DevPtr),
+                    i("Btype"),
+                    i("ldb"),
+                    p("beta", "*const f32", HostInScalar("f32")),
+                    p("Carray", "*mut c_void", DevPtr),
+                    i("Ctype"),
+                    i("ldc"),
+                    i("batchCount"),
+                    i("computeType"),
+                    i("algo"),
+                ],
+            },
         ],
     }
 }

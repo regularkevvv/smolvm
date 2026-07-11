@@ -242,3 +242,31 @@ pub extern "C" fn cublasGemmStridedBatchedEx(handle: *mut c_void, transa: c_int,
     // No output params: fire-and-forget (failures surface as sticky async errors).
     match with_client(|c| c.lib_call_deferred(LIB_ID, 13, a)) { Ok(()) => 0, Err(_) => 1 }
 }
+#[no_mangle]
+pub extern "C" fn cublasGemmBatchedEx(handle: *mut c_void, transa: c_int, transb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const f32, Aarray: *const c_void, Atype: c_int, lda: c_int, Barray: *const c_void, Btype: c_int, ldb: c_int, beta: *const f32, Carray: *mut c_void, Ctype: c_int, ldc: c_int, batchCount: c_int, computeType: c_int, algo: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(transa as i32).to_le_bytes());
+    a.extend_from_slice(&(transb as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(k as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(Aarray as u64).to_le_bytes());
+    a.extend_from_slice(&(Atype as i32).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(Barray as u64).to_le_bytes());
+    a.extend_from_slice(&(Btype as i32).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
+    a.extend_from_slice(&(Carray as u64).to_le_bytes());
+    a.extend_from_slice(&(Ctype as i32).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    a.extend_from_slice(&(batchCount as i32).to_le_bytes());
+    a.extend_from_slice(&(computeType as i32).to_le_bytes());
+    a.extend_from_slice(&(algo as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 14, a)) { Ok(()) => 0, Err(_) => 1 }
+}

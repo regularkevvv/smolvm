@@ -724,13 +724,14 @@ mod guestmem {
     }
 }
 
-/// Bump-allocate `size` bytes (16-aligned) from the shared region.
+/// Bump-allocate `size` bytes (256-aligned: ggml asserts host buffers hit
+/// TENSOR_ALIGNMENT, and 256 also matches cudaHostAlloc's real alignment).
 #[allow(clippy::needless_return)] // `return` is load-bearing across the cfg arms
 fn shm_alloc(size: usize) -> Option<*mut u8> {
     #[cfg(target_os = "linux")]
     {
         let r = shm_region()?;
-        let sz = (size as u64 + 15) & !15;
+        let sz = (size as u64 + 255) & !255;
         let off = SHM_NEXT.fetch_add(sz, Ordering::Relaxed);
         if off + sz > r.len() as u64 {
             return None; // region exhausted → caller falls back
@@ -772,7 +773,7 @@ fn cuda_host_malloc(ptr: *mut *mut c_void, size: usize) -> c_int {
     if let Some(mem) = shm_alloc(size) {
         return set_last(unsafe { out(ptr, mem as *mut c_void) });
     }
-    let layout = match std::alloc::Layout::from_size_align(size, 16) {
+    let layout = match std::alloc::Layout::from_size_align(size, 256) {
         Ok(l) => l,
         Err(_) => return set_last(CUDA_ERROR_INVALID_VALUE),
     };
@@ -1199,6 +1200,121 @@ const _: () = {
     assert!(std::mem::offset_of!(CudaDeviceProp, reserved_shared_mem_per_block) == 720);
     assert!(std::mem::size_of::<CudaDeviceProp>() == 1032);
 };
+
+/// CUDA 13 entry point: 13.x renamed the symbol back from `_v2` AND changed
+/// the struct (1008 bytes, clock-rate fields removed, everything after
+/// `canMapHostMemory` shifted). Callers compiled against 13.x land here;
+/// 12.x callers keep `_v2` and its layout. Offsets measured from the 13.3
+/// headers (scratchpad probe), values fetched like the 12.x path.
+#[no_mangle]
+pub extern "C" fn cudaGetDeviceProperties(prop: *mut c_void, device: c_int) -> c_int {
+    if prop.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { std::ptr::write_bytes(prop as *mut u8, 0, 1008) };
+    set_last(
+        with_state(|s| {
+            let a = |s: &mut ShimState, attr: i32, dflt: i32| {
+                s.client.device_get_attribute(attr, device).unwrap_or(dflt)
+            };
+            let name = s.client.device_get_name(device).unwrap_or_default();
+            let uuid = s.client.device_get_uuid(device).unwrap_or([0; 16]);
+            let total = s.client.device_total_mem(device).unwrap_or(0);
+            let base = prop as *mut u8;
+            let wi = |off: usize, v: i32| unsafe { base.add(off).cast::<i32>().write_unaligned(v) };
+            let wu = |off: usize, v: u64| unsafe { base.add(off).cast::<u64>().write_unaligned(v) };
+            let nb = name.as_bytes();
+            let n = nb.len().min(255);
+            unsafe {
+                std::ptr::copy_nonoverlapping(nb.as_ptr(), base, n);
+                std::ptr::copy_nonoverlapping(uuid.as_ptr(), base.add(256), 16);
+            }
+            wu(288, total); // totalGlobalMem
+            wu(296, a(s, A_MAX_SHMEM_PER_BLOCK, 49152) as u64);
+            wi(304, a(s, A_MAX_REGS_PER_BLOCK, 65536));
+            wi(308, a(s, A_WARP_SIZE, 32));
+            wu(312, 2147483647); // memPitch
+            wi(320, a(s, A_MAX_THREADS_PER_BLOCK, 1024));
+            wi(324, a(s, A_MAX_BLOCK_DIM_X, 1024));
+            wi(328, a(s, A_MAX_BLOCK_DIM_Y, 1024));
+            wi(332, a(s, A_MAX_BLOCK_DIM_Z, 64));
+            wi(336, a(s, A_MAX_GRID_DIM_X, 2147483647));
+            wi(340, a(s, A_MAX_GRID_DIM_Y, 65535));
+            wi(344, a(s, A_MAX_GRID_DIM_Z, 65535));
+            wu(352, a(s, A_TOTAL_CONST_MEM, 65536) as u64);
+            wi(360, a(s, A_COMPUTE_MAJOR, 8));
+            wi(364, a(s, A_COMPUTE_MINOR, 6));
+            wu(368, 512); // textureAlignment
+            wu(376, 32); // texturePitchAlignment
+            wi(384, a(s, A_MP_COUNT, 1));
+            wi(392, 1); // canMapHostMemory
+            wi(560, a(s, A_CONCURRENT_KERNELS, 1));
+            wi(584, a(s, A_ASYNC_ENGINE_COUNT, 2));
+            wi(588, 1); // unifiedAddressing
+            wi(592, a(s, A_MEMORY_BUS_WIDTH, 0));
+            wi(596, a(s, A_L2_CACHE_SIZE, 0));
+            wi(600, a(s, A_MAX_PERSISTING_L2, 0));
+            wi(604, a(s, A_MAX_THREADS_PER_MP, 1536));
+            wi(608, 1); // streamPrioritiesSupported
+            wi(612, 1); // globalL1CacheSupported
+            wi(616, 1); // localL1CacheSupported
+            wu(624, a(s, A_MAX_SHMEM_PER_MP, 102400) as u64);
+            wi(632, a(s, A_MAX_REGS_PER_MP, 65536));
+            wi(636, a(s, A_MANAGED_MEMORY, 1));
+            wi(656, a(s, A_CONCURRENT_MANAGED_ACCESS, 1));
+            wi(660, a(s, A_COMPUTE_PREEMPTION, 1));
+            wi(668, a(s, A_COOPERATIVE_LAUNCH, 1));
+            wu(672, a(s, A_MAX_SHMEM_PER_BLOCK_OPTIN, 101376) as u64);
+            wi(688, a(s, A_MAX_BLOCKS_PER_MP, 16));
+            wi(692, a(s, A_MAX_ACCESS_POLICY_WINDOW, 0));
+            wu(696, a(s, A_RESERVED_SHMEM_PER_BLOCK, 0) as u64);
+            wi(704, a(s, A_HOST_REGISTER_SUPPORTED, 1));
+            Ok(())
+        })
+        .err()
+        .unwrap_or(CUDA_SUCCESS),
+    )
+}
+
+/// Device-flag scheduling hints have no effect through forwarding.
+#[no_mangle]
+pub extern "C" fn cudaSetDeviceFlags(_flags: c_uint) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// Whole-graph exec update: report "update failed" — ggml (and torch) fall
+/// back to destroying and re-instantiating the graph, which we forward.
+#[no_mangle]
+pub extern "C" fn cudaGraphExecUpdate(
+    _exec: *mut c_void,
+    _graph: *mut c_void,
+    result_info: *mut c_void,
+) -> c_int {
+    if !result_info.is_null() {
+        // cudaGraphExecUpdateResultInfo { result, errorNode, errorFromNode }
+        unsafe { std::ptr::write_bytes(result_info as *mut u8, 0, 24) };
+    }
+    910 // cudaErrorGraphExecUpdateFailure
+}
+
+/// Cooperative launches need grid-wide sync the transport can't fake; the
+/// caller sees NotSupported and picks a non-cooperative path.
+#[no_mangle]
+pub extern "C" fn cudaLaunchCooperativeKernel(
+    _func: *const c_void,
+    _grid: Dim3,
+    _block: Dim3,
+    _args: *mut *mut c_void,
+    _shared: usize,
+    _stream: *mut c_void,
+) -> c_int {
+    set_last(801) // cudaErrorNotSupported
+}
+
+#[no_mangle]
+pub extern "C" fn cublasGetStatusString(_status: c_int) -> *const c_char {
+    c"cublas status (forwarded by smolvm)".as_ptr()
+}
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -> c_int {

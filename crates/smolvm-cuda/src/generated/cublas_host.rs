@@ -14,6 +14,7 @@ pub struct GenLib { _lib: Library,
     f_cublasGetProperty: unsafe extern "C" fn(c_int, *mut c_int) -> c_int,
     f_cublasGemmEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, *const c_void, c_int, c_int, *const f32, *mut c_void, c_int, c_int, c_int, c_int) -> c_int,
     f_cublasGemmStridedBatchedEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, i64, *const c_void, c_int, c_int, i64, *const f32, *mut c_void, c_int, c_int, i64, c_int, c_int, c_int) -> c_int,
+    f_cublasGemmBatchedEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, *const c_void, c_int, c_int, *const f32, *mut c_void, c_int, c_int, c_int, c_int, c_int) -> c_int,
 }
 impl GenLib {
     pub fn load() -> Result<GenLib, String> {
@@ -34,6 +35,7 @@ impl GenLib {
                 f_cublasGetProperty: sym(&lib, b"cublasGetProperty\0")?,
                 f_cublasGemmEx: sym(&lib, b"cublasGemmEx\0")?,
                 f_cublasGemmStridedBatchedEx: sym(&lib, b"cublasGemmStridedBatchedEx\0")?,
+                f_cublasGemmBatchedEx: sym(&lib, b"cublasGemmBatchedEx\0")?,
                 _lib: lib,
             })
         }
@@ -242,6 +244,31 @@ impl GenLib {
                 let algo = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGemmStridedBatchedEx)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, Atype as c_int, lda as c_int, strideA as i64, B, Btype as c_int, ldb as c_int, strideB as i64, &beta_v, C, Ctype as c_int, ldc as c_int, strideC as i64, batchCount as c_int, computeType as c_int, algo as c_int) };
+                (st, out)
+            }
+            14 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.f32();
+                let Aarray = __c.u64() as *const c_void;
+                let Atype = __c.i32();
+                let lda = __c.i32();
+                let Barray = __c.u64() as *const c_void;
+                let Btype = __c.i32();
+                let ldb = __c.i32();
+                let beta_v = __c.f32();
+                let Carray = __c.u64() as *mut c_void;
+                let Ctype = __c.i32();
+                let ldc = __c.i32();
+                let batchCount = __c.i32();
+                let computeType = __c.i32();
+                let algo = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasGemmBatchedEx)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, Aarray, Atype as c_int, lda as c_int, Barray, Btype as c_int, ldb as c_int, &beta_v, Carray, Ctype as c_int, ldc as c_int, batchCount as c_int, computeType as c_int, algo as c_int) };
                 (st, out)
             }
             _ => (super::super::CUDA_ERROR_NOT_FOUND, Vec::new()),
