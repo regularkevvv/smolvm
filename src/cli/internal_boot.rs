@@ -332,7 +332,17 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         let marker_name = std::env::var(smolvm_protocol::guest_env::READY_MARKER)
             .unwrap_or_else(|_| smolvm_protocol::AGENT_READY_MARKER.to_string());
         let ready_marker = config.rootfs_path.join(marker_name);
-        let _ = std::fs::File::create(&ready_marker);
+        if let Err(e) = std::fs::File::create(&ready_marker) {
+            // Read-only rootfs (e.g. root-owned system install): the marker
+            // can never be written, by us or by the guest. Not fatal — the
+            // manager detects this and uses socket readiness instead (#590) —
+            // but don't hide it.
+            eprintln!(
+                "[boot] ready marker pre-create failed ({e}); readiness will use \
+                 the vsock socket probe: {}",
+                ready_marker.display()
+            );
+        }
         read_write.push(ready_marker);
 
         if let Err(e) = smolvm::process::restrict_filesystem(&read_exec, &read_write) {
