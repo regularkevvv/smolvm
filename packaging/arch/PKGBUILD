@@ -1,0 +1,68 @@
+# Maintainer: BinSquare <hebinsquared@gmail.com>
+# Official smol-machines package — served from the smol-machines pacman repo.
+# Repackages the upstream release binaries (includes the smol-machines
+# libkrun fork, soname libkrun.so.2, which stock Arch libkrun cannot replace:
+# disk overlays, snapshots, egress policy and control-socket support need it).
+pkgname=smolvm
+pkgver=1.5.0
+pkgrel=1
+pkgdesc='Build & run portable, lightweight, self-contained virtual machines (official smol-machines package)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/smol-machines/smolvm'
+license=('Apache-2.0')
+depends=(
+    'seatd'
+    'crun'
+    'jq'
+    'e2fsprogs'
+    'util-linux'
+    'libcap'
+    'gzip'
+    'tar'
+)
+options=(!debug !strip)
+conflicts=('smolvm-bin' 'smolvm-git')
+source=(
+    "LICENSE-$pkgver::https://raw.githubusercontent.com/smol-machines/$pkgname/refs/tags/v$pkgver/LICENSE"
+)
+source_x86_64=(
+    "$pkgname-$pkgver-linux-x86_64.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver-linux-x86_64.tar.gz"
+)
+source_aarch64=(
+    "$pkgname-$pkgver-linux-arm64.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver-linux-arm64.tar.gz"
+)
+sha256sums=(
+    'ac6a4050f2f415a02f3c223ddee932a07de627bc143059e9a1ea9df088e46909'
+)
+sha256sums_x86_64=(
+    '986bc230befea542af18d85a849fca056a18d728c9c7b75cfca382adb0fe1a64'
+)
+sha256sums_aarch64=(
+    'f3e339635359b29cb60407e5d7deac3d4199870d8af2034c37c74f0f1c5530e8'
+)
+
+package() {
+    case "$CARCH" in
+        x86_64)  _dir="$pkgname-$pkgver-linux-x86_64" ;;
+        aarch64) _dir="$pkgname-$pkgver-linux-arm64" ;;
+    esac
+    cd "$_dir"
+
+    # Point the wrapper at the packaged locations instead of script-relative ones
+    sed -i \
+        -e 's|^SMOLVM_BIN=.*|SMOLVM_BIN=/usr/lib/smolvm/smolvm-bin|' \
+        -e 's|^SMOLVM_LIB=.*|SMOLVM_LIB=/usr/lib/smolvm/lib|' \
+        -e 's|^SMOLVM_BUNDLED_ROOTFS=.*|SMOLVM_BUNDLED_ROOTFS=/usr/lib/smolvm/agent-rootfs|' \
+        smolvm
+
+    install -Dm0755 smolvm "$pkgdir/usr/bin/smolvm"
+    install -Dm0755 smolvm-bin "$pkgdir/usr/lib/smolvm/smolvm-bin"
+    cp -a lib "$pkgdir/usr/lib/smolvm/lib"
+    cp -r agent-rootfs "$pkgdir/usr/lib/smolvm/agent-rootfs"
+    # pre-formatted storage template (optional at runtime; saves a mkfs on first pack)
+    install -Dm644 storage-template.ext4 "$pkgdir/usr/lib/smolvm/storage-template.ext4"
+    install -Dm644 "../LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.txt "$pkgdir/usr/share/doc/$pkgname/README.txt"
+}
+
+# vim: ts=4 sw=4 et:

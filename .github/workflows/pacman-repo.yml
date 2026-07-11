@@ -1,0 +1,79 @@
+name: Publish pacman repo
+
+# Builds Arch packages from the release binaries and publishes them to
+# rolling releases (pacman-repo-x86_64 / pacman-repo-aarch64) that serve
+# as pacman repository endpoints. See docs/install/arch.md.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package (e.g. v1.5.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG='${{ github.event.release.tag_name || inputs.tag }}'
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pkgver=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install tooling
+        run: pacman -Syu --noconfirm pacman-contrib github-cli git
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare build user
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          cp -r packaging/arch /home/builder/build
+          chown -R builder /home/builder/build
+
+      - name: Build packages (both arches; repackage-only, no compilation)
+        run: |
+          cd /home/builder/build
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.tag.outputs.pkgver }}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sudo -u builder updpkgsums
+          sudo -u builder makepkg -df --noconfirm
+          sudo -u builder env CARCH=aarch64 makepkg -df --noconfirm --ignorearch
+          ls -l *.pkg.tar.zst
+
+      - name: Publish to rolling pacman repo releases
+        run: |
+          git config --global --add safe.directory "$PWD"
+          cd /home/builder/build
+          for arch in x86_64 aarch64; do
+            roll="pacman-repo-$arch"
+            mkdir -p "repo-$arch" && cd "repo-$arch"
+            cp ../smolvm-*-"$arch".pkg.tar.zst .
+            # fetch existing db (first run: absent)
+            gh release download "$roll" -R "$GITHUB_REPOSITORY" \
+              -p 'smol-machines.db.tar.gz' -p 'smol-machines.files.tar.gz' 2>/dev/null || true
+            repo-add smol-machines.db.tar.gz smolvm-*-"$arch".pkg.tar.zst
+            # rolling release exists? create once
+            gh release view "$roll" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+              gh release create "$roll" -R "$GITHUB_REPOSITORY" --prerelease \
+                --title "pacman repo ($arch)" \
+                --notes "Rolling pacman repository endpoint for $arch. Do not delete. See docs/install/arch.md."
+            # upload package + db (db symlink targets must be uploaded as real files)
+            cp --remove-destination "$(readlink -f smol-machines.db)" smol-machines.db
+            cp --remove-destination "$(readlink -f smol-machines.files)" smol-machines.files
+            gh release upload "$roll" -R "$GITHUB_REPOSITORY" --clobber \
+              smolvm-*-"$arch".pkg.tar.zst \
+              smol-machines.db.tar.gz smol-machines.files.tar.gz \
+              smol-machines.db smol-machines.files
+            cd ..
+          done
