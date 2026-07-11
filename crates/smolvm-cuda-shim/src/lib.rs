@@ -53,13 +53,16 @@ const SHIM_CUDA_VERSION: c_int = 12040;
 
 // ---- transport ---------------------------------------------------------------
 
-/// One concrete byte stream to the host CUDA server.
+/// One concrete byte stream to the host CUDA server. `Bridged` owns no
+/// socket: the client routes through the runtime shim's connection instead
+/// and never touches its stream.
 enum Stream {
     #[cfg(target_os = "linux")]
     Vsock(vsock::VsockStream),
     Tcp(std::net::TcpStream),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    Bridged,
 }
 
 impl Read for Stream {
@@ -70,6 +73,7 @@ impl Read for Stream {
             Stream::Tcp(s) => s.read(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.read(buf),
+            Stream::Bridged => Err(std::io::Error::other("bridged client has no stream")),
         }
     }
 }
@@ -81,6 +85,7 @@ impl Write for Stream {
             Stream::Tcp(s) => s.write(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.write(buf),
+            Stream::Bridged => Err(std::io::Error::other("bridged client has no stream")),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -90,6 +95,7 @@ impl Write for Stream {
             Stream::Tcp(s) => s.flush(),
             #[cfg(unix)]
             Stream::Unix(s) => s.flush(),
+            Stream::Bridged => Ok(()),
         }
     }
 }
@@ -98,7 +104,10 @@ fn connect() -> Result<Stream, c_int> {
     let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
     if let Some(addr) = spec.strip_prefix("tcp:") {
         return std::net::TcpStream::connect(addr)
-            .map(Stream::Tcp)
+            .map(|s| {
+                let _ = s.set_nodelay(true); // low-latency request/response
+                Stream::Tcp(s)
+            })
             .map_err(|_| CUDA_ERROR_NO_DEVICE);
     }
     #[cfg(unix)]
@@ -145,14 +154,28 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
     if guard.is_some() {
         return Ok(());
     }
-    let stream = connect()?;
-    let mut client = Client::new(stream);
+    // Preferred: ride the runtime shim's connection (both shims loaded, one
+    // program-ordered pipeline, full deferral). Fallback: own connection —
+    // then this traffic shares one guest program-order stream with the
+    // runtime shim's connection, and two independently flushed deferred
+    // queues would let the host execute work out of order (recorded misorder
+    // in a CUDA graph replays wrong), so run every op sync and fence the
+    // runtime connection before each one (see fence_runtime).
+    let mut client = match resolve_bridge() {
+        Some(bridge) => Client::new_bridged(Stream::Bridged, bridge),
+        None => {
+            let mut c = Client::new(connect()?);
+            c.set_defer_enabled(false);
+            c
+        }
+    };
     if let Err(e) = client.init() {
         return Err(match e {
             CudaRpcError::Cuda(code) => code as c_int,
             _ => CUDA_ERROR_NO_DEVICE,
         });
     }
+    BRIDGED.store(client.is_bridged(), std::sync::atomic::Ordering::Relaxed);
     *guard = Some(ShimState {
         client,
         param_sizes: HashMap::new(),
@@ -162,9 +185,74 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
     Ok(())
 }
 
+/// Set once at connect: this shim's client rides the runtime shim's
+/// connection, so the per-op runtime fence is unnecessary.
+static BRIDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime shim's bridge exports, if it's loaded in this process.
+/// All three must resolve or none are used. `SMOLVM_CUDA_BRIDGE=0` forces the
+/// standalone fallback (kill-switch, mirrors `SMOLVM_CUDA_ASYNC=0`).
+fn resolve_bridge() -> Option<smolvm_cuda::client::Bridge> {
+    if std::env::var("SMOLVM_CUDA_BRIDGE").as_deref() == Ok("0") {
+        return None;
+    }
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    // glibc: RTLD_DEFAULT == NULL (this shim is glibc-only).
+    unsafe {
+        let quiet = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_quiet".as_ptr());
+        let call = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_call".as_ptr());
+        let drain = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_drain".as_ptr());
+        if quiet.is_null() || call.is_null() || drain.is_null() {
+            return None;
+        }
+        Some(smolvm_cuda::client::Bridge {
+            quiet: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const u8, usize) -> i32>(
+                quiet,
+            ),
+            call: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize,
+            >(call),
+            drain: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> i32>(drain),
+        })
+    }
+}
+
 /// Run `f` against the connected client, translating errors to `CUresult`.
 /// Auto-connects on first use (see [`ensure_connected`]).
+/// Settle the runtime shim's deferred pipeline before running one of our ops,
+/// so guest program order holds across the two connections. The hook is
+/// exported by the runtime shim (`smolvm_cudart_fence` in libcudart); resolved
+/// lazily because either shim can load first. dlsym cost is paid only until
+/// the symbol appears (a process without the runtime shim keeps probing, but
+/// such a process has no cross-connection ordering to preserve anyway).
+fn fence_runtime() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    // glibc: RTLD_DEFAULT == NULL (this shim is glibc-only).
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+    let mut p = HOOK.load(Ordering::Relaxed);
+    if p == 0 {
+        p = unsafe { dlsym(std::ptr::null_mut(), c"smolvm_cudart_fence".as_ptr()) } as usize;
+        if p != 0 {
+            HOOK.store(p, Ordering::Relaxed);
+        }
+    }
+    if p != 0 {
+        let f: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(p) };
+        f();
+    }
+}
+
 fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, CudaRpcError>) -> Result<T, c_int> {
+    // Bridged: program order is inherent (one pipeline), no fence needed.
+    if !BRIDGED.load(std::sync::atomic::Ordering::Relaxed) {
+        fence_runtime();
+    }
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return Err(CUDA_ERROR_UNKNOWN),
@@ -547,6 +635,104 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
         + 1)
 }
 
+// ---- VMM (torch expandable-segments allocator) --------------------------------
+// Prop/desc structs are read at fixed offsets: CUmemAllocationProp.location.id
+// sits at byte 12, CUmemAccessDesc.location.id at byte 4.
+
+#[no_mangle]
+pub extern "C" fn cuMemAddressReserve(
+    ptr: *mut u64,
+    size: usize,
+    align: usize,
+    _addr_hint: u64,
+    _flags: u64,
+) -> c_int {
+    match with_state(|s| s.client.mem_address_reserve(size as u64, align as u64)) {
+        Ok(va) => ret(unsafe { out(ptr, va) }),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemCreate(
+    handle: *mut u64,
+    size: usize,
+    prop: *const c_void,
+    _flags: u64,
+) -> c_int {
+    let device = if prop.is_null() {
+        0
+    } else {
+        unsafe { ((prop as *const u8).add(12) as *const c_int).read_unaligned() }
+    };
+    match with_state(|s| s.client.mem_create(size as u64, device)) {
+        Ok(h) => ret(unsafe { out(handle, h) }),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemMap(
+    ptr: u64,
+    size: usize,
+    offset: usize,
+    handle: u64,
+    _flags: u64,
+) -> c_int {
+    ret(with_state(|s| {
+        s.client.mem_map(ptr, size as u64, offset as u64, handle)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemSetAccess(
+    ptr: u64,
+    size: usize,
+    desc: *const c_void,
+    _count: usize,
+) -> c_int {
+    let device = if desc.is_null() {
+        0
+    } else {
+        unsafe { ((desc as *const u8).add(4) as *const c_int).read_unaligned() }
+    };
+    ret(with_state(|s| {
+        s.client.mem_set_access(ptr, size as u64, device)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemUnmap(ptr: u64, size: usize) -> c_int {
+    ret(with_state(|s| s.client.mem_unmap(ptr, size as u64)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemRelease(handle: u64) -> c_int {
+    ret(with_state(|s| s.client.mem_release(handle)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemAddressFree(ptr: u64, size: usize) -> c_int {
+    ret(with_state(|s| s.client.mem_address_free(ptr, size as u64)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemGetAllocationGranularity(
+    granularity: *mut usize,
+    prop: *const c_void,
+    flags: c_uint,
+) -> c_int {
+    let device = if prop.is_null() {
+        0
+    } else {
+        unsafe { ((prop as *const u8).add(12) as *const c_int).read_unaligned() }
+    };
+    match with_state(|s| s.client.mem_get_allocation_granularity(device, flags)) {
+        Ok(g) => ret(unsafe { out(granularity, g as usize) }),
+        Err(code) => code,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cuModuleLoadData(module: *mut *mut c_void, image: *const c_void) -> c_int {
     let len = match unsafe { module_image_len(image) } {
@@ -641,7 +827,7 @@ pub extern "C" fn cuMemcpyHtoD_v2(dptr: u64, src: *const c_void, bytes: usize) -
         return CUDA_ERROR_INVALID_VALUE;
     }
     let data = unsafe { std::slice::from_raw_parts(src as *const u8, bytes) };
-    ret(with_state(|s| s.client.memcpy_htod(dptr, data)))
+    ret(with_state(|s| s.client.memcpy_htod(dptr, data, 0)))
 }
 
 #[no_mangle]
@@ -649,7 +835,7 @@ pub extern "C" fn cuMemcpyDtoH_v2(dst: *mut c_void, dptr: u64, bytes: usize) -> 
     if dst.is_null() && bytes > 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    match with_state(|s| s.client.memcpy_dtoh(dptr, bytes as u64)) {
+    match with_state(|s| s.client.memcpy_dtoh(dptr, bytes as u64, 0)) {
         Ok(data) => {
             if data.len() != bytes {
                 return CUDA_ERROR_UNKNOWN;
@@ -722,6 +908,150 @@ pub extern "C" fn cuMemcpyDtoDAsync_v2(
 
 // ---- kernel launch ----------------------------------------------------------------
 
+/// `CUlaunchConfig` (CUDA 12): dims + shared bytes + stream + an attribute
+/// array we don't forward (clusters/programmatic completion — not used by the
+/// Triton kernels that launch through this entry point).
+#[repr(C)]
+struct CuLaunchConfig {
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_bytes: c_uint,
+    stream: *mut c_void,
+    attrs: *mut c_void,
+    num_attrs: c_uint,
+}
+
+/// Attribute-carrying launch (Triton/torch.compile's launcher). The attributes
+/// are ignored; everything else lowers onto the plain launch path.
+#[no_mangle]
+pub extern "C" fn cuLaunchKernelEx(
+    config: *const c_void,
+    func: *mut c_void,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> c_int {
+    if config.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // SAFETY: caller passes a valid CUlaunchConfig.
+    let c = unsafe { &*(config as *const CuLaunchConfig) };
+    cuLaunchKernel(
+        func,
+        c.grid_x,
+        c.grid_y,
+        c.grid_z,
+        c.block_x,
+        c.block_y,
+        c.block_z,
+        c.shared_bytes,
+        c.stream,
+        kernel_params,
+        extra,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cuLaunchKernelEx_ptsz(
+    config: *const c_void,
+    func: *mut c_void,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> c_int {
+    cuLaunchKernelEx(config, func, kernel_params, extra)
+}
+
+/// Pointer attributes. Every device pointer we hand out is the host's real
+/// `CUdeviceptr`, so a pointer the guest holds is a device pointer: report
+/// memory-type Device, device-pointer = the value itself, ordinal 0, not
+/// managed. Range/host-pointer queries return the pointer / null respectively.
+/// vLLM's allocator and Triton link these; a stub error broke import.
+#[no_mangle]
+pub extern "C" fn cuPointerGetAttribute(data: *mut c_void, attribute: c_int, ptr: u64) -> c_int {
+    if data.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // CUpointer_attribute: 1=CONTEXT, 2=MEMORY_TYPE, 3=DEVICE_POINTER,
+    // 4=HOST_POINTER, 6=BUFFER_ID, 7=IS_MANAGED, 9=DEVICE_ORDINAL,
+    // 11=RANGE_START_ADDR, 12=RANGE_SIZE, 13=MAPPED.
+    unsafe {
+        match attribute {
+            2 => *(data as *mut c_uint) = 2, // CU_MEMORYTYPE_DEVICE
+            3 | 11 => *(data as *mut u64) = ptr,
+            12 => *(data as *mut usize) = 0,
+            4 => *(data as *mut u64) = 0, // no host mapping
+            7 => *(data as *mut c_int) = 0,
+            9 => *(data as *mut c_int) = 0,
+            13 => *(data as *mut c_int) = 1,
+            _ => *(data as *mut u64) = 0,
+        }
+    }
+    CUDA_SUCCESS
+}
+
+/// Batched pointer-attribute query: fill each requested attribute per the
+/// single-attribute logic above.
+#[no_mangle]
+pub extern "C" fn cuPointerGetAttributes(
+    num_attributes: c_uint,
+    attributes: *const c_int,
+    data: *const *mut c_void,
+    ptr: u64,
+) -> c_int {
+    if attributes.is_null() || data.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for i in 0..num_attributes as isize {
+        let attr = unsafe { *attributes.offset(i) };
+        let out = unsafe { *data.offset(i) };
+        if !out.is_null() {
+            cuPointerGetAttribute(out, attr, ptr);
+        }
+    }
+    CUDA_SUCCESS
+}
+
+/// Cache-config is a scheduling hint the host driver applies at launch; a
+/// no-op here is correct (work runs on the host's real function).
+#[no_mangle]
+pub extern "C" fn cuFuncSetCacheConfig(_func: *mut c_void, _config: c_int) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// Context limits (stack size, printf FIFO, malloc heap): report a generous
+/// value on get, accept any set. Triton reads the stack-size limit during
+/// launcher setup; a stub error there aborted the launch.
+#[no_mangle]
+pub extern "C" fn cuCtxGetLimit(pvalue: *mut usize, _limit: c_int) -> c_int {
+    if pvalue.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *pvalue = 8 * 1024 * 1024 };
+    CUDA_SUCCESS
+}
+#[no_mangle]
+pub extern "C" fn cuCtxSetLimit(_limit: c_int, _value: usize) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// No cluster support (clusters are an sm_90+ feature we don't forward);
+/// reporting 0 max clusters keeps Triton on the standard, non-cluster launch.
+#[no_mangle]
+pub extern "C" fn cuOccupancyMaxActiveClusters(
+    num_clusters: *mut c_int,
+    _func: *mut c_void,
+    _config: *const c_void,
+) -> c_int {
+    if num_clusters.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *num_clusters = 0 };
+    CUDA_SUCCESS
+}
+
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn cuLaunchKernel(
@@ -793,6 +1123,22 @@ pub extern "C" fn cuStreamCreate(stream: *mut *mut c_void, flags: c_uint) -> c_i
     }
 }
 
+// PyTorch's stream pool (used for CUDA-graph capture) creates streams here.
+// Priority is advisory scheduling only; forward as a plain stream. A stub that
+// left `stream` unwritten fed callers an uninitialized handle → a bad-pointer
+// crash inside cuBLAS during graph capture.
+#[no_mangle]
+pub extern "C" fn cuStreamCreateWithPriority(
+    stream: *mut *mut c_void,
+    flags: c_uint,
+    _priority: c_int,
+) -> c_int {
+    match with_state(|s| s.client.stream_create(flags)) {
+        Ok(h) => ret(unsafe { out(stream, h as *mut c_void) }),
+        Err(code) => code,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cuStreamDestroy_v2(stream: *mut c_void) -> c_int {
     ret(with_state(|s| s.client.stream_destroy(stream as u64)))
@@ -804,17 +1150,26 @@ pub extern "C" fn cuStreamSynchronize(stream: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn cuStreamQuery(_stream: *mut c_void) -> c_int {
-    CUDA_SUCCESS // all work completes synchronously
+pub extern "C" fn cuStreamQuery(stream: *mut c_void) -> c_int {
+    // Honest completion status (0 or 600-NotReady) now that work runs on real
+    // side streams.
+    match with_state(|s| s.client.stream_query(stream as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn cuStreamWaitEvent(
-    _stream: *mut c_void,
-    _event: *mut c_void,
-    _flags: c_uint,
+    stream: *mut c_void,
+    event: *mut c_void,
+    flags: c_uint,
 ) -> c_int {
-    CUDA_SUCCESS // recorded events are already complete
+    // Real cross-stream ordering edge (a graph dependency during capture).
+    ret(with_state(|s| {
+        s.client
+            .stream_wait_event(stream as u64, event as u64, flags)
+    }))
 }
 
 #[no_mangle]
@@ -939,6 +1294,7 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuMemGetInfo" => cuMemGetInfo_v2,
         "cuLaunchKernel" => cuLaunchKernel,
         "cuStreamCreate" => cuStreamCreate,
+        "cuStreamCreateWithPriority" => cuStreamCreateWithPriority,
         "cuStreamDestroy" => cuStreamDestroy_v2,
         "cuStreamSynchronize" => cuStreamSynchronize,
         "cuStreamQuery" => cuStreamQuery,
@@ -1075,9 +1431,15 @@ pub extern "C" fn cuFuncGetAttribute(pi: *mut c_int, attrib: c_int, _func: *mut 
     }
     CUDA_SUCCESS
 }
+// Triton/vLLM kernels needing >48 KiB shared memory must raise
+// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES here before launching, or the
+// launch fails with INVALID_VALUE. Forward it so the host function's real limit
+// is raised; Triton checks the return to decide whether the kernel can run.
 #[no_mangle]
-pub extern "C" fn cuFuncSetAttribute() -> c_int {
-    CUDA_SUCCESS
+pub extern "C" fn cuFuncSetAttribute(func: *mut c_void, attrib: c_int, value: c_int) -> c_int {
+    ret(with_state(|s| {
+        s.client.func_set_attribute(func as u64, attrib, value)
+    }))
 }
 #[no_mangle]
 pub extern "C" fn cuLaunchCooperativeKernel() -> c_int {

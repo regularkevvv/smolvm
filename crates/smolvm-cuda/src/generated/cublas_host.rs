@@ -3,6 +3,7 @@ pub struct GenLib { _lib: Library,
     f_cublasCreate_v2: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
     f_cublasDestroy_v2: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_cublasSgemm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasHgemm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const u16, *const u16, c_int, *const u16, c_int, *const u16, *mut u16, c_int) -> c_int,
     f_cublasDgemm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
     f_cublasSgemmStridedBatched: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, i64, *const f32, c_int, i64, *const f32, *mut f32, c_int, i64, c_int) -> c_int,
     f_cublasDgemmStridedBatched: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, i64, *const f64, c_int, i64, *const f64, *mut f64, c_int, i64, c_int) -> c_int,
@@ -22,6 +23,7 @@ impl GenLib {
                 f_cublasCreate_v2: sym(&lib, b"cublasCreate_v2\0")?,
                 f_cublasDestroy_v2: sym(&lib, b"cublasDestroy_v2\0")?,
                 f_cublasSgemm_v2: sym(&lib, b"cublasSgemm_v2\0")?,
+                f_cublasHgemm: sym(&lib, b"cublasHgemm\0")?,
                 f_cublasDgemm_v2: sym(&lib, b"cublasDgemm_v2\0")?,
                 f_cublasSgemmStridedBatched: sym(&lib, b"cublasSgemmStridedBatched\0")?,
                 f_cublasDgemmStridedBatched: sym(&lib, b"cublasDgemmStridedBatched\0")?,
@@ -36,18 +38,21 @@ impl GenLib {
             })
         }
     }
-    pub fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
         let mut __c = GenCur { b: args, p: 0 };
+        let _ = __streams;
         match func {
-            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cublasCreate_v2)(&mut h) }; (st, (h as u64).to_le_bytes().to_vec()) }
+            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cublasCreate_v2)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             1 => {
-                let handle = __c.u64() as *mut c_void;
+                let __raw = __c.u64();
+                let handle = super::vh_resolve(__vh, __raw) as *mut c_void;
+                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasDestroy_v2)(handle) };
                 (st, out)
             }
             2 => {
-                let handle = __c.u64() as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -66,7 +71,26 @@ impl GenLib {
                 (st, out)
             }
             3 => {
-                let handle = __c.u64() as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.u16();
+                let A = __c.u64() as *const u16;
+                let lda = __c.i32();
+                let B = __c.u64() as *const u16;
+                let ldb = __c.i32();
+                let beta_v = __c.u16();
+                let C = __c.u64() as *mut u16;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasHgemm)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int, &beta_v, C, ldc as c_int) };
+                (st, out)
+            }
+            4 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -84,8 +108,8 @@ impl GenLib {
                 let st = unsafe { (self.f_cublasDgemm_v2)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int, &beta_v, C, ldc as c_int) };
                 (st, out)
             }
-            4 => {
-                let handle = __c.u64() as *mut c_void;
+            5 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -107,8 +131,8 @@ impl GenLib {
                 let st = unsafe { (self.f_cublasSgemmStridedBatched)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, strideA as i64, B, ldb as c_int, strideB as i64, &beta_v, C, ldc as c_int, strideC as i64, batchCount as c_int) };
                 (st, out)
             }
-            5 => {
-                let handle = __c.u64() as *mut c_void;
+            6 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -130,37 +154,37 @@ impl GenLib {
                 let st = unsafe { (self.f_cublasDgemmStridedBatched)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, strideA as i64, B, ldb as c_int, strideB as i64, &beta_v, C, ldc as c_int, strideC as i64, batchCount as c_int) };
                 (st, out)
             }
-            6 => {
-                let handle = __c.u64() as *mut c_void;
-                let stream = __c.u64() as *mut c_void;
+            7 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let stream = super::stream_resolve(__streams, __c.u64()) as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetStream_v2)(handle, stream) };
                 (st, out)
             }
-            7 => {
-                let handle = __c.u64() as *mut c_void;
+            8 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let workspace = __c.u64() as *mut c_void;
                 let size = __c.u64();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetWorkspace_v2)(handle, workspace, size as usize) };
                 (st, out)
             }
-            8 => {
-                let handle = __c.u64() as *mut c_void;
+            9 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let mode = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetMathMode)(handle, mode as c_int) };
                 (st, out)
             }
-            9 => {
-                let handle = __c.u64() as *mut c_void;
+            10 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let mut mode_v: c_int = 0 as c_int;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGetMathMode)(handle, &mut mode_v) };
                 out.extend_from_slice(&(mode_v as i32).to_le_bytes());
                 (st, out)
             }
-            10 => {
+            11 => {
                 let prop_type = __c.i32();
                 let mut value_v: c_int = 0 as c_int;
                 let mut out = Vec::new();
@@ -168,8 +192,8 @@ impl GenLib {
                 out.extend_from_slice(&(value_v as i32).to_le_bytes());
                 (st, out)
             }
-            11 => {
-                let handle = __c.u64() as *mut c_void;
+            12 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -192,8 +216,8 @@ impl GenLib {
                 let st = unsafe { (self.f_cublasGemmEx)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, A, Atype as c_int, lda as c_int, B, Btype as c_int, ldb as c_int, &beta_v, C, Ctype as c_int, ldc as c_int, computeType as c_int, algo as c_int) };
                 (st, out)
             }
-            12 => {
-                let handle = __c.u64() as *mut c_void;
+            13 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -227,6 +251,7 @@ impl GenLib {
 struct GenCur<'a> { b: &'a [u8], p: usize }
 impl GenCur<'_> {
     fn take(&mut self, n: usize) -> [u8; 8] { let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }
+    fn u16(&mut self) -> u16 { u16::from_le_bytes(self.take(2)[..2].try_into().unwrap()) }
     fn i32(&mut self) -> i32 { i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }
     fn i64(&mut self) -> i64 { i64::from_le_bytes(self.take(8)) }
     fn u64(&mut self) -> u64 { u64::from_le_bytes(self.take(8)) }

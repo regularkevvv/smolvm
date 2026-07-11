@@ -32,7 +32,7 @@
 use smolvm_cuda::client::{Client, CudaRpcError};
 mod cublas_stubs;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -152,8 +152,16 @@ struct ShimState {
     funcs: HashMap<usize, FuncRec>,
     /// Host pinned-memory allocations (guest RAM) → layout, for cudaFreeHost.
     host_allocs: HashMap<usize, std::alloc::Layout>,
-    /// Live device allocations, to classify pointers for cudaMemcpyDefault.
-    dev_allocs: HashSet<u64>,
+    /// Live device allocations, base → size. Range-queried (not exact-match):
+    /// PyTorch's caching allocator suballocates, so tensor data pointers are
+    /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
+    /// must still report Device or torch's `getDeviceFromPtr` throws.
+    dev_allocs: std::collections::BTreeMap<u64, u64>,
+    /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
+    /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
+    /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
+    /// answer locally instead of round-tripping.
+    capture: Option<(u64, u64)>,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -167,6 +175,11 @@ thread_local! {
 
 fn set_last(code: c_int) -> c_int {
     if code != CUDA_SUCCESS {
+        if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = bt.lines().take(16).collect();
+            eprintln!("[shim-err] code={code} frames:\n{}", frames.join("\n"));
+        }
         LAST_ERROR.with(|e| e.set(code));
     }
     code
@@ -181,9 +194,19 @@ fn map_err(e: CudaRpcError) -> c_int {
             2 => CUDA_ERROR_MEMORY_ALLOCATION,
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
-            _ => CUDA_ERROR_UNKNOWN,
+            other => {
+                if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                    eprintln!("[map-err] unmapped driver code {other}");
+                }
+                CUDA_ERROR_UNKNOWN
+            }
         },
-        CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => CUDA_ERROR_UNKNOWN,
+        CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                eprintln!("[map-err] transport: {e}");
+            }
+            CUDA_ERROR_UNKNOWN
+        }
     }
 }
 
@@ -191,24 +214,172 @@ fn map_err(e: CudaRpcError) -> c_int {
 /// client. The first call performs `cuInit` + `cuDevicePrimaryCtxRetain(0)`
 /// (which the host binds current on its serving thread), matching how the CUDA
 /// runtime brings up its device on first use.
+/// Cross-shim ordering hook, dlsym'd by the driver shim (`libcuda.so.1`).
+/// The two shims hold separate connections to the host, i.e. two ordering
+/// domains for one guest program-order stream; the driver shim fences this
+/// connection before each of its own ops so runtime-issued work (deferred in
+/// the pipeline) executes first. No-op before the runtime connection exists.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_fence() {
+    if let Ok(mut guard) = STATE.lock() {
+        if let Some(st) = guard.as_mut() {
+            let _ = st.client.drain();
+        }
+    }
+}
+
+// ---- driver-shim bridge -------------------------------------------------------
+// The driver shim (`libcuda.so.1`) dlsym-resolves these three and routes ALL
+// its traffic through this connection, giving the host one program-ordered
+// pipeline for both shims (see smolvm-cuda's `client::Bridge`). Op statuses
+// stay in-band in the response payload — nothing is lost to error mapping.
+
+/// A response too large for the caller's buffer, parked until the caller
+/// retries with a big-enough one (null request = fetch).
+static BRIDGE_PENDING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Fire-and-forget: append one encoded request to the shared pipeline.
+/// Nonzero = transport failure.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_quiet(req: *const u8, len: usize) -> i32 {
+    if req.is_null() {
+        return 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(req, len) };
+    match with_client(|c| c.raw_quiet(bytes)) {
+        Ok(()) => 0,
+        Err(_) => 999,
+    }
+}
+
+/// Synchronous round-trip: send one encoded request, write the response
+/// payload into `resp`. Returns the response length; -1 = transport failure;
+/// other negatives = `cap` too small, retry with `-ret` capacity and a null
+/// request to collect the stashed response.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_call(
+    req: *const u8,
+    req_len: usize,
+    resp: *mut u8,
+    cap: usize,
+) -> isize {
+    let payload = if req.is_null() {
+        match BRIDGE_PENDING.lock().map(|mut g| g.take()) {
+            Ok(Some(p)) => p,
+            _ => return -1,
+        }
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
+        match with_client(|c| c.raw_call(bytes)) {
+            Ok(p) => p,
+            Err(_) => return -1,
+        }
+    };
+    if payload.len() > cap {
+        let n = payload.len() as isize;
+        match BRIDGE_PENDING.lock() {
+            Ok(mut g) => {
+                *g = Some(payload);
+                -n
+            }
+            Err(_) => -1,
+        }
+    } else {
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), resp, payload.len()) };
+        payload.len() as isize
+    }
+}
+
+/// Fence the shared pipeline; returns (and consumes) the first collected
+/// quiet-failure status, so the bridged caller can surface it.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_drain() -> i32 {
+    with_client(|c| {
+        c.drain()?;
+        Ok(c.take_sticky())
+    })
+    .unwrap_or(999)
+}
+
+/// Allocate one ring region: pinned pages + their per-page GPAs.
+fn ring_alloc_pages(pages: usize) -> Option<(Vec<*mut u8>, Vec<u64>)> {
+    const PAGE: usize = 4096;
+    let base = guestmem::alloc(pages * PAGE)? as usize;
+    // Zero (also faults every page in before pagemap reads).
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, pages * PAGE) };
+    let segs = guestmem::segments(base, pages * PAGE)?;
+    let mut gpas = Vec::with_capacity(pages);
+    for (gpa, len) in segs {
+        let mut off = 0;
+        while off < len {
+            gpas.push(gpa + off);
+            off += PAGE as u64;
+        }
+    }
+    if gpas.len() != pages {
+        return None;
+    }
+    Some((
+        (0..pages).map(|i| (base + i * PAGE) as *mut u8).collect(),
+        gpas,
+    ))
+}
+
+/// Try to switch `client` to the shared-memory ring transport. Failure is
+/// fine — the connection simply stays on the socket.
+fn ring_try_setup(client: &mut Client<Stream>) {
+    const PAGE: usize = 4096;
+    let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+    let Some(req) = ring_alloc_pages(32) else {
+        if trace {
+            eprintln!("[ring] no pinned pages (zerocopy off?) — socket mode");
+        }
+        return;
+    };
+    let (Some(resp), Some(bounce)) = (ring_alloc_pages(8), ring_alloc_pages(64)) else {
+        return;
+    };
+    match client.ring_setup(PAGE, req, resp, bounce) {
+        Ok(()) => {
+            if trace {
+                eprintln!("[ring] shared-memory rings active");
+            }
+        }
+        Err(e) => {
+            if trace {
+                eprintln!("[ring] setup rejected ({e}) — socket mode");
+            }
+        }
+    }
+}
+
 fn with_client<T>(
     f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
     let mut guard = STATE.lock().map_err(|_| CUDA_ERROR_UNKNOWN)?;
     if guard.is_none() {
         let stream = connect()?;
+        #[cfg(target_os = "linux")]
+        let try_ring = matches!(stream, Stream::Vsock(_))
+            && std::env::var("SMOLVM_CUDA_RING").as_deref() != Ok("0");
+        #[cfg(not(target_os = "linux"))]
+        let try_ring = false;
         let mut client = Client::new(stream);
         client.init().map_err(|_| CUDA_ERROR_INITIALIZATION)?;
         let _ = client
             .primary_ctx_retain(0)
             .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+        if try_ring {
+            ring_try_setup(&mut client); // best-effort; socket mode on failure
+        }
         *guard = Some(ShimState {
             client,
             initialized: true,
             modules: HashMap::new(),
             funcs: HashMap::new(),
             host_allocs: HashMap::new(),
-            dev_allocs: HashSet::new(),
+            dev_allocs: std::collections::BTreeMap::new(),
+            capture: None,
         });
     }
     let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
@@ -292,13 +463,46 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     set_last(
         match with_state(|s| {
             let d = s.client.mem_alloc(size as u64).map_err(map_err)?;
-            s.dev_allocs.insert(d);
+            s.dev_allocs.insert(d, size as u64);
             Ok(d)
         }) {
             Ok(d) => unsafe { out(dev_ptr, d as *mut c_void) },
             Err(e) => e,
         },
     )
+}
+
+/// `cudaMallocManaged` served as plain device memory: bitsandbytes links it
+/// (its paged optimizers host-access managed pointers — those would fault —
+/// but its 4-bit/8-bit compute paths only need the symbol to resolve and the
+/// pointer to be device-valid).
+#[no_mangle]
+pub extern "C" fn cudaMallocManaged(
+    dev_ptr: *mut *mut c_void,
+    size: usize,
+    _flags: c_uint,
+) -> c_int {
+    cudaMalloc(dev_ptr, size)
+}
+
+/// Managed-memory prefetch hint: nothing to do, our "managed" memory is
+/// always device-resident.
+#[no_mangle]
+pub extern "C" fn cudaMemPrefetchAsync(
+    _dev_ptr: *const c_void,
+    _count: usize,
+    _dst_device: c_int,
+    _stream: *mut c_void,
+) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// Is `p` inside any live device allocation (base ≤ p < base+size)?
+fn dev_contains(allocs: &std::collections::BTreeMap<u64, u64>, p: u64) -> bool {
+    allocs
+        .range(..=p)
+        .next_back()
+        .is_some_and(|(base, size)| p < base + size)
 }
 
 #[no_mangle]
@@ -620,8 +824,8 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
     if kind != MEMCPY_DEFAULT {
         return kind;
     }
-    let dst_dev = s.dev_allocs.contains(&(dst as u64));
-    let src_dev = s.dev_allocs.contains(&(src as u64));
+    let dst_dev = dev_contains(&s.dev_allocs, dst as u64);
+    let src_dev = dev_contains(&s.dev_allocs, src as u64);
     match (src_dev, dst_dev) {
         (false, true) => MEMCPY_HTOD,
         (true, false) => MEMCPY_DTOH,
@@ -630,7 +834,22 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
     }
 }
 
-fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
+fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream: u64) -> c_int {
+    let dbg = std::env::var_os("SMOLVM_CUDA_TRACE_MEMCPY").is_some();
+    let r = do_memcpy_inner(dst, src, n, kind, stream);
+    if dbg && r != CUDA_SUCCESS {
+        eprintln!("[memcpy-err] kind={kind} n={n} -> {r}");
+    }
+    r
+}
+
+fn do_memcpy_inner(
+    dst: *mut c_void,
+    src: *const c_void,
+    n: usize,
+    kind: c_int,
+    stream: u64,
+) -> c_int {
     with_state(|s| {
         let kind = resolve_kind(s, dst, src, kind);
         match kind {
@@ -646,7 +865,7 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                 // segments; the host reads guest RAM directly. Fall back to
                 // byte-shipping if the host can't serve it (no mapping).
                 if let Some(segs) = guestmem::segments(src as usize, n) {
-                    if s.client.memcpy_gpa_htod(dst as u64, segs).is_ok() {
+                    if s.client.memcpy_gpa_htod(dst as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
                 }
@@ -654,15 +873,24 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                 if let Some(off) = shm_offset(src) {
                     return s
                         .client
-                        .memcpy_shm_htod(dst as u64, off, n as u64)
+                        .memcpy_shm_htod(dst as u64, off, n as u64, stream)
                         .map_err(map_err);
                 }
+                // Chunk: one frame must stay far below the transport's
+                // 256 MiB message cap (a 272 MiB embedding tensor here killed
+                // the connection). Host-synchronous copies chunk safely.
                 let data = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
-                s.client.memcpy_htod(dst as u64, data).map_err(map_err)
+                const CHUNK: usize = 64 * 1024 * 1024;
+                for (i, piece) in data.chunks(CHUNK).enumerate() {
+                    s.client
+                        .memcpy_htod(dst as u64 + (i * CHUNK) as u64, piece, stream)
+                        .map_err(map_err)?;
+                }
+                Ok(())
             }
             MEMCPY_DTOH => {
                 if let Some(segs) = guestmem::segments(dst as usize, n) {
-                    if s.client.memcpy_gpa_dtoh(src as u64, segs).is_ok() {
+                    if s.client.memcpy_gpa_dtoh(src as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
                 }
@@ -670,17 +898,25 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                     // Host writes straight into the shared region at `off`.
                     return s
                         .client
-                        .memcpy_shm_dtoh(off, src as u64, n as u64)
+                        .memcpy_shm_dtoh(off, src as u64, n as u64, stream)
                         .map_err(map_err);
                 }
-                let data = s
-                    .client
-                    .memcpy_dtoh(src as u64, n as u64)
-                    .map_err(map_err)?;
-                if data.len() != n {
-                    return Err(CUDA_ERROR_UNKNOWN);
+                const CHUNK: usize = 64 * 1024 * 1024; // see H2D: stay under the frame cap
+                let mut off = 0;
+                while off < n {
+                    let c = (n - off).min(CHUNK);
+                    let data = s
+                        .client
+                        .memcpy_dtoh(src as u64 + off as u64, c as u64, stream)
+                        .map_err(map_err)?;
+                    if data.len() != c {
+                        return Err(CUDA_ERROR_UNKNOWN);
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), (dst as *mut u8).add(off), c)
+                    };
+                    off += c;
                 }
-                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, n) };
                 Ok(())
             }
             MEMCPY_DTOD => s
@@ -696,7 +932,7 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
 
 #[no_mangle]
 pub extern "C" fn cudaMemcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
-    set_last(do_memcpy(dst, src, n, kind))
+    set_last(do_memcpy(dst, src, n, kind, 0))
 }
 
 #[no_mangle]
@@ -705,11 +941,28 @@ pub extern "C" fn cudaMemcpyAsync(
     src: *const c_void,
     n: usize,
     kind: c_int,
-    _stream: *mut c_void,
+    stream: *mut c_void,
 ) -> c_int {
-    // Executed synchronously; ordering within a stream is preserved because all
-    // work runs on the host's single serving thread in call order.
-    set_last(do_memcpy(dst, src, n, kind))
+    // Device-to-device goes through the stream-ordered driver call: it
+    // pipelines like a launch and — critically — records into an active graph
+    // capture instead of invalidating it (the sync form is capture-unsafe).
+    let resolved = with_state(|s| Ok(resolve_kind(s, dst, src, kind))).unwrap_or(kind);
+    if resolved == MEMCPY_DTOD {
+        return set_last(
+            match with_client(|c| {
+                c.memcpy_dtod_async(dst as u64, src as u64, n as u64, stream as u64)
+            }) {
+                Ok(()) => CUDA_SUCCESS,
+                Err(e) => e,
+            },
+        );
+    }
+    // Other kinds complete before returning (the CUDA API permits a more
+    // synchronous implementation), but the host orders the copy after prior
+    // work on `stream` first — torch's non-blocking pool streams don't order
+    // against the NULL-stream copy the host uses, so dropping the stream let
+    // a copy overwrite buffers that still-running kernels were reading.
+    set_last(do_memcpy(dst, src, n, kind, stream as u64))
 }
 
 #[no_mangle]
@@ -727,9 +980,18 @@ pub extern "C" fn cudaMemsetAsync(
     dev_ptr: *mut c_void,
     value: c_int,
     count: usize,
-    _stream: *mut c_void,
+    stream: *mut c_void,
 ) -> c_int {
-    cudaMemset(dev_ptr, value, count)
+    // Stream-ordered driver call: pipelines, and records into an active graph
+    // capture instead of invalidating it.
+    set_last(
+        match with_client(|c| {
+            c.memset_d8_async(dev_ptr as u64, value as u8, count as u64, stream as u64)
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 // ---- streams ----------------------------------------------------------------
@@ -787,12 +1049,37 @@ const A_MAX_SHMEM_PER_BLOCK: i32 = 8;
 const A_TOTAL_CONST_MEM: i32 = 9;
 const A_WARP_SIZE: i32 = 10;
 const A_MAX_REGS_PER_BLOCK: i32 = 12;
+const A_CLOCK_RATE: i32 = 13;
 const A_MP_COUNT: i32 = 16;
+const A_KERNEL_EXEC_TIMEOUT: i32 = 17;
+const A_CONCURRENT_KERNELS: i32 = 31;
+const A_PCI_BUS_ID: i32 = 33;
+const A_PCI_DEVICE_ID: i32 = 34;
+const A_MEMORY_CLOCK_RATE: i32 = 36;
+const A_MEMORY_BUS_WIDTH: i32 = 37;
+const A_L2_CACHE_SIZE: i32 = 38;
 const A_MAX_THREADS_PER_MP: i32 = 39;
+const A_ASYNC_ENGINE_COUNT: i32 = 40;
+const A_PCI_DOMAIN_ID: i32 = 50;
 const A_COMPUTE_MAJOR: i32 = 75;
 const A_COMPUTE_MINOR: i32 = 76;
 const A_MAX_SHMEM_PER_MP: i32 = 81;
 const A_MAX_REGS_PER_MP: i32 = 82;
+const A_MANAGED_MEMORY: i32 = 83;
+const A_CONCURRENT_MANAGED_ACCESS: i32 = 89;
+const A_COMPUTE_PREEMPTION: i32 = 90;
+const A_COOPERATIVE_LAUNCH: i32 = 95;
+const A_COOPERATIVE_MULTI_DEVICE: i32 = 96;
+const A_SINGLE_TO_DOUBLE_PERF: i32 = 87;
+const A_MAX_SHMEM_PER_BLOCK_OPTIN: i32 = 97;
+const A_HOST_REGISTER_SUPPORTED: i32 = 99;
+const A_SPARSE_CUDA_ARRAY: i32 = 112;
+const A_READ_ONLY_HOST_REGISTER: i32 = 113;
+const A_MAX_BLOCKS_PER_MP: i32 = 106;
+const A_MAX_PERSISTING_L2: i32 = 108;
+const A_MAX_ACCESS_POLICY_WINDOW: i32 = 109;
+const A_RESERVED_SHMEM_PER_BLOCK: i32 = 111;
+const A_TIMELINE_SEMAPHORE: i32 = 114;
 
 #[no_mangle]
 pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int {
@@ -815,12 +1102,15 @@ pub extern "C" fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int {
     })
 }
 
-/// `cudaDeviceProp` (CUDA 12.x prefix). Only the fields PyTorch reads are set;
-/// the caller's ~1 KiB struct is zeroed first so the rest is well-defined.
+/// `cudaDeviceProp`, the exact CUDA 12.x layout (1032 bytes). Offsets verified
+/// against the real bundled `libcudart.so.12` filling the struct on this
+/// machine, and pinned by the compile-time assertions below — a missing field
+/// silently shifts everything after it (that bug has bitten twice: uuid, and a
+/// mis-sized texture block that landed the tail up to 76 bytes off).
 #[repr(C)]
 struct CudaDeviceProp {
     name: [u8; 256],
-    uuid: [u8; 16], // cudaUUID_t — MUST be here or every field below is 16B off
+    uuid: [u8; 16],
     luid: [u8; 8],
     luid_device_node_mask: c_uint,
     total_global_mem: usize,
@@ -831,15 +1121,19 @@ struct CudaDeviceProp {
     max_threads_per_block: c_int,
     max_threads_dim: [c_int; 3],
     max_grid_size: [c_int; 3],
+    clock_rate: c_int,
     total_const_mem: usize,
     major: c_int,
     minor: c_int,
     texture_alignment: usize,
     texture_pitch_alignment: usize,
+    device_overlap: c_int,
     multi_processor_count: c_int,
+    kernel_exec_timeout_enabled: c_int,
     integrated: c_int,
     can_map_host_memory: c_int,
-    _tex_surf: [c_int; 63], // maxTexture*/maxSurface* block (offsets kept, unused)
+    compute_mode: c_int,
+    _tex_surf: [c_int; 40], // maxTexture*/maxSurface* block (unused, left zero)
     surface_alignment: usize,
     concurrent_kernels: c_int,
     ecc_enabled: c_int,
@@ -849,6 +1143,7 @@ struct CudaDeviceProp {
     tcc_driver: c_int,
     async_engine_count: c_int,
     unified_addressing: c_int,
+    memory_clock_rate: c_int,
     memory_bus_width: c_int,
     l2_cache_size: c_int,
     persisting_l2_cache_max_size: c_int,
@@ -862,16 +1157,48 @@ struct CudaDeviceProp {
     is_multi_gpu_board: c_int,
     multi_gpu_board_group_id: c_int,
     host_native_atomic_supported: c_int,
+    single_to_double_precision_perf_ratio: c_int,
     pageable_memory_access: c_int,
     concurrent_managed_access: c_int,
     compute_preemption_supported: c_int,
     can_use_host_pointer_for_registered_mem: c_int,
     cooperative_launch: c_int,
+    cooperative_multi_device_launch: c_int,
     shared_mem_per_block_optin: usize,
     pageable_memory_access_uses_host_page_tables: c_int,
     direct_managed_mem_access_from_host: c_int,
     max_blocks_per_multiprocessor: c_int,
+    access_policy_max_window_size: c_int,
+    reserved_shared_mem_per_block: usize,
+    host_register_supported: c_int,
+    sparse_cuda_array_supported: c_int,
+    host_register_read_only_supported: c_int,
+    timeline_semaphore_interop_supported: c_int,
+    memory_pools_supported: c_int,
+    gpu_direct_rdma_supported: c_int,
+    gpu_direct_rdma_flush_writes_options: c_uint,
+    gpu_direct_rdma_writes_ordering: c_int,
+    memory_pool_supported_handle_types: c_uint,
+    deferred_mapping_cuda_array_supported: c_int,
+    ipc_event_supported: c_int,
+    cluster_launch: c_int,
+    unified_function_pointers: c_int,
+    _reserved: [c_int; 63],
 }
+
+// Anchor offsets measured from the real 12.4 cudart on this machine; a layout
+// drift fails the build instead of shipping a silently shifted struct.
+const _: () = {
+    assert!(std::mem::offset_of!(CudaDeviceProp, clock_rate) == 348);
+    assert!(std::mem::offset_of!(CudaDeviceProp, multi_processor_count) == 388);
+    assert!(std::mem::offset_of!(CudaDeviceProp, _tex_surf) == 408);
+    assert!(std::mem::offset_of!(CudaDeviceProp, memory_clock_rate) == 608);
+    assert!(std::mem::offset_of!(CudaDeviceProp, max_threads_per_multiprocessor) == 624);
+    assert!(std::mem::offset_of!(CudaDeviceProp, regs_per_multiprocessor) == 648);
+    assert!(std::mem::offset_of!(CudaDeviceProp, shared_mem_per_block_optin) == 696);
+    assert!(std::mem::offset_of!(CudaDeviceProp, reserved_shared_mem_per_block) == 720);
+    assert!(std::mem::size_of::<CudaDeviceProp>() == 1032);
+};
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -> c_int {
@@ -887,6 +1214,7 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
                 s.client.device_get_attribute(attr, device).unwrap_or(dflt)
             };
             let name = s.client.device_get_name(device).unwrap_or_default();
+            let uuid = s.client.device_get_uuid(device).unwrap_or([0; 16]);
             let total = s.client.device_total_mem(device).unwrap_or(0);
             let major = a(s, A_COMPUTE_MAJOR, 8);
             let minor = a(s, A_COMPUTE_MINOR, 6);
@@ -909,46 +1237,84 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
                 a(s, A_MAX_GRID_DIM_Y, 65535),
                 a(s, A_MAX_GRID_DIM_Z, 65535),
             );
+            let clock = a(s, A_CLOCK_RATE, 0);
+            let mem_clock = a(s, A_MEMORY_CLOCK_RATE, 0);
+            let bus_width = a(s, A_MEMORY_BUS_WIDTH, 0);
+            let l2 = a(s, A_L2_CACHE_SIZE, 0);
+            let persist_l2 = a(s, A_MAX_PERSISTING_L2, 0);
+            let engines = a(s, A_ASYNC_ENGINE_COUNT, 2);
+            let timeout = a(s, A_KERNEL_EXEC_TIMEOUT, 0);
+            let shmem_optin = a(s, A_MAX_SHMEM_PER_BLOCK_OPTIN, shmem_mp);
+            let reserved_shmem = a(s, A_RESERVED_SHMEM_PER_BLOCK, 0);
+            let max_blocks_mp = a(s, A_MAX_BLOCKS_PER_MP, 16);
+            let access_window = a(s, A_MAX_ACCESS_POLICY_WINDOW, 0);
+            let (pci_bus, pci_dev, pci_dom) = (
+                a(s, A_PCI_BUS_ID, 0),
+                a(s, A_PCI_DEVICE_ID, 0),
+                a(s, A_PCI_DOMAIN_ID, 0),
+            );
             // SAFETY: `prop` points at a caller-provided cudaDeviceProp we zeroed.
             let p = unsafe { &mut *(prop as *mut CudaDeviceProp) };
             let nb = name.as_bytes();
             let n = nb.len().min(255);
             p.name[..n].copy_from_slice(&nb[..n]);
+            p.uuid = uuid;
             p.total_global_mem = total as usize;
             p.shared_mem_per_block = shmem_blk as usize;
             p.regs_per_block = regs_blk;
             p.warp_size = warp;
+            p.mem_pitch = 2147483647;
             p.max_threads_per_block = max_tpb;
             p.max_threads_dim = [bx, by, bz];
             p.max_grid_size = [gx, gy, gz];
+            p.clock_rate = clock;
             p.total_const_mem = const_mem as usize;
             p.major = major;
             p.minor = minor;
+            p.texture_alignment = 512;
+            p.texture_pitch_alignment = 32;
+            p.device_overlap = (engines > 0) as c_int;
             p.multi_processor_count = mp;
+            p.kernel_exec_timeout_enabled = timeout;
             p.can_map_host_memory = 1;
-            p.concurrent_kernels = 1;
+            p.surface_alignment = 512;
+            p.concurrent_kernels = a(s, A_CONCURRENT_KERNELS, 1);
+            p.pci_bus_id = pci_bus;
+            p.pci_device_id = pci_dev;
+            p.pci_domain_id = pci_dom;
+            p.async_engine_count = engines;
             p.unified_addressing = 1;
+            p.memory_clock_rate = mem_clock;
+            p.memory_bus_width = bus_width;
+            p.l2_cache_size = l2;
+            p.persisting_l2_cache_max_size = persist_l2;
             p.max_threads_per_multiprocessor = max_tpm;
             p.stream_priorities_supported = 1;
             p.global_l1_cache_supported = 1;
             p.local_l1_cache_supported = 1;
             p.shared_mem_per_multiprocessor = shmem_mp as usize;
             p.regs_per_multiprocessor = regs_mp;
-            p.managed_memory = 1;
-            p.concurrent_managed_access = 1;
-            p.cooperative_launch = 1;
-            p.compute_preemption_supported = 1;
-            p.shared_mem_per_block_optin = shmem_mp as usize;
-            p.max_blocks_per_multiprocessor = 16;
-            // The hand-built struct tail diverges from CUDA 12.4's cudaDeviceProp
-            // by a few bytes, so PyTorch reads multiProcessorCount /
-            // maxThreadsPerMultiProcessor as 0 and divides by zero in its RNG
-            // launch config. Write those two at their verified real offsets.
-            unsafe {
-                let base = prop as *mut u8;
-                base.add(388).cast::<c_int>().write_unaligned(mp);
-                base.add(624).cast::<c_int>().write_unaligned(max_tpm);
-            }
+            p.managed_memory = a(s, A_MANAGED_MEMORY, 1);
+            p.single_to_double_precision_perf_ratio = a(s, A_SINGLE_TO_DOUBLE_PERF, 32);
+            p.concurrent_managed_access = a(s, A_CONCURRENT_MANAGED_ACCESS, 1);
+            p.compute_preemption_supported = a(s, A_COMPUTE_PREEMPTION, 1);
+            p.cooperative_launch = a(s, A_COOPERATIVE_LAUNCH, 1);
+            p.cooperative_multi_device_launch = a(s, A_COOPERATIVE_MULTI_DEVICE, 1);
+            p.shared_mem_per_block_optin = shmem_optin as usize;
+            p.max_blocks_per_multiprocessor = max_blocks_mp;
+            p.access_policy_max_window_size = access_window;
+            p.reserved_shared_mem_per_block = reserved_shmem as usize;
+            p.host_register_supported = a(s, A_HOST_REGISTER_SUPPORTED, 1);
+            p.timeline_semaphore_interop_supported = a(s, A_TIMELINE_SEMAPHORE, 1);
+            p.sparse_cuda_array_supported = a(s, A_SPARSE_CUDA_ARRAY, 0);
+            p.host_register_read_only_supported = a(s, A_READ_ONLY_HOST_REGISTER, 0);
+            // Deliberately NOT mirrored from the host GPU: capabilities that
+            // would steer callers onto paths forwarding can't honor. Pageable /
+            // registered host memory is guest RAM the host GPU can't reach by
+            // that pointer, mempools + IPC events are stubbed.
+            // (pageable_memory_access, can_use_host_pointer_for_registered_mem,
+            //  memory_pools_supported, memory_pool_supported_handle_types,
+            //  ipc_event_supported stay 0.)
             Ok(())
         })
         .err()
@@ -1004,9 +1370,15 @@ pub extern "C" fn cudaEventSynchronize(event: *mut c_void) -> c_int {
     })
 }
 #[no_mangle]
-pub extern "C" fn cudaEventQuery(_event: *mut c_void) -> c_int {
-    // Serving thread runs work in call order, so a recorded event is complete.
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
+    // Must be honest: PyTorch's allocator polls this to decide when freed
+    // blocks are safe to reuse. Always answering "complete" caused premature
+    // reuse (ILLEGAL_ADDRESS) once work really ran on side streams. NotReady
+    // (600) latches into last-error exactly like real cudart; torch clears it.
+    set_last(match with_client(|c| c.event_query(event as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    })
 }
 #[no_mangle]
 pub extern "C" fn cudaEventElapsedTime(
@@ -1037,40 +1409,223 @@ pub extern "C" fn cudaStreamCreateWithPriority(
 }
 #[no_mangle]
 pub extern "C" fn cudaStreamWaitEvent(
-    _stream: *mut c_void,
-    _event: *mut c_void,
-    _flags: c_uint,
+    stream: *mut c_void,
+    event: *mut c_void,
+    flags: c_uint,
 ) -> c_int {
-    set_last(CUDA_SUCCESS) // in-order execution on the serving thread
+    // A real cross-stream ordering edge now that work runs on side streams
+    // (and a graph dependency during capture) — dropping it made replays racy
+    // (ILLEGAL_ADDRESS). Deferred like a launch.
+    set_last(
+        match with_client(|c| c.stream_wait_event(stream as u64, event as u64, flags)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
-pub extern "C" fn cudaStreamQuery(_stream: *mut c_void) -> c_int {
-    set_last(CUDA_SUCCESS) // always idle: prior work already ran
+pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
+    // Honest completion status (0 or 600-NotReady), same as cudaEventQuery.
+    set_last(match with_client(|c| c.stream_query(stream as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    })
 }
+// ---- CUDA graphs -------------------------------------------------------------
+// Capture happens on the HOST driver: Begin/End forward, and every launch /
+// stream-ordered op issued in between lands on the capturing host stream and is
+// recorded (not executed) by the real driver. Replay is a single GraphLaunch
+// message for the whole graph — the antidote to per-launch round-trips in
+// launch-bound inference. The hot capture-status queries answer from the
+// guest-side `capture` field, costing nothing outside capture.
+
+/// cudaStreamCaptureStatusActive.
+const CAPTURE_ACTIVE: c_int = 1;
+
 #[no_mangle]
-pub extern "C" fn cudaStreamIsCapturing(_stream: *mut c_void, status: *mut c_int) -> c_int {
-    set_last(unsafe { out(status, 0) }) // cudaStreamCaptureStatusNone
+pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
+    set_last(
+        match with_state(|s| {
+            s.client
+                .stream_begin_capture(stream as u64, mode)
+                .map_err(map_err)?;
+            // Fetch the driver's capture id once; the allocator re-reads it
+            // through the local queries below.
+            let (_, id) = s
+                .client
+                .stream_capture_info(stream as u64)
+                .map_err(map_err)?;
+            s.capture = Some((stream as u64, id));
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
+
+#[no_mangle]
+pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> c_int {
+    if graph.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| {
+            let g = s
+                .client
+                .stream_end_capture(stream as u64)
+                .map_err(map_err)?;
+            s.capture = None;
+            Ok(g)
+        }) {
+            Ok(g) => unsafe { out(graph, g as *mut c_void) },
+            Err(e) => {
+                let _ = with_state(|s| {
+                    s.capture = None;
+                    Ok(())
+                });
+                e
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
+    let active = with_state(|s| Ok(matches!(s.capture, Some((cs, _)) if cs == stream as u64)))
+        .unwrap_or(false);
+    set_last(unsafe { out(status, if active { CAPTURE_ACTIVE } else { 0 }) })
+}
+
 #[no_mangle]
 pub extern "C" fn cudaStreamGetCaptureInfo_v2(
-    _stream: *mut c_void,
+    stream: *mut c_void,
     status: *mut c_int,
     id: *mut u64,
-    _graph: *mut *mut c_void,
-    _deps: *mut *mut *const c_void,
-    _num_deps: *mut usize,
+    graph: *mut *mut c_void,
+    deps: *mut *mut *const c_void,
+    num_deps: *mut usize,
 ) -> c_int {
+    let cap = with_state(|s| Ok(s.capture)).unwrap_or(None);
+    let (st, cid) = match cap {
+        Some((cs, cid)) if cs == stream as u64 => (CAPTURE_ACTIVE, cid),
+        _ => (0, 0),
+    };
     unsafe {
-        let _ = out(status, 0);
+        let _ = out(status, st);
         if !id.is_null() {
-            let _ = out(id, 0u64);
+            let _ = out(id, cid);
+        }
+        if !graph.is_null() {
+            let _ = out(graph, std::ptr::null_mut());
+        }
+        if !deps.is_null() {
+            let _ = out(deps, std::ptr::null_mut());
+        }
+        if !num_deps.is_null() {
+            let _ = out(num_deps, 0usize);
         }
     }
     set_last(CUDA_SUCCESS)
 }
+
 #[no_mangle]
-pub extern "C" fn cudaThreadExchangeStreamCaptureMode(_mode: *mut c_int) -> c_int {
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaGraphInstantiate(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    _error_node: *mut *mut c_void,
+    _log_buffer: *mut c_char,
+    _buffer_size: usize,
+) -> c_int {
+    cudaGraphInstantiateWithFlags(graph_exec, graph, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphInstantiateWithFlags(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    _flags: u64,
+) -> c_int {
+    if graph_exec.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(match with_client(|c| c.graph_instantiate(graph as u64)) {
+        Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
+        Err(e) => e,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) -> c_int {
+    // The whole point: one pipelined message replays every captured kernel.
+    set_last(
+        match with_client(|c| c.graph_launch(graph_exec as u64, stream as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
+}
+
+/// Count-only node query (`nodes == NULL`): PyTorch uses it to warn about
+/// empty captures. Filling a caller-provided node array is not supported.
+#[no_mangle]
+pub extern "C" fn cudaGraphGetNodes(
+    graph: *mut c_void,
+    nodes: *mut *mut c_void,
+    num_nodes: *mut usize,
+) -> c_int {
+    if num_nodes.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    match with_client(|c| c.graph_get_node_count(graph as u64)) {
+        Ok(n) => {
+            if !nodes.is_null() {
+                return set_last(CUDA_ERROR_INVALID_VALUE);
+            }
+            set_last(unsafe { out(num_nodes, n as usize) })
+        }
+        Err(e) => set_last(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
+    set_last(
+        match with_client(|c| c.graph_exec_destroy(graph_exec as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
+    set_last(match with_client(|c| c.graph_destroy(graph as u64)) {
+        Ok(()) => CUDA_SUCCESS,
+        Err(e) => e,
+    })
+}
+#[no_mangle]
+pub extern "C" fn cudaThreadExchangeStreamCaptureMode(mode: *mut c_int) -> c_int {
+    // PyTorch's allocator wraps capture-time cudaMalloc in a relaxed-mode
+    // guard via this call. The per-thread mode must take effect on the HOST
+    // thread that will execute the malloc — each connection is served by one
+    // host thread, so forwarding maps the semantics exactly. A no-op here
+    // leaves the host thread in global mode and the malloc fails with 900
+    // (cudaErrorStreamCaptureUnsupported), invalidating the capture.
+    if mode.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let new_mode = unsafe { *mode };
+    set_last(
+        match with_client(|c| c.thread_exchange_capture_mode(new_mode)) {
+            Ok(old) => {
+                unsafe { *mode = old };
+                CUDA_SUCCESS
+            }
+            Err(e) => e,
+        },
+    )
 }
 /// `cudaStreamCallback_t` = `void (*)(cudaStream_t, cudaError_t, void*)`.
 type StreamCallback = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void);
@@ -1173,7 +1728,7 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     // unregistered, and PyTorch's `is_pinned()` relies on that: reporting Host
     // for arbitrary pointers made `pin_memory()` a silent no-op, so pinned
     // transfers never reached the zero-copy path.
-    let is_dev = with_state(|s| Ok(s.dev_allocs.contains(&(ptr as u64)))).unwrap_or(false);
+    let is_dev = with_state(|s| Ok(dev_contains(&s.dev_allocs, ptr as u64))).unwrap_or(false);
     let is_pinned_host = !is_dev
         && (guestmem::is_pinned(ptr as usize)
             || shm_offset(ptr).is_some()
@@ -1221,9 +1776,24 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void)
     }
     set_last(CUDA_SUCCESS)
 }
+/// Forward the shared-memory opt-in (`cudaFuncAttributeMaxDynamicSharedMemorySize`
+/// = 8, matching the driver's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`)
+/// to the host function. FlashAttention/cutlass kernels needing >48 KiB shared
+/// memory raise it here before launching, or the launch fails with INVALID_VALUE.
+/// The runtime and driver enum values coincide, so `attr` passes through.
 #[no_mangle]
-pub extern "C" fn cudaFuncSetAttribute(_func: *const c_void, _attr: c_int, _value: c_int) -> c_int {
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int) -> c_int {
+    let r = with_state(|s| {
+        let fid = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
+            .fid;
+        s.client
+            .func_set_attribute(fid, attr, value)
+            .map_err(map_err)
+    });
+    set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 #[no_mangle]
 pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
@@ -1461,6 +2031,10 @@ fn do_launch(
     stream: u64,
     args: *mut *mut c_void,
 ) -> c_int {
+    // Debug bisection: drop launches entirely to isolate marshaling cost.
+    if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
+        return CUDA_SUCCESS;
+    }
     with_state(|s| {
         let rec = s
             .funcs
@@ -1568,6 +2142,7 @@ pub extern "C" fn __cudaLaunchKernel_ptsz(
 
 #[no_mangle]
 pub extern "C" fn cudaGetLastError() -> c_int {
+    merge_sticky_async_error();
     LAST_ERROR.with(|e| {
         let v = e.get();
         e.set(CUDA_SUCCESS);
@@ -1577,7 +2152,22 @@ pub extern "C" fn cudaGetLastError() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaPeekAtLastError() -> c_int {
+    merge_sticky_async_error();
     LAST_ERROR.with(|e| e.get())
+}
+
+/// Fold any sticky asynchronous-pipeline error (a deferred launch/memcpy that
+/// failed on the host) into the thread's last-error slot. Non-blocking: it
+/// only reports failures already observed, matching how `cudaGetLastError`
+/// reports asynchronous errors "seen so far" without synchronizing.
+fn merge_sticky_async_error() {
+    let _ = with_state(|s| {
+        let code = s.client.take_sticky();
+        if code != 0 {
+            set_last(map_err(CudaRpcError::Cuda(code)));
+        }
+        Ok(())
+    });
 }
 
 #[no_mangle]
@@ -1693,6 +2283,15 @@ mod gen_cudnn {
 // pointers, so attribute arrays ship as raw bytes sized by the attribute type.
 const LIB_CUDNN_BACKEND: u8 = 3;
 
+/// Guest-assigned virtual descriptor ids (bit 63 tags them; host userspace
+/// pointers and device VAs never set it). Lets create calls fire-and-forget:
+/// we invent the id, the host maps it to the real descriptor it creates.
+pub(crate) fn alloc_vhandle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new((1 << 63) | 1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Byte size of one `cudnnBackendAttributeType_t` element (must match host).
 fn cudnn_be_elem_size(t: c_int) -> usize {
     match t {
@@ -1711,14 +2310,17 @@ pub extern "C" fn cudnnBackendCreateDescriptor(
     if descriptor.is_null() {
         return 2000; // CUDNN_STATUS_BAD_PARAM
     }
-    let a = descriptor_type.to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 0, a)) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *descriptor = h as *mut c_void };
+    // Fire-and-forget: hand back a virtual id now; the host materializes the
+    // descriptor and maps the id. A creation failure surfaces on the next
+    // synchronous call touching it (Finalize/GetAttribute).
+    let vh = alloc_vhandle();
+    let mut a = descriptor_type.to_le_bytes().to_vec();
+    a.extend_from_slice(&vh.to_le_bytes());
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 0, a)) {
+        Ok(()) => {
+            unsafe { *descriptor = vh as *mut c_void };
             0
         }
-        Ok((st, _)) => st,
         Err(_) => 1,
     }
 }
@@ -1726,8 +2328,8 @@ pub extern "C" fn cudnnBackendCreateDescriptor(
 #[no_mangle]
 pub extern "C" fn cudnnBackendDestroyDescriptor(descriptor: *mut c_void) -> c_int {
     let a = (descriptor as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 1, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 1, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -1751,8 +2353,8 @@ pub extern "C" fn cudnnBackendSetAttribute(
             std::slice::from_raw_parts(array_of_elements as *const u8, n)
         });
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 2, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 2, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -1789,9 +2391,20 @@ pub extern "C" fn cudnnBackendGetAttribute(
                 let cap =
                     (requested_element_count.max(0) as usize) * cudnn_be_elem_size(attribute_type);
                 let n = bytes.len().min(cap);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), array_of_elements as *mut u8, n)
-                };
+                // Descriptor arrays are populated *in place*: the returned
+                // pointers are the caller's own descriptors, so keep the ids
+                // the caller passed (they may be virtual) instead of the real
+                // host pointers the server sees.
+                const TYPE_BACKEND_DESCRIPTOR: c_int = 15;
+                if attribute_type != TYPE_BACKEND_DESCRIPTOR {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            array_of_elements as *mut u8,
+                            n,
+                        )
+                    };
+                }
             }
             0
         }
@@ -1819,8 +2432,8 @@ pub extern "C" fn cudnnBackendExecute(
     a.extend_from_slice(&(handle as u64).to_le_bytes());
     a.extend_from_slice(&(execution_plan as u64).to_le_bytes());
     a.extend_from_slice(&(variant_pack as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 5, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 5, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2109,8 +2722,8 @@ pub extern "C" fn cublasLtMatmul(
     buf.extend_from_slice(&(workspace as u64).to_le_bytes());
     buf.extend_from_slice(&(workspace_size_in_bytes as u64).to_le_bytes());
     buf.extend_from_slice(&(stream as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 10, buf)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 10, buf)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2127,7 +2740,7 @@ const LIB_CUDNN_BN: u8 = 5;
 /// stub that returned an int caused a segfault. The exact text is cosmetic.
 #[no_mangle]
 pub extern "C" fn cudnnGetErrorString(_status: c_int) -> *const c_char {
-    b"cudnn status (forwarded by smolvm)\0".as_ptr() as *const c_char
+    c"cudnn status (forwarded by smolvm)".as_ptr()
 }
 
 /// Read a host float behind a `*const c_void` (cuDNN alpha/beta), 0.0 if null.
@@ -2152,6 +2765,10 @@ pub extern "C" fn cudnnSetTensorNdDescriptor(
     a.extend_from_slice(&(tensor_desc as u64).to_le_bytes());
     a.extend_from_slice(&data_type.to_le_bytes());
     a.extend_from_slice(&nb_dims.to_le_bytes());
+    // Record this descriptor\'s content fingerprint (everything after the
+    // handle) so pure size queries over it can be memoized soundly — the
+    // handle value alone is reusable across different shapes.
+    record_desc_fingerprint(tensor_desc as u64, &a[8..]);
     for arr in [dim_a, stride_a] {
         for i in 0..n {
             let v = if arr.is_null() {
@@ -2162,8 +2779,8 @@ pub extern "C" fn cudnnSetTensorNdDescriptor(
             a.extend_from_slice(&v.to_le_bytes());
         }
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 0, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 0, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2205,8 +2822,8 @@ pub extern "C" fn cudnnBatchNormalizationForwardInference(
         a.extend_from_slice(&p.to_le_bytes());
     }
     a.extend_from_slice(&epsilon.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 2, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 2, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2274,8 +2891,8 @@ pub extern "C" fn cudnnBatchNormalizationForwardTrainingEx(
     a.extend_from_slice(&(ws_size as u64).to_le_bytes());
     a.extend_from_slice(&(reserve as u64).to_le_bytes());
     a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 3, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 3, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2353,19 +2970,81 @@ pub extern "C" fn cudnnBatchNormalizationBackwardEx(
     a.extend_from_slice(&(ws_size as u64).to_le_bytes());
     a.extend_from_slice(&(reserve as u64).to_le_bytes());
     a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 4, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 4, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
+/// Tensor-descriptor content fingerprints (dtype + dims + strides from the
+/// last `cudnnSetTensorNdDescriptor`), keyed by handle value. A handle alone
+/// is not a stable identity — destroy/create can reuse the address — so size
+/// memoization keys on these contents instead.
+static DESC_FP: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+
+fn record_desc_fingerprint(desc: u64, contents: &[u8]) {
+    if let Ok(mut g) = DESC_FP.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(desc, contents.to_vec());
+    }
+}
+
+/// Rewrite a BN size-query arg blob into a content-addressed memo key: every
+/// descriptor handle is replaced by its recorded fingerprint. `None` (do not
+/// cache) if any non-null descriptor has no fingerprint on record.
+fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
+    // Layouts (see the three Get*Size wrappers): handle u64, mode i32, ops i32,
+    // then only u64 descriptor handles (5/7 for the workspace queries, act+x
+    // for the reserve query). The leading cudnn handle is identity-stable.
+    if args.len() < 16 || !(args.len() - 16).is_multiple_of(8) {
+        return None;
+    }
+    let fps = DESC_FP.lock().ok()?;
+    let fps = fps.as_ref()?;
+    let mut key = Vec::with_capacity(args.len() * 4);
+    key.extend_from_slice(&func.to_le_bytes());
+    key.extend_from_slice(&args[..16]);
+    for chunk in args[16..].chunks_exact(8) {
+        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+        if h == 0 {
+            key.push(0);
+            continue;
+        }
+        let fp = fps.get(&h)?; // unknown descriptor → uncacheable
+        key.extend_from_slice(&(fp.len() as u32).to_le_bytes());
+        key.extend_from_slice(fp);
+    }
+    Some(key)
+}
+
 /// Shared tail for the three `Get...Size` queries: forward the packed args and
-/// write the returned `size_t` through `size_out`.
+/// write the returned `size_t` through `size_out`. Memoized on the descriptor
+/// *contents* (not handles): the sizes are pure functions of those contents,
+/// and PyTorch re-queries them on every batch-norm invocation (~150 sync
+/// round-trips per ResNet training step without the cache).
 fn bn_size_call(func: u16, args: Vec<u8>, size_out: *mut usize) -> c_int {
+    static MEMO: Mutex<Option<HashMap<Vec<u8>, usize>>> = Mutex::new(None);
+    let key = bn_memo_key(func, &args);
+    if let Some(k) = &key {
+        if let Ok(mut g) = MEMO.lock() {
+            if let Some(sz) = g.get_or_insert_with(HashMap::new).get(k) {
+                if !size_out.is_null() {
+                    unsafe { *size_out = *sz };
+                }
+                return 0;
+            }
+        }
+    }
     match with_client(|c| c.lib_call(LIB_CUDNN_BN, func, args)) {
         Ok((0, out)) if out.len() >= 8 => {
+            let sz = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize;
             if !size_out.is_null() {
-                unsafe { *size_out = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize };
+                unsafe { *size_out = sz };
+            }
+            if let Some(k) = key {
+                if let Ok(mut g) = MEMO.lock() {
+                    g.get_or_insert_with(HashMap::new).insert(k, sz);
+                }
             }
             0
         }

@@ -22,6 +22,7 @@ pub type CuResult<T> = Result<T, i32>;
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
 /// `CUDA_ERROR_NOT_FOUND`.
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
+pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 
 /// A CUDA Driver-API implementation. Handles returned here are the backend's
 /// own raw values (e.g. real `CUmodule` pointers); [`serve`] hides them behind
@@ -43,10 +44,17 @@ pub trait Backend: Send {
     fn module_unload(&mut self, module: u64) -> CuResult<()>;
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>>;
+    /// Set a `CUfunction_attribute` (e.g. raise max dynamic shared memory).
+    fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()>;
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
     fn mem_free(&mut self, dptr: u64) -> CuResult<()>;
-    fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()>;
-    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> CuResult<Vec<u8>>;
+    /// Copy with stream ordering: prior work on `stream` (0 = legacy default)
+    /// must complete first. Torch's pool streams are created non-blocking, so
+    /// a NULL-stream copy does NOT order against them — dropping `stream`
+    /// makes a `cudaMemcpyAsync` overwrite buffers still-running kernels read.
+    fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> CuResult<()>;
+    /// See `memcpy_htod` for the `stream` contract.
+    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> CuResult<Vec<u8>>;
     fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> CuResult<()>;
     fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> CuResult<()>;
     fn mem_get_info(&mut self) -> CuResult<(u64, u64)>;
@@ -61,6 +69,37 @@ pub trait Backend: Send {
     ) -> CuResult<()>;
     fn ctx_synchronize(&mut self) -> CuResult<()>;
     fn stream_create(&mut self, flags: u32) -> CuResult<u64>;
+    /// Begin capturing `stream`'s work into a CUDA graph (mode per
+    /// `cudaStreamCaptureMode`).
+    fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> CuResult<()>;
+    /// Exchange this (serving) thread's capture interaction mode; returns the
+    /// previous mode. Lets a guest run capture-unsafe calls (allocator growth)
+    /// under `cudaStreamCaptureModeRelaxed` exactly like PyTorch does natively.
+    fn thread_exchange_capture_mode(&mut self, mode: i32) -> CuResult<i32>;
+    /// Raw `cuStreamQuery` code as a value (0 complete, 600 not ready) — not
+    /// an error, so it rides the response body.
+    fn stream_query(&mut self, stream: u64) -> CuResult<i32>;
+    /// `cuStreamWaitEvent`: make `stream` wait for `event`.
+    fn stream_wait_event(&mut self, stream: u64, event: u64, flags: u32) -> CuResult<()>;
+    /// Raw `cuEventQuery` code as a value (0 complete, 600 not ready).
+    fn event_query(&mut self, event: u64) -> CuResult<i32>;
+    /// End capture; returns the raw `cudaGraph_t`.
+    fn stream_end_capture(&mut self, stream: u64) -> CuResult<u64>;
+    /// `(capture_status, capture_id)` for `stream`.
+    fn stream_capture_info(&mut self, stream: u64) -> CuResult<(u64, u64)>;
+    /// Instantiate a captured graph; returns the raw `cudaGraphExec_t`.
+    fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
+    /// Replay an instantiated graph on `stream`.
+    fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()>;
+    fn graph_destroy(&mut self, graph: u64) -> CuResult<()>;
+    /// Number of nodes in a captured graph (PyTorch warns on empty graphs).
+    fn graph_get_node_count(&mut self, graph: u64) -> CuResult<u64>;
+    /// Stream-ordered memset (capture-safe; the sync form would invalidate an
+    /// active capture).
+    fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> CuResult<()>;
+    /// Stream-ordered device-to-device copy (capture-safe).
+    fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, stream: u64) -> CuResult<()>;
     fn stream_destroy(&mut self, stream: u64) -> CuResult<()>;
     fn stream_synchronize(&mut self, stream: u64) -> CuResult<()>;
     fn event_create(&mut self, flags: u32) -> CuResult<u64>;
@@ -119,18 +158,38 @@ pub trait Backend: Send {
     ) -> CuResult<()>;
 
     /// Generic forward-to-host-lib dispatch (code-generated per function).
-    /// Returns `(library_status, serialized_outputs)`. Default: unsupported.
-    fn lib_call(&mut self, _lib: u8, _func: u16, _args: &[u8]) -> CuResult<(i32, Vec<u8>)> {
+    /// `streams` is the session's stream table (wire id → raw host stream) for
+    /// resolving `cudaStream_t` parameters. Returns `(library_status,
+    /// serialized_outputs)`. Default: unsupported.
+    fn lib_call(
+        &mut self,
+        _lib: u8,
+        _func: u16,
+        _args: &[u8],
+        _streams: &HashMap<u64, u64>,
+    ) -> CuResult<(i32, Vec<u8>)> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
 
     /// Zero-copy H2D: DMA `size` bytes from shared-region `offset` to `dptr`.
     /// Default: no shared region → caller must fall back to byte-shipping.
-    fn memcpy_shm_htod(&mut self, _dptr: u64, _offset: u64, _size: u64) -> CuResult<()> {
+    fn memcpy_shm_htod(
+        &mut self,
+        _dptr: u64,
+        _offset: u64,
+        _size: u64,
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
     /// Zero-copy D2H: DMA `size` bytes from `dptr` to shared-region `offset`.
-    fn memcpy_shm_dtoh(&mut self, _offset: u64, _dptr: u64, _size: u64) -> CuResult<()> {
+    fn memcpy_shm_dtoh(
+        &mut self,
+        _offset: u64,
+        _dptr: u64,
+        _size: u64,
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
 
@@ -139,12 +198,53 @@ pub trait Backend: Send {
     /// by the embedder. Guest RAM is usually split around the 4 GiB PCI hole.
     fn set_guest_ram(&mut self, _regions: Vec<(u64, u64, u64)>) {}
     /// Zero-copy H2D from guest RAM: gather `segments` and DMA to `dptr`.
-    fn memcpy_gpa_htod(&mut self, _dptr: u64, _segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_htod(
+        &mut self,
+        _dptr: u64,
+        _segments: &[(u64, u64)],
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
     /// Zero-copy D2H to guest RAM: DMA from `dptr` and scatter into `segments`.
-    fn memcpy_gpa_dtoh(&mut self, _dptr: u64, _segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_dtoh(
+        &mut self,
+        _dptr: u64,
+        _segments: &[(u64, u64)],
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
+    }
+    /// Host virtual address of `len` bytes at guest-physical `gpa`, when the
+    /// embedder mapped guest RAM (in-VM only). Rings need long-lived page
+    /// mappings, unlike the per-call `memcpy_gpa_*` segment reads.
+    fn gpa_to_hva(&mut self, _gpa: u64, _len: u64) -> Option<u64> {
+        None
+    }
+    // VMM (torch expandable-segments allocator). Defaults: unsupported.
+    fn mem_address_reserve(&mut self, _size: u64, _align: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_create(&mut self, _size: u64, _device: i32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_map(&mut self, _va: u64, _size: u64, _offset: u64, _handle: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_set_access(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_unmap(&mut self, _va: u64, _size: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_release(&mut self, _handle: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_address_free(&mut self, _va: u64, _size: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_get_allocation_granularity(&mut self, _device: i32, _flags: u32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
     }
 }
 
@@ -159,6 +259,50 @@ struct Session {
     streams: HashMap<u64, u64>,
     events: HashMap<u64, u64>,
     cublas_handles: HashMap<u64, u64>,
+    /// Live resources this connection created, reclaimed when it ends —
+    /// a guest that dies mid-run must not leak GPU memory (device
+    /// allocations are the multi-GB hazard; modules/streams/events are
+    /// hygiene). Raw backend handles.
+    owned_dptrs: HashMap<u64, u64>, // dptr → size (also the quota ledger)
+    /// VMM state for reclaim: physical handles → size (quota ledger too),
+    /// live mappings (va → size), and address reservations (va → size).
+    owned_vmm_handles: HashMap<u64, u64>,
+    owned_vmm_maps: HashMap<u64, u64>,
+    owned_vmm_reservations: HashMap<u64, u64>,
+    owned_modules: std::collections::HashSet<u64>,
+    owned_streams: std::collections::HashSet<u64>,
+    owned_events: std::collections::HashSet<u64>,
+    primary_retains: u32,
+}
+
+/// Free everything a finished connection still owns. Failures are ignored —
+/// the driver may already have reclaimed (context destruction, device reset).
+fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
+    for (d, _size) in std::mem::take(&mut sess.owned_dptrs) {
+        let _ = b.mem_free(d);
+    }
+    // VMM teardown order: unmap, release physical, free reservations.
+    for (va, size) in std::mem::take(&mut sess.owned_vmm_maps) {
+        let _ = b.mem_unmap(va, size);
+    }
+    for (h, _size) in std::mem::take(&mut sess.owned_vmm_handles) {
+        let _ = b.mem_release(h);
+    }
+    for (va, size) in std::mem::take(&mut sess.owned_vmm_reservations) {
+        let _ = b.mem_address_free(va, size);
+    }
+    for m in std::mem::take(&mut sess.owned_modules) {
+        let _ = b.module_unload(m);
+    }
+    for st in std::mem::take(&mut sess.owned_streams) {
+        let _ = b.stream_destroy(st);
+    }
+    for e in std::mem::take(&mut sess.owned_events) {
+        let _ = b.event_destroy(e);
+    }
+    for _ in 0..std::mem::take(&mut sess.primary_retains) {
+        let _ = b.primary_ctx_release(0);
+    }
 }
 
 impl Session {
@@ -170,15 +314,346 @@ impl Session {
 
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
 /// request is dispatched to `backend`; returns on clean EOF.
-pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
+pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
     let mut sess = Session::default();
+    let r = serve_inner(stream, backend, &mut sess);
+    // The connection is over (guest exit, crash, or transport error): free
+    // everything it still owns so a dead client can't hold GPU memory.
+    reclaim_session(&mut sess, backend);
+    r
+}
+
+fn serve_inner<S: Read + Write>(
+    mut stream: S,
+    backend: &mut dyn Backend,
+    sess: &mut Session,
+) -> std::io::Result<()> {
+    // First failure among quiet (fire-and-forget) requests since the last
+    // fence. Quiet requests get no response at all — the client collects
+    // failures with one Fence round-trip instead of reading N per-op replies,
+    // which on vsock cost a guest wake-up each.
+    let mut quiet_sticky: i32 = 0;
     while let Some(payload) = read_msg(&mut stream)? {
-        let req = decode_request(&payload)?;
-        let (status, resp) = dispatch(&mut sess, backend, req);
-        let out = encode_response(status, &resp);
-        write_msg(&mut stream, &out)?;
+        match payload.first() {
+            // Quiet wrapper: execute the inner request, reply with nothing.
+            Some(&crate::proto::QUIET_PREFIX) => {
+                let req = decode_request(&payload[1..])?;
+                if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op~] 0x{:02x} len={}", payload[1], payload.len());
+                }
+                let (status, _) = dispatch(sess, backend, req);
+                if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op~!] status={status}");
+                }
+                if status != 0 && quiet_sticky == 0 {
+                    quiet_sticky = status;
+                }
+            }
+            // Fence: report (and clear) the sticky quiet failure.
+            Some(&crate::proto::FENCE_OP) if payload.len() == 1 => {
+                let st = std::mem::take(&mut quiet_sticky);
+                write_msg(&mut stream, &encode_response(st, &Response::Ok))?;
+            }
+            _ => {
+                let req = decode_request(&payload)?;
+                if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op] 0x{:02x} len={}", payload[0], payload.len());
+                }
+                // Transport upgrade: switch this connection to shared-memory
+                // rings and never return to socket framing (the socket then
+                // carries only doorbell bytes).
+                if let Request::RingSetup {
+                    page_size,
+                    req_pages,
+                    resp_pages,
+                    bounce_pages,
+                } = req
+                {
+                    match HostRings::map(backend, page_size, &req_pages, &resp_pages, &bounce_pages)
+                    {
+                        Ok(rings) => {
+                            write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
+                            return serve_rings(stream, backend, sess, quiet_sticky, rings);
+                            // (session reclaimed by `serve` on return)
+                        }
+                        Err(code) => {
+                            write_msg(&mut stream, &encode_response(code, &Response::Ok))?;
+                            continue;
+                        }
+                    }
+                }
+                let (status, resp) = dispatch(sess, backend, req);
+                if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op!] status={status}");
+                }
+                let out = encode_response(status, &resp);
+                write_msg(&mut stream, &out)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// Host mappings of the guest's rings + bounce buffer.
+struct HostRings {
+    req: crate::ring::Ring,
+    resp: crate::ring::Ring,
+    /// Bounce pages (host VAs) for responses too large for an inline record.
+    bounce: Vec<*mut u8>,
+    page_size: usize,
+}
+
+impl HostRings {
+    fn map(
+        backend: &mut dyn Backend,
+        page_size: u32,
+        req_pages: &[u64],
+        resp_pages: &[u64],
+        bounce_pages: &[u64],
+    ) -> Result<HostRings, i32> {
+        let ps = page_size as usize;
+        if ps < crate::ring::HEADER_SIZE + crate::ring::RECORD_SIZE
+            || req_pages.is_empty()
+            || resp_pages.is_empty()
+        {
+            return Err(1); // CUDA_ERROR_INVALID_VALUE
+        }
+        let mut map_all = |gpas: &[u64]| -> Result<Vec<*mut u8>, i32> {
+            gpas.iter()
+                .map(|&gpa| {
+                    backend
+                        .gpa_to_hva(gpa, page_size as u64)
+                        .map(|hva| hva as *mut u8)
+                        .ok_or(CUDA_ERROR_NOT_SUPPORTED)
+                })
+                .collect()
+        };
+        let req = map_all(req_pages)?;
+        let resp = map_all(resp_pages)?;
+        let bounce = map_all(bounce_pages)?;
+        // SAFETY: pages are backed by mapped guest RAM for the VM's lifetime.
+        Ok(HostRings {
+            req: unsafe { crate::ring::Ring::from_pages(req, ps) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
+            bounce,
+            page_size: ps,
+        })
+    }
+
+    /// Copy an oversized response into the bounce buffer. Returns false when
+    /// it doesn't fit (protocol error surfaced to the guest as a status).
+    fn write_bounce(&self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.bounce.len() * self.page_size {
+            return false;
+        }
+        for (i, chunk) in bytes.chunks(self.page_size).enumerate() {
+            // SAFETY: chunk fits within bounce page i (checked above).
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.bounce[i], chunk.len());
+            }
+        }
+        true
+    }
+}
+
+/// Ring-mode serve loop: requests pop from the guest's request ring,
+/// responses push to the completion ring; the socket carries doorbells only.
+fn serve_rings<S: Read + Write>(
+    mut stream: S,
+    backend: &mut dyn Backend,
+    sess: &mut Session,
+    mut quiet_sticky: i32,
+    rings: HostRings,
+) -> std::io::Result<()> {
+    use crate::ring::LEN_INDIRECT;
+    let oplog = std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some();
+    // Reassembly buffer for oversized frames arriving as bounce chunks.
+    let mut pending: Vec<u8> = Vec::new();
+    // Push one response. Oversized ones chunk through the bounce pages: the
+    // guest posts a continue record (16×0xFF, LEN_INDIRECT) on the request
+    // ring after copying each non-final chunk out — unambiguous because a
+    // blocked guest can't send anything else. Doorbell on park either way.
+    fn respond<S: Read + Write>(
+        rings: &HostRings,
+        stream: &mut S,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let kick = |stream: &mut S| -> std::io::Result<()> {
+            if rings_take_parked(rings) {
+                stream.write_all(&[1u8])?;
+                stream.flush()?;
+            }
+            Ok(())
+        };
+        fn rings_take_parked(rings: &HostRings) -> bool {
+            rings.resp.take_parked()
+        }
+        if bytes.len() <= crate::ring::INLINE_MAX {
+            while !rings.resp.try_push(bytes, 0) {
+                std::hint::spin_loop(); // guest drains sync responses promptly
+            }
+            return kick(stream);
+        }
+        let cap = rings.bounce.len() * rings.page_size;
+        let total = bytes.len();
+        let mut off = 0;
+        while off < total {
+            let chunk = (total - off).min(cap);
+            if !rings.write_bounce(&bytes[off..off + chunk]) {
+                return Err(std::io::Error::other("ring: bounce write failed"));
+            }
+            let mut hdr = [0u8; 16];
+            hdr[..8].copy_from_slice(&(total as u64).to_le_bytes());
+            hdr[8..].copy_from_slice(&(chunk as u64).to_le_bytes());
+            while !rings.resp.try_push(&hdr, LEN_INDIRECT) {
+                std::hint::spin_loop();
+            }
+            kick(stream)?;
+            off += chunk;
+            if off < total {
+                // Await the guest's continue record before refilling.
+                loop {
+                    if let Some((p, f)) = rings.req.try_pop() {
+                        if f & LEN_INDIRECT != 0 && p == [0xFF; 16] {
+                            break;
+                        }
+                        return Err(std::io::Error::other("ring: expected continue"));
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        Ok(())
+    }
+    loop {
+        let (payload, flags) = match rings.req.try_pop() {
+            Some(rec) => rec,
+            None => {
+                // Adaptive wait: spin briefly, then park and block on a
+                // doorbell byte from the guest.
+                let mut found = None;
+                for _ in 0..20_000 {
+                    if let Some(rec) = rings.req.try_pop() {
+                        found = Some(rec);
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                match found {
+                    Some(rec) => rec,
+                    None => {
+                        if !rings.req.park() {
+                            let mut byte = [0u8; 1];
+                            match stream.read(&mut byte) {
+                                Ok(0) => return Ok(()), // guest closed
+                                Ok(_) => {}
+                                Err(e) => return Err(e),
+                            }
+                            rings.req.unpark();
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        // Oversized frame: chunks arrive through the bounce pages. Every
+        // non-final chunk is acked (so the guest can refill the pages); the
+        // final chunk completes the frame, which dispatches below and whose
+        // own response closes the exchange.
+        let frame: Vec<u8> = if flags & LEN_INDIRECT != 0 {
+            if payload.len() < 16 {
+                return Err(std::io::Error::other("ring: short chunk record"));
+            }
+            let total = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let chunk = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            if total > crate::proto::MAX_MSG || chunk > rings.bounce.len() * rings.page_size {
+                return Err(std::io::Error::other("ring: oversized chunk"));
+            }
+            let mut left = chunk;
+            for &page in &rings.bounce {
+                if left == 0 {
+                    break;
+                }
+                let take = left.min(rings.page_size);
+                // SAFETY: bounce pages are mapped guest RAM.
+                unsafe {
+                    pending.extend_from_slice(std::slice::from_raw_parts(page, take));
+                }
+                left -= take;
+            }
+            if pending.len() < total {
+                // Ack the chunk so the guest may refill the bounce pages.
+                respond(&rings, &mut stream, &encode_response(0, &Response::Ok))?;
+                continue;
+            }
+            std::mem::take(&mut pending)
+        } else {
+            payload
+        };
+        match frame.first() {
+            Some(&crate::proto::QUIET_PREFIX) => {
+                let req = match decode_request(&frame[1..]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[ring-dbg] malformed QUIET frame len={} head={:02x?}",
+                            frame.len(),
+                            &frame[..frame.len().min(12)]
+                        );
+                        return Err(e);
+                    }
+                };
+                if oplog {
+                    eprintln!("[op~] 0x{:02x} len={}", frame[1], frame.len());
+                }
+                let (status, _) = dispatch(sess, backend, req);
+                if status != 0 {
+                    if oplog {
+                        eprintln!("[op~!] status={status}");
+                    }
+                    if quiet_sticky == 0 {
+                        quiet_sticky = status;
+                    }
+                }
+            }
+            Some(&crate::proto::FENCE_OP) if frame.len() == 1 => {
+                let st = std::mem::take(&mut quiet_sticky);
+                respond(&rings, &mut stream, &encode_response(st, &Response::Ok))?;
+            }
+            _ => {
+                let req = match decode_request(&frame) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[ring-dbg] malformed frame len={} head={:02x?}",
+                            frame.len(),
+                            &frame[..frame.len().min(12)]
+                        );
+                        return Err(e);
+                    }
+                };
+                if oplog {
+                    eprintln!("[op] 0x{:02x} len={}", frame[0], frame.len());
+                }
+                let (status, resp) = dispatch(sess, backend, req);
+                if status != 0 && oplog {
+                    eprintln!("[op!] status={status}");
+                }
+                respond(&rings, &mut stream, &encode_response(status, &resp))?;
+            }
+        }
+    }
+}
+
+/// Per-connection VRAM budget (`SMOLVM_CUDA_VRAM_LIMIT_MB`), read per
+/// allocation: rare calls, and staying uncached keeps it adjustable and
+/// test-deterministic.
+fn vram_limit() -> u64 {
+    std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(u64::MAX)
 }
 
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
@@ -189,14 +664,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // Translate an opaque stream id: 0 is the default stream (passes through),
     // anything else must be a live minted id.
     fn raw_stream(sess: &Session, stream: u64) -> CuResult<u64> {
+        // Streams are raw host pointers on the wire (see StreamCreate below);
+        // the table only translates ids minted by pre-raw-stream guests.
         if stream == 0 {
             Ok(0)
         } else {
-            sess.streams
-                .get(&stream)
-                .copied()
-                .ok_or(CUDA_ERROR_INVALID_HANDLE)
+            Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
         }
+    }
+    fn raw_event(sess: &Session, event: u64) -> CuResult<u64> {
+        // Same raw-on-the-wire convention as streams.
+        Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
     let r: CuResult<Response> = (|| match req {
         Request::Init => b.init().map(|_| Response::Ok),
@@ -224,15 +702,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::PrimaryCtxRetain { device } => {
             let raw = b.primary_ctx_retain(device)?;
+            sess.primary_retains += 1;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
+            sess.primary_retains = sess.primary_retains.saturating_sub(1);
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
             let raw = b.module_load_data(&image)?;
+            sess.owned_modules.insert(raw);
             let id = sess.mint();
             sess.modules.insert(id, raw);
             Ok(Response::Handle(id))
@@ -247,6 +728,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::ModuleUnload { module } => {
             let raw_mod = raw(&sess.modules, module)?;
             b.module_unload(raw_mod)?;
+            sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
         }
@@ -259,10 +741,45 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             Ok(Response::Data(out))
         }
-        Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(Response::Dptr),
-        Request::MemFree { dptr } => b.mem_free(dptr).map(|_| Response::Ok),
-        Request::MemcpyHtoD { dptr, data } => b.memcpy_htod(dptr, &data).map(|_| Response::Ok),
-        Request::MemcpyDtoH { dptr, bytes } => b.memcpy_dtoh(dptr, bytes).map(Response::Data),
+        Request::FuncSetAttribute {
+            function,
+            attrib,
+            value,
+        } => {
+            let raw_fn = raw(&sess.functions, function)?;
+            b.func_set_attribute(raw_fn, attrib, value)
+                .map(|_| Response::Ok)
+        }
+        Request::MemAlloc { bytes } => {
+            // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
+            // host): a guest may not allocate past its budget — the CUDA-
+            // native failure (out of memory) surfaces to the app.
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(bytes) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
+            }
+            b.mem_alloc(bytes).map(|d| {
+                sess.owned_dptrs.insert(d, bytes);
+                Response::Dptr(d)
+            })
+        }
+        Request::MemFree { dptr } => {
+            sess.owned_dptrs.remove(&dptr);
+            // (removal returns the freed size to the quota ledger)
+            b.mem_free(dptr).map(|_| Response::Ok)
+        }
+        Request::MemcpyHtoD { dptr, stream, data } => b
+            .memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyDtoH {
+            dptr,
+            bytes,
+            stream,
+        } => b
+            .memcpy_dtoh(dptr, bytes, raw_stream(sess, stream)?)
+            .map(Response::Data),
         Request::MemcpyDtoD { dst, src, bytes } => {
             b.memcpy_dtod(dst, src, bytes).map(|_| Response::Ok)
         }
@@ -284,15 +801,67 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 .map(|_| Response::Ok)
         }
         Request::CtxSynchronize => b.ctx_synchronize().map(|_| Response::Ok),
-        Request::StreamCreate { flags } => {
-            let raw = b.stream_create(flags)?;
-            let id = sess.mint();
-            sess.streams.insert(id, raw);
-            Ok(Response::Handle(id))
+        // Streams hand back the RAW host pointer, not a session-minted id.
+        // Streams are context-scoped and every connection retains the same
+        // device primary context — but one guest process holds SEPARATE
+        // connections (runtime shim + driver shim), so a per-session id minted
+        // on one is garbage on the other: torch's capture stream (runtime)
+        // fed to a Triton kernel launch (driver) came back INVALID_HANDLE.
+        // Raw pointers are valid on every connection, like device pointers.
+        Request::StreamCreate { flags } => b.stream_create(flags).map(|st| {
+            sess.owned_streams.insert(st);
+            Response::Handle(st)
+        }),
+        Request::StreamBeginCapture { stream, mode } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
+        }
+        Request::ThreadExchangeCaptureMode { mode } => {
+            b.thread_exchange_capture_mode(mode).map(Response::Count)
+        }
+        Request::StreamEndCapture { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_end_capture(raw).map(Response::Handle)
+        }
+        Request::StreamCaptureInfo { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_capture_info(raw)
+                .map(|(st, id)| Response::Pair(st, id))
+        }
+        Request::GraphInstantiate { graph } => b.graph_instantiate(graph).map(Response::Handle),
+        Request::GraphLaunch { graph_exec, stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.graph_launch(graph_exec, raw).map(|_| Response::Ok)
+        }
+        Request::GraphExecDestroy { graph_exec } => {
+            b.graph_exec_destroy(graph_exec).map(|_| Response::Ok)
+        }
+        Request::GraphDestroy { graph } => b.graph_destroy(graph).map(|_| Response::Ok),
+        Request::GraphGetNodes { graph } => b.graph_get_node_count(graph).map(Response::Bytes),
+        Request::MemsetD8Async {
+            dptr,
+            value,
+            bytes,
+            stream,
+        } => {
+            let raw = raw_stream(sess, stream)?;
+            b.memset_d8_async(dptr, value, bytes, raw)
+                .map(|_| Response::Ok)
+        }
+        Request::MemcpyDtoDAsync {
+            dst,
+            src,
+            bytes,
+            stream,
+        } => {
+            let raw = raw_stream(sess, stream)?;
+            b.memcpy_dtod_async(dst, src, bytes, raw)
+                .map(|_| Response::Ok)
         }
         Request::StreamDestroy { stream } => {
-            let raw = raw(&sess.streams, stream)?;
+            let raw = raw_stream(sess, stream)?;
             b.stream_destroy(raw)?;
+            sess.owned_streams.remove(&raw);
             sess.streams.remove(&stream);
             Ok(Response::Ok)
         }
@@ -300,30 +869,50 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = raw_stream(sess, stream)?;
             b.stream_synchronize(raw).map(|_| Response::Ok)
         }
-        Request::EventCreate { flags } => {
-            let raw = b.event_create(flags)?;
-            let id = sess.mint();
-            sess.events.insert(id, raw);
-            Ok(Response::Handle(id))
+        Request::StreamQuery { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_query(raw).map(Response::Count)
         }
+        Request::StreamWaitEvent {
+            stream,
+            event,
+            flags,
+        } => {
+            let raw_s = raw_stream(sess, stream)?;
+            let raw_e = raw_event(sess, event)?;
+            b.stream_wait_event(raw_s, raw_e, flags)
+                .map(|_| Response::Ok)
+        }
+        // Events are raw host pointers on the wire, same as streams (see
+        // StreamCreate): context-scoped, and one guest process talks over
+        // several connections that must all understand the same handle.
+        Request::EventCreate { flags } => b.event_create(flags).map(|e| {
+            sess.owned_events.insert(e);
+            Response::Handle(e)
+        }),
         Request::EventDestroy { event } => {
-            let raw = raw(&sess.events, event)?;
+            let raw = raw_event(sess, event)?;
             b.event_destroy(raw)?;
+            sess.owned_events.remove(&raw);
             sess.events.remove(&event);
             Ok(Response::Ok)
         }
         Request::EventRecord { event, stream } => {
-            let raw_ev = raw(&sess.events, event)?;
+            let raw_ev = raw_event(sess, event)?;
             let raw_str = raw_stream(sess, stream)?;
             b.event_record(raw_ev, raw_str).map(|_| Response::Ok)
         }
         Request::EventSynchronize { event } => {
-            let raw_ev = raw(&sess.events, event)?;
+            let raw_ev = raw_event(sess, event)?;
             b.event_synchronize(raw_ev).map(|_| Response::Ok)
         }
+        Request::EventQuery { event } => {
+            let raw_ev = raw_event(sess, event)?;
+            b.event_query(raw_ev).map(Response::Count)
+        }
         Request::EventElapsedTime { start, end } => {
-            let raw_start = raw(&sess.events, start)?;
-            let raw_end = raw(&sess.events, end)?;
+            let raw_start = raw_event(sess, start)?;
+            let raw_end = raw_event(sess, end)?;
             b.event_elapsed_time(raw_start, raw_end)
                 .map(Response::Millis)
         }
@@ -418,20 +1007,86 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok)
         }
         Request::LibCall { lib, func, args } => b
-            .lib_call(lib, func, &args)
+            .lib_call(lib, func, &args, &sess.streams)
             .map(|(status, out)| Response::LibResult(status, out)),
-        Request::MemcpyShmHtoD { dptr, offset, size } => {
-            b.memcpy_shm_htod(dptr, offset, size).map(|_| Response::Ok)
+        Request::MemcpyShmHtoD {
+            dptr,
+            offset,
+            size,
+            stream,
+        } => b
+            .memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyShmDtoH {
+            offset,
+            dptr,
+            size,
+            stream,
+        } => b
+            .memcpy_shm_dtoh(offset, dptr, size, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyGpaHtoD {
+            dptr,
+            stream,
+            segments,
+        } => b
+            .memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyGpaDtoH {
+            dptr,
+            stream,
+            segments,
+        } => b
+            .memcpy_gpa_dtoh(dptr, &segments, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        // Handled by the serve loop (transport concern, not a backend op);
+        // reaching dispatch means the transport doesn't support rings.
+        Request::RingSetup { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
+        Request::MemAddressReserve { size, align } => {
+            b.mem_address_reserve(size, align).map(|va| {
+                sess.owned_vmm_reservations.insert(va, size);
+                Response::Dptr(va)
+            })
         }
-        Request::MemcpyShmDtoH { offset, dptr, size } => {
-            b.memcpy_shm_dtoh(offset, dptr, size).map(|_| Response::Ok)
+        Request::MemCreate { size, device } => {
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(size) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
+            }
+            b.mem_create(size, device).map(|h| {
+                sess.owned_vmm_handles.insert(h, size);
+                Response::Handle(h)
+            })
         }
-        Request::MemcpyGpaHtoD { dptr, segments } => {
-            b.memcpy_gpa_htod(dptr, &segments).map(|_| Response::Ok)
+        Request::MemMap {
+            va,
+            size,
+            offset,
+            handle,
+        } => b.mem_map(va, size, offset, handle).map(|_| {
+            sess.owned_vmm_maps.insert(va, size);
+            Response::Ok
+        }),
+        Request::MemSetAccess { va, size, device } => {
+            b.mem_set_access(va, size, device).map(|_| Response::Ok)
         }
-        Request::MemcpyGpaDtoH { dptr, segments } => {
-            b.memcpy_gpa_dtoh(dptr, &segments).map(|_| Response::Ok)
+        Request::MemUnmap { va, size } => {
+            sess.owned_vmm_maps.remove(&va);
+            b.mem_unmap(va, size).map(|_| Response::Ok)
         }
+        Request::MemRelease { handle } => {
+            sess.owned_vmm_handles.remove(&handle);
+            b.mem_release(handle).map(|_| Response::Ok)
+        }
+        Request::MemAddressFree { va, size } => {
+            sess.owned_vmm_reservations.remove(&va);
+            b.mem_address_free(va, size).map(|_| Response::Ok)
+        }
+        Request::MemGetAllocationGranularity { device, flags } => b
+            .mem_get_allocation_granularity(device, flags)
+            .map(Response::Bytes),
     })();
     match r {
         Ok(resp) => (0, resp),
@@ -452,6 +1107,9 @@ pub struct CpuBackend {
     mem: HashMap<u64, Vec<u8>>,
     fn_names: HashMap<u64, String>,
     next_handle: u64,
+    /// Guest-RAM mappings, same shape as the GPU backend's — lets the ring
+    /// transport (and its tests) run without a GPU.
+    guest_ram: Vec<(u64, u64, u64)>,
 }
 
 impl Default for CpuBackend {
@@ -461,6 +1119,7 @@ impl Default for CpuBackend {
             mem: HashMap::new(),
             fn_names: HashMap::new(),
             next_handle: 1,
+            guest_ram: Vec::new(),
         }
     }
 }
@@ -483,6 +1142,14 @@ fn read_u32(p: &[u8]) -> Option<u32> {
 impl Backend for CpuBackend {
     fn init(&mut self) -> CuResult<()> {
         Ok(())
+    }
+    fn set_guest_ram(&mut self, regions: Vec<(u64, u64, u64)>) {
+        self.guest_ram = regions;
+    }
+    fn gpa_to_hva(&mut self, gpa: u64, len: u64) -> Option<u64> {
+        self.guest_ram.iter().find_map(|&(gs, hva, rlen)| {
+            (gpa >= gs && gpa.checked_add(len)? <= gs + rlen).then(|| hva + (gpa - gs))
+        })
     }
     fn device_get_count(&mut self) -> CuResult<i32> {
         Ok(1)
@@ -549,6 +1216,10 @@ impl Backend for CpuBackend {
             _ => Err(CUDA_ERROR_NOT_FOUND),
         }
     }
+    fn func_set_attribute(&mut self, _function: u64, _attrib: i32, _value: i32) -> CuResult<()> {
+        // CPU emulation has no shared-memory limits to raise.
+        Ok(())
+    }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64> {
         let dptr = self.next_dptr;
         self.next_dptr += bytes.max(1);
@@ -561,7 +1232,7 @@ impl Backend for CpuBackend {
             .map(|_| ())
             .ok_or(CUDA_ERROR_INVALID_HANDLE)
     }
-    fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()> {
+    fn memcpy_htod(&mut self, dptr: u64, data: &[u8], _stream: u64) -> CuResult<()> {
         let buf = self.mem.get_mut(&dptr).ok_or(CUDA_ERROR_INVALID_HANDLE)?;
         if data.len() > buf.len() {
             return Err(CUDA_ERROR_INVALID_HANDLE);
@@ -569,7 +1240,7 @@ impl Backend for CpuBackend {
         buf[..data.len()].copy_from_slice(data);
         Ok(())
     }
-    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> CuResult<Vec<u8>> {
+    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, _stream: u64) -> CuResult<Vec<u8>> {
         let buf = self.mem.get(&dptr).ok_or(CUDA_ERROR_INVALID_HANDLE)?;
         let n = bytes as usize;
         if n > buf.len() {
@@ -649,6 +1320,49 @@ impl Backend for CpuBackend {
     // synchronously, so create/destroy mint handles and the rest are no-ops.
     fn stream_create(&mut self, _flags: u32) -> CuResult<u64> {
         Ok(self.handle())
+    }
+    fn stream_begin_capture(&mut self, _stream: u64, _mode: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn thread_exchange_capture_mode(&mut self, mode: i32) -> CuResult<i32> {
+        // No capture machinery in CPU emulation; echo the mode back.
+        Ok(mode)
+    }
+    fn stream_query(&mut self, _stream: u64) -> CuResult<i32> {
+        Ok(0) // everything executes synchronously
+    }
+    fn stream_wait_event(&mut self, _stream: u64, _event: u64, _flags: u32) -> CuResult<()> {
+        Ok(()) // in-order execution: the dependency already holds
+    }
+    fn event_query(&mut self, _event: u64) -> CuResult<i32> {
+        Ok(0)
+    }
+    fn stream_end_capture(&mut self, _stream: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn stream_capture_info(&mut self, _stream: u64) -> CuResult<(u64, u64)> {
+        Ok((0, 0)) // cudaStreamCaptureStatusNone
+    }
+    fn graph_instantiate(&mut self, _graph: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_launch(&mut self, _graph_exec: u64, _stream: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_exec_destroy(&mut self, _graph_exec: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_destroy(&mut self, _graph: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_get_node_count(&mut self, _graph: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, _stream: u64) -> CuResult<()> {
+        self.memset_d8(dptr, value, bytes)
+    }
+    fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, _stream: u64) -> CuResult<()> {
+        self.memcpy_dtod(dst, src, bytes)
     }
     fn stream_destroy(&mut self, _stream: u64) -> CuResult<()> {
         Ok(())
@@ -771,11 +1485,23 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        dispatch(&mut sess, &mut b, Request::MemcpyHtoD { dptr: da, data: a });
         dispatch(
             &mut sess,
             &mut b,
-            Request::MemcpyHtoD { dptr: db, data: bb },
+            Request::MemcpyHtoD {
+                dptr: da,
+                stream: 0,
+                data: a,
+            },
+        );
+        dispatch(
+            &mut sess,
+            &mut b,
+            Request::MemcpyHtoD {
+                dptr: db,
+                stream: 0,
+                data: bb,
+            },
         );
         let params = vec![
             da.to_le_bytes().to_vec(),
@@ -802,6 +1528,7 @@ mod tests {
             Request::MemcpyDtoH {
                 dptr: dc,
                 bytes: 16,
+                stream: 0,
             },
         )
         .1
@@ -912,8 +1639,8 @@ mod tests {
         let bb: Vec<u8> = (0..n)
             .flat_map(|i| ((2 * i) as f32).to_le_bytes())
             .collect();
-        cli.memcpy_htod(da, &a).unwrap();
-        cli.memcpy_htod(db, &bb).unwrap();
+        cli.memcpy_htod(da, &a, 0).unwrap();
+        cli.memcpy_htod(db, &bb, 0).unwrap();
         cli.launch_kernel(
             func,
             [1, 1, 1],
@@ -929,7 +1656,7 @@ mod tests {
         )
         .unwrap();
         cli.ctx_synchronize().unwrap();
-        let out = cli.memcpy_dtoh(dc, (n * 4) as u64).unwrap();
+        let out = cli.memcpy_dtoh(dc, (n * 4) as u64, 0).unwrap();
         let c: Vec<f32> = out
             .chunks(4)
             .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
@@ -938,5 +1665,138 @@ mod tests {
         assert_eq!(c, expect);
         drop(cli); // closes client_side → server sees EOF
         server.join().unwrap();
+    }
+    // Ring transport end-to-end: handshake over the socket, then requests
+    // (inline quiet, indirect oversized, fence) through shared memory with
+    // bounce-buffer responses — no GPU, no VM.
+    #[test]
+    fn ring_transport_end_to_end() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{Receiver, Sender};
+        struct Chan {
+            tx: Sender<u8>,
+            rx: Receiver<u8>,
+        }
+        impl Write for Chan {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                for &x in buf {
+                    self.tx
+                        .send(x)
+                        .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Read for Chan {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                match self.rx.recv() {
+                    Ok(b) => {
+                        buf[0] = b;
+                        Ok(1)
+                    }
+                    Err(_) => Ok(0), // EOF
+                }
+            }
+        }
+
+        // In-process fake guest RAM: identity-mapped (GPA == host VA), so
+        // any heap address — ring pages and indirect staging buffers alike —
+        // resolves. The aligned ring pages are leaked so both threads may
+        // hold pointers.
+        const PAGES: usize = 64;
+        const PAGE: usize = 4096;
+        let _ = AtomicUsize::new(0); // (kept import happy on older toolchains)
+        let layout = std::alloc::Layout::from_size_align(PAGES * PAGE, PAGE).unwrap();
+        // SAFETY: fresh allocation, zeroed, intentionally leaked.
+        let hva = unsafe {
+            let p = std::alloc::alloc_zeroed(layout);
+            assert!(!p.is_null());
+            p as usize
+        };
+
+        let (c2s_tx, c2s_rx) = std::sync::mpsc::channel();
+        let (s2c_tx, s2c_rx) = std::sync::mpsc::channel();
+        let server_side = Chan {
+            tx: s2c_tx,
+            rx: c2s_rx,
+        };
+        let client_side = Chan {
+            tx: c2s_tx,
+            rx: s2c_rx,
+        };
+        let server = std::thread::spawn(move || {
+            let mut b = CpuBackend::default();
+            b.set_guest_ram(vec![(0, 0, u64::MAX / 2)]); // identity: hva == gpa
+            let r = serve(server_side, &mut b);
+            eprintln!("[test] serve exited: {r:?}");
+        });
+
+        let mut cli = Client::new(client_side);
+        cli.init().unwrap();
+        let vas = |r: std::ops::Range<usize>| -> Vec<*mut u8> {
+            r.map(|i| (hva + i * PAGE) as *mut u8).collect()
+        };
+        let gpas = |r: std::ops::Range<usize>| -> Vec<u64> {
+            r.map(|i| (hva + i * PAGE) as u64).collect()
+        };
+        cli.ring_setup(
+            PAGE,
+            (vas(0..8), gpas(0..8)),
+            (vas(8..16), gpas(8..16)),
+            (vas(16..24), gpas(16..24)),
+        )
+        .unwrap();
+        assert!(cli.is_ring());
+
+        // Sync op over the ring (inline both ways).
+        assert_eq!(cli.device_get_count().unwrap(), 1);
+        let d = cli.mem_alloc(8192).unwrap();
+        // Deferred quiet op, inline record.
+        cli.memcpy_htod(d, &[9u8; 64], 0).unwrap();
+        // Fence over the ring settles it.
+        cli.drain().unwrap();
+        assert_eq!(cli.take_sticky(), 0);
+        // Oversized write: multi-chunk through the 32 KiB bounce staging.
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let d2 = cli.mem_alloc(big.len() as u64).unwrap();
+        cli.memcpy_htod(d2, &big, 0).unwrap();
+        // Oversized read: response spills through the same bounce pages.
+        let back = cli.memcpy_dtoh(d2, big.len() as u64, 0).unwrap();
+        assert_eq!(back, big);
+        drop(cli);
+        server.join().unwrap();
+    }
+    // A connection may not allocate past SMOLVM_CUDA_VRAM_LIMIT_MB; freeing
+    // returns budget. (Env is process-global; restored at the end so
+    // parallel tests never see the 1 MB cap on their own allocations.)
+    #[test]
+    fn vram_quota_enforced() {
+        std::env::set_var("SMOLVM_CUDA_VRAM_LIMIT_MB", "1");
+        let mut sess = Session::default();
+        let mut b = CpuBackend::default();
+        let mb = 1024 * 1024;
+        let (st, r) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
+        assert_eq!(st, 0);
+        let d1 = match r {
+            Response::Dptr(d) => d,
+            _ => unreachable!(),
+        };
+        // Second half-MB fits exactly; a byte more must fail with OOM(2).
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
+        assert_eq!(st, 0);
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: 1 });
+        assert_eq!(st, 2, "over-quota alloc must report OUT_OF_MEMORY");
+        // Freeing restores budget.
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemFree { dptr: d1 });
+        assert_eq!(st, 0);
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 4 });
+        assert_eq!(st, 0);
+        std::env::remove_var("SMOLVM_CUDA_VRAM_LIMIT_MB");
     }
 }

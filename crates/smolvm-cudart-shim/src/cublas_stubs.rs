@@ -471,30 +471,6 @@ pub extern "C" fn cudaGraphDebugDotPrint() -> c_int {
     rt_stub("cudaGraphDebugDotPrint")
 }
 #[no_mangle]
-pub extern "C" fn cudaGraphDestroy() -> c_int {
-    rt_stub("cudaGraphDestroy")
-}
-#[no_mangle]
-pub extern "C" fn cudaGraphExecDestroy() -> c_int {
-    rt_stub("cudaGraphExecDestroy")
-}
-#[no_mangle]
-pub extern "C" fn cudaGraphGetNodes() -> c_int {
-    rt_stub("cudaGraphGetNodes")
-}
-#[no_mangle]
-pub extern "C" fn cudaGraphInstantiate() -> c_int {
-    rt_stub("cudaGraphInstantiate")
-}
-#[no_mangle]
-pub extern "C" fn cudaGraphInstantiateWithFlags() -> c_int {
-    rt_stub("cudaGraphInstantiateWithFlags")
-}
-#[no_mangle]
-pub extern "C" fn cudaGraphLaunch() -> c_int {
-    rt_stub("cudaGraphLaunch")
-}
-#[no_mangle]
 pub extern "C" fn cudaIpcCloseMemHandle() -> c_int {
     rt_stub("cudaIpcCloseMemHandle")
 }
@@ -522,15 +498,6 @@ pub extern "C" fn cudaMemcpyPeerAsync() -> c_int {
 pub extern "C" fn cudaRegisterVar() -> c_int {
     rt_stub("cudaRegisterVar")
 }
-#[no_mangle]
-pub extern "C" fn cudaStreamBeginCapture() -> c_int {
-    rt_stub("cudaStreamBeginCapture")
-}
-#[no_mangle]
-pub extern "C" fn cudaStreamEndCapture() -> c_int {
-    rt_stub("cudaStreamEndCapture")
-}
-
 /// `__cudaRegisterVar` — registers a __device__/__constant__ global. No-op:
 /// forwarded workloads that don't use cudaMemcpyToSymbol never need the mapping.
 #[no_mangle]

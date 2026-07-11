@@ -36,25 +36,606 @@ impl From<io::Error> for CudaRpcError {
 
 pub type Result<T> = std::result::Result<T, CudaRpcError>;
 
+/// Debug profiling (`SMOLVM_CUDA_COUNT_SYNC=1`): tally synchronous round-trips
+/// per op, dumped to stderr every 4096 calls, to show what still serializes an
+/// asynchronously-pipelined workload. For `LibCall` the tally key includes the
+/// library id and function index.
+fn count_sync(req: &Request, op: Op) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let key = match req {
+        Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
+        Request::ModuleGetFunction { name, .. } => format!("ModuleGetFunction({name})"),
+        Request::FuncGetParamInfo { function } => format!("FuncGetParamInfo(fid={function})"),
+        Request::ModuleLoadData { image } => format!("ModuleLoadData(len={})", image.len()),
+        _ => format!("{op:?}"),
+    };
+    let mut g = COUNTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    *m.entry(key).or_insert(0) += 1;
+    let total: u64 = m.values().sum();
+    if total.is_multiple_of(4096) {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("[sync-counts after {total}]");
+        for (k, n) in v.iter().take(12) {
+            eprintln!("  {n:>8}  {k}");
+        }
+    }
+}
+
+/// C-ABI hooks into another shim's connection in the same process, resolved
+/// via `dlsym`. The driver shim (`libcuda.so.1`) routes its traffic through
+/// the runtime shim's connection with these, so the host sees ONE
+/// program-ordered pipeline instead of two independently flushed queues (two
+/// queues let the host execute work out of guest program order — fatal once
+/// CUDA-graph capture records the misorder).
+#[derive(Clone, Copy)]
+pub struct Bridge {
+    /// Append one encoded request to the shared pipeline, fire-and-forget.
+    /// Nonzero return = transport failure (op-level failures surface later as
+    /// sticky asynchronous errors on the owning connection).
+    pub quiet: unsafe extern "C" fn(req: *const u8, len: usize) -> i32,
+    /// Send one encoded request, receive its response payload (status still
+    /// in-band). Returns the response length; -1 = transport failure; any
+    /// other negative = `cap` too small, retry with `-ret` bytes and an empty
+    /// request to fetch the stashed response.
+    pub call: unsafe extern "C" fn(req: *const u8, len: usize, resp: *mut u8, cap: usize) -> isize,
+    /// Settle the shared pipeline (fence); returns the first collected
+    /// quiet-failure status, 0 if none.
+    pub drain: unsafe extern "C" fn() -> i32,
+}
+
+/// Debug bisection (`SMOLVM_CUDA_SYNC_OPS=LaunchKernel,LibCall1,LibCall4:10`):
+/// force the named op kinds — optionally narrowed to a library id and
+/// function index for `LibCall` — to synchronous round-trips while the rest
+/// stay deferred, to isolate which deferred class corrupts a failing workload.
+fn sync_forced(req: &Request, op: Op) -> bool {
+    use std::sync::OnceLock;
+    static SET: OnceLock<Vec<String>> = OnceLock::new();
+    let set = SET.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_SYNC_OPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect()
+    });
+    if set.is_empty() {
+        return false;
+    }
+    let kind = format!("{op:?}").to_ascii_lowercase();
+    if set.contains(&kind) {
+        return true;
+    }
+    if let Request::LibCall { lib, func, .. } = req {
+        return set.contains(&format!("libcall{lib}"))
+            || set.contains(&format!("libcall{lib}:{func}"));
+    }
+    false
+}
+
+/// Round-trip one encoded request over a [`Bridge`], growing the response
+/// buffer when the callee reports it too small (the callee stashes the
+/// response; an empty request fetches the stash).
+fn bridge_call_vec(b: &Bridge, req: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    let mut ret = unsafe { (b.call)(req.as_ptr(), req.len(), buf.as_mut_ptr(), buf.len()) };
+    if ret < -1 {
+        buf = vec![0u8; (-ret) as usize];
+        ret = unsafe { (b.call)(std::ptr::null(), 0, buf.as_mut_ptr(), buf.len()) };
+    }
+    if ret >= 0 {
+        buf.truncate(ret as usize);
+        Ok(buf)
+    } else {
+        Err(CudaRpcError::Protocol("bridge call failed"))
+    }
+}
+
+/// Shared-memory ring transport state (in-VM fast path; see `crate::ring`).
+pub struct ClientRing {
+    /// Guest→host requests (this side produces).
+    req: crate::ring::Ring,
+    /// Host→guest completions (this side consumes).
+    resp: crate::ring::Ring,
+    /// Guest VAs of the bounce pages: staging for oversized traffic in both
+    /// directions (requests chunk guest→host, responses spill host→guest —
+    /// never simultaneously, the queue is strictly request-then-response).
+    bounce: Vec<*mut u8>,
+    page_size: usize,
+}
+
+// SAFETY: raw pointers reference process-owned pinned pages; the shim holds
+// the client behind a mutex.
+unsafe impl Send for ClientRing {}
+
 /// A CUDA Driver-API client over one connection to the host server.
 pub struct Client<S> {
     stream: S,
+    /// Shared-memory ring transport, when negotiated (in-VM fast path).
+    ring: Option<ClientRing>,
+    /// When set, this client owns no connection: every request rides another
+    /// shim's connection through these hooks (see [`Bridge`]).
+    bridge: Option<Bridge>,
+    /// Count of quiet (fire-and-forget) requests since the last fence. Quiet
+    /// requests produce no responses; a fence settles them all at once.
+    deferred: usize,
+    /// First non-zero status collected from a deferred response — surfaced at
+    /// the next launch/synchronize, mirroring CUDA's asynchronous ("sticky")
+    /// error reporting.
+    sticky: i32,
+    /// Kill-switch: `SMOLVM_CUDA_ASYNC=0` restores strict per-call round-trips.
+    defer_enabled: bool,
+    /// Framed-but-unsent deferred requests. Batching them into one write turns
+    /// a launch storm's thousand syscalls into a handful; flushed before any
+    /// read (a response can only exist for a request the host has seen).
+    wbuf: Vec<u8>,
 }
+
+/// Outstanding-response cap. Responses are ~8 bytes, so even the smallest
+/// socket buffer holds far more than this; the cap just bounds how much work
+/// can race ahead of an error being noticed.
+const MAX_DEFERRED: usize = 512;
+/// Flush the deferred-write buffer beyond this size even without a sync point,
+/// so bulk H2D byte-shipping doesn't accumulate unbounded copies in memory.
+const WBUF_FLUSH: usize = 256 * 1024;
 
 impl<S: Read + Write> Client<S> {
     pub fn new(stream: S) -> Self {
-        Client { stream }
+        Client {
+            stream,
+            ring: None,
+            bridge: None,
+            deferred: 0,
+            sticky: 0,
+            defer_enabled: std::env::var("SMOLVM_CUDA_ASYNC").as_deref() != Ok("0"),
+            wbuf: Vec::new(),
+        }
+    }
+
+    /// A client that owns no connection: every request rides another shim's
+    /// connection via `bridge`. `stream` is never read or written.
+    pub fn new_bridged(stream: S, bridge: Bridge) -> Self {
+        let mut c = Self::new(stream);
+        c.bridge = Some(bridge);
+        c
+    }
+
+    pub fn is_bridged(&self) -> bool {
+        self.bridge.is_some()
+    }
+
+    /// Negotiate the shared-memory ring transport (in-VM fast path). `req`,
+    /// `resp` and `bounce` are (page VAs, page GPAs) of zeroed, mlocked,
+    /// page-aligned guest allocations. On Ok the connection switches: the
+    /// socket carries only doorbell bytes from here on.
+    #[allow(clippy::type_complexity)]
+    pub fn ring_setup(
+        &mut self,
+        page_size: usize,
+        req: (Vec<*mut u8>, Vec<u64>),
+        resp: (Vec<*mut u8>, Vec<u64>),
+        bounce: (Vec<*mut u8>, Vec<u64>),
+    ) -> Result<()> {
+        self.call(
+            &Request::RingSetup {
+                page_size: page_size as u32,
+                req_pages: req.1,
+                resp_pages: resp.1,
+                bounce_pages: bounce.1,
+            },
+            Op::RingSetup,
+        )?;
+        // SAFETY: pages are owned by the shim and stay mapped + resident for
+        // the process lifetime (mlocked, never freed).
+        self.ring = Some(ClientRing {
+            req: unsafe { crate::ring::Ring::from_pages(req.0, page_size) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp.0, page_size) },
+            bounce: bounce.0,
+            page_size,
+        });
+        Ok(())
+    }
+
+    pub fn is_ring(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Push one frame (socket-payload bytes: QUIET/FENCE prefix included) to
+    /// the request ring. Oversized frames chunk through the bounce pages:
+    /// each chunk record is acked by the host before the pages are reused,
+    /// except the last — the caller's own response wait covers it, so every
+    /// oversized frame MUST be a sync op (quiet callers upgrade to sync).
+    fn ring_push(&mut self, frame: &[u8]) -> Result<()> {
+        use crate::ring::{INLINE_MAX, LEN_INDIRECT};
+        if frame.len() <= INLINE_MAX {
+            let ring = self.ring.as_ref().expect("ring transport");
+            while !ring.req.try_push(frame, 0) {
+                std::hint::spin_loop(); // host drains continuously
+            }
+            if ring.req.take_parked() {
+                self.stream.write_all(&[1u8])?;
+                self.stream.flush()?;
+            }
+            return Ok(());
+        }
+        let (bounce_cap, page_size) = {
+            let ring = self.ring.as_ref().expect("ring transport");
+            (ring.bounce.len() * ring.page_size, ring.page_size)
+        };
+        let total = frame.len();
+        let mut off = 0;
+        while off < total {
+            let chunk = (total - off).min(bounce_cap);
+            {
+                let ring = self.ring.as_ref().expect("ring transport");
+                for (i, piece) in frame[off..off + chunk].chunks(page_size).enumerate() {
+                    // SAFETY: bounce pages are live shim allocations of
+                    // page_size bytes each; piece fits by construction.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(piece.as_ptr(), ring.bounce[i], piece.len());
+                    }
+                }
+                let mut rec = [0u8; 16];
+                rec[..8].copy_from_slice(&(total as u64).to_le_bytes());
+                rec[8..].copy_from_slice(&(chunk as u64).to_le_bytes());
+                while !ring.req.try_push(&rec, LEN_INDIRECT) {
+                    std::hint::spin_loop();
+                }
+                if ring.req.take_parked() {
+                    self.stream.write_all(&[1u8])?;
+                    self.stream.flush()?;
+                }
+            }
+            off += chunk;
+            if off < total {
+                // Host acks each non-final chunk once copied out; the final
+                // chunk is covered by the operation's own response.
+                let _ack = self.ring_pop_response()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Await exactly one completion record: spin briefly, then park and block
+    /// on a doorbell byte.
+    fn ring_pop_response(&mut self) -> Result<Vec<u8>> {
+        use crate::ring::LEN_INDIRECT;
+        loop {
+            {
+                let ring = self.ring.as_ref().expect("ring transport");
+                let mut popped = ring.resp.try_pop();
+                if popped.is_none() {
+                    for _ in 0..20_000 {
+                        popped = ring.resp.try_pop();
+                        if popped.is_some() {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+                if let Some((payload, flags)) = popped {
+                    if flags & LEN_INDIRECT == 0 {
+                        return Ok(payload);
+                    }
+                    // Oversized response: [total][chunk] records, each chunk
+                    // staged in the bounce pages; we post a continue record
+                    // after copying each non-final chunk out.
+                    let mut hdr = payload;
+                    let mut buf: Vec<u8> = Vec::new();
+                    loop {
+                        if hdr.len() < 16 {
+                            return Err(CudaRpcError::Protocol("ring: short indirect"));
+                        }
+                        let total = u64::from_le_bytes(hdr[..8].try_into().unwrap()) as usize;
+                        let chunk = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
+                        if chunk > ring.bounce.len() * ring.page_size {
+                            return Err(CudaRpcError::Protocol("ring: bounce overrun"));
+                        }
+                        let mut left = chunk;
+                        for &page in &ring.bounce {
+                            if left == 0 {
+                                break;
+                            }
+                            let take = left.min(ring.page_size);
+                            // SAFETY: bounce pages are live shim allocations.
+                            unsafe {
+                                buf.extend_from_slice(std::slice::from_raw_parts(
+                                    page as *const u8,
+                                    take,
+                                ));
+                            }
+                            left -= take;
+                        }
+                        if buf.len() >= total {
+                            return Ok(buf);
+                        }
+                        // More chunks: tell the host the pages are free.
+                        while !ring.req.try_push(&[0xFF; 16], LEN_INDIRECT) {
+                            std::hint::spin_loop();
+                        }
+                        hdr = loop {
+                            if let Some((p, f)) = ring.resp.try_pop() {
+                                if f & LEN_INDIRECT == 0 {
+                                    return Err(CudaRpcError::Protocol("ring: expected chunk"));
+                                }
+                                break p;
+                            }
+                            std::hint::spin_loop();
+                        };
+                    }
+                }
+                if ring.resp.park() {
+                    continue; // record landed while parking
+                }
+            }
+            // Blocked: wait for the host's doorbell byte on the socket.
+            let mut byte = [0u8; 1];
+            match self.stream.read(&mut byte) {
+                Ok(0) => return Err(CudaRpcError::Protocol("host closed ring connection")),
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.ring.as_ref().expect("ring transport").resp.unpark();
+        }
+    }
+
+    /// One sync round-trip over the rings.
+    fn ring_roundtrip(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
+        self.ring_push(frame)?;
+        self.ring_pop_response()
+    }
+
+    /// Send everything buffered by deferred calls.
+    fn flush_wbuf(&mut self) -> Result<()> {
+        if !self.wbuf.is_empty() {
+            self.stream.write_all(&self.wbuf)?;
+            self.stream.flush()?;
+            self.wbuf.clear();
+        }
+        Ok(())
+    }
+
+    /// Force every op to a synchronous round-trip (disable the deferred
+    /// pipeline). Used by the driver shim: it shares one guest program-order
+    /// stream with the runtime shim's connection, and two independently
+    /// flushed deferred queues would let the host execute their work out of
+    /// program order (fatal once CUDA-graph capture records the misorder).
+    pub fn set_defer_enabled(&mut self, on: bool) {
+        self.defer_enabled = on;
+    }
+
+    /// Settle all fire-and-forget work with a single fence round-trip: quiet
+    /// requests produce no per-op responses (each response read costs a guest
+    /// wake-up on vsock), so one fence reply carries the first failure among
+    /// them.
+    pub fn drain(&mut self) -> Result<()> {
+        if self.ring.is_some() {
+            if self.deferred == 0 {
+                return Ok(());
+            }
+            self.deferred = 0;
+            let resp = self.ring_roundtrip(&[crate::proto::FENCE_OP])?;
+            if resp.len() >= 4 {
+                let status = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                if status != 0 && self.sticky == 0 {
+                    self.sticky = status;
+                }
+            }
+            return Ok(());
+        }
+        if let Some(b) = self.bridge {
+            let st = unsafe { (b.drain)() };
+            if st != 0 && self.sticky == 0 {
+                self.sticky = st;
+            }
+            return Ok(());
+        }
+        if self.deferred == 0 {
+            return self.flush_wbuf();
+        }
+        self.deferred = 0;
+        self.wbuf.extend_from_slice(&1u32.to_le_bytes());
+        self.wbuf.push(crate::proto::FENCE_OP);
+        self.flush_wbuf()?;
+        let payload =
+            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-fence"))?;
+        if payload.len() >= 4 {
+            let status = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            if status != 0 && self.sticky == 0 {
+                if std::env::var_os("SMOLVM_CUDA_TRACE_STICKY").is_some() {
+                    eprintln!("[sticky] fence collected {status}");
+                }
+                self.sticky = status;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take (and clear) the sticky asynchronous error, if any. Non-blocking:
+    /// reports failures already collected by a past drain, the way
+    /// `cudaGetLastError` reports asynchronous errors observed so far.
+    pub fn take_sticky(&mut self) -> i32 {
+        std::mem::take(&mut self.sticky)
+    }
+
+    /// Send `req` without waiting for its (status-only) response. Ordering is
+    /// preserved — the host serves one request at a time in arrival order — so
+    /// the deferred work is complete by the time any later round-trip returns.
+    /// Fails fast if an earlier deferred op already failed (sticky).
+    fn call_deferred(&mut self, req: &Request, op: Op) -> Result<()> {
+        self.call_deferred_kind(req, op, false)
+    }
+
+    fn call_deferred_kind(&mut self, req: &Request, op: Op, _is_libcall: bool) -> Result<()> {
+        if !self.defer_enabled || sync_forced(req, op) {
+            return self.call(req, op).map(|_| ());
+        }
+        if let Some(b) = self.bridge {
+            // Push into the owning connection's pipeline NOW — buffering here
+            // would re-create the two-queue reorder the bridge exists to kill.
+            if self.sticky != 0 {
+                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+            }
+            let payload = encode_request(req);
+            let rc = unsafe { (b.quiet)(payload.as_ptr(), payload.len()) };
+            if rc != 0 {
+                return Err(CudaRpcError::Cuda(rc));
+            }
+            return Ok(());
+        }
+        if self.ring.is_some() {
+            if self.deferred >= MAX_DEFERRED {
+                self.drain()?;
+            }
+            if self.sticky != 0 {
+                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+            }
+            let payload = encode_request(req);
+            if payload.len() < crate::ring::INLINE_MAX {
+                let mut frame = Vec::with_capacity(payload.len() + 1);
+                frame.push(crate::proto::QUIET_PREFIX);
+                frame.extend_from_slice(&payload);
+                self.ring_push(&frame)?;
+                self.deferred += 1;
+            } else {
+                // Oversized quiet frames go indirect, which needs the staging
+                // buffer alive until consumption — round-trip instead and
+                // fold a failure into the sticky slot.
+                let resp = self.ring_roundtrip(&payload)?;
+                if resp.len() >= 4 {
+                    let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                    if st != 0 && self.sticky == 0 {
+                        self.sticky = st;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if self.deferred >= MAX_DEFERRED {
+            self.drain()?;
+        }
+        if self.sticky != 0 {
+            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+        }
+        // Frame into the batch buffer as a QUIET request (no response) — one
+        // write syscall per sync point (or per WBUF_FLUSH bytes), and one
+        // fence reply per drain instead of one reply per request.
+        let payload = encode_request(req);
+        self.wbuf
+            .extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        self.wbuf.push(crate::proto::QUIET_PREFIX);
+        self.wbuf.extend_from_slice(&payload);
+        self.deferred += 1;
+        if self.wbuf.len() >= WBUF_FLUSH {
+            self.flush_wbuf()?;
+        }
+        Ok(())
+    }
+
+    /// Fire-and-forget `LibCall` for library functions with no output
+    /// parameters (GEMMs, conv/batch-norm executes, stream setters): the call
+    /// reports optimistic success and a real failure surfaces as a sticky
+    /// asynchronous error, like a failed kernel launch.
+    pub fn lib_call_deferred(&mut self, lib: u8, func: u16, args: Vec<u8>) -> Result<()> {
+        self.call_deferred_kind(&Request::LibCall { lib, func, args }, Op::LibCall, true)
     }
 
     fn call(&mut self, req: &Request, op: Op) -> Result<Response> {
-        write_msg(&mut self.stream, &encode_request(req))?;
-        let payload =
-            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
+        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
+            count_sync(req, op);
+        }
+        let payload = if self.ring.is_some() {
+            self.ring_roundtrip(&encode_request(req))?
+        } else if let Some(b) = self.bridge {
+            bridge_call_vec(&b, &encode_request(req))?
+        } else {
+            // Flush, don't fence: the host serves in arrival order, so this
+            // request's response already proves every deferred request before
+            // it was consumed. A fence here would double the RTT of every
+            // sync op under deferred load just to surface quiet failures a
+            // little earlier — they still surface at explicit sync points
+            // (drain) and the MAX_DEFERRED backstop.
+            self.flush_wbuf()?;
+            write_msg(&mut self.stream, &encode_request(req))?;
+            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?
+        };
         let (status, resp) = decode_response(op, &payload)?;
         if status != 0 {
             return Err(CudaRpcError::Cuda(status));
         }
         Ok(resp)
+    }
+
+    /// Serve a bridged peer: append one pre-encoded request to this
+    /// connection's deferred pipeline, preserving arrival order. In strict
+    /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
+    /// failure status is collected as this connection's sticky error.
+    pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
+        if self.ring.is_some() && self.defer_enabled {
+            if self.deferred >= MAX_DEFERRED {
+                self.drain()?;
+            }
+            if self.sticky != 0 {
+                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+            }
+            if payload.len() < crate::ring::INLINE_MAX {
+                let mut frame = Vec::with_capacity(payload.len() + 1);
+                frame.push(crate::proto::QUIET_PREFIX);
+                frame.extend_from_slice(payload);
+                self.ring_push(&frame)?;
+                self.deferred += 1;
+            } else {
+                let resp = self.ring_roundtrip(payload)?;
+                if resp.len() >= 4 {
+                    let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                    if st != 0 && self.sticky == 0 {
+                        self.sticky = st;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if !self.defer_enabled {
+            let resp = self.raw_call(payload)?;
+            if resp.len() >= 4 {
+                let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                if st != 0 && self.sticky == 0 {
+                    self.sticky = st;
+                }
+            }
+            return Ok(());
+        }
+        if self.deferred >= MAX_DEFERRED {
+            self.drain()?;
+        }
+        if self.sticky != 0 {
+            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+        }
+        self.wbuf
+            .extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        self.wbuf.push(crate::proto::QUIET_PREFIX);
+        self.wbuf.extend_from_slice(payload);
+        self.deferred += 1;
+        if self.wbuf.len() >= WBUF_FLUSH {
+            self.flush_wbuf()?;
+        }
+        Ok(())
+    }
+
+    /// Serve a bridged peer: one pre-encoded synchronous round-trip. Returns
+    /// the raw response payload — the status stays in-band for the peer to
+    /// decode, so nothing is lost to error mapping.
+    pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.ring.is_some() {
+            return self.ring_roundtrip(payload);
+        }
+        // Flush, don't fence — see `call`.
+        self.flush_wbuf()?;
+        write_msg(&mut self.stream, payload)?;
+        read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
     }
 
     pub fn init(&mut self) -> Result<()> {
@@ -127,23 +708,32 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn mem_free(&mut self, dptr: u64) -> Result<()> {
-        self.call(&Request::MemFree { dptr }, Op::MemFree)
-            .map(|_| ())
+        // Deferred: status-only, and callers ignore free failures anyway.
+        self.call_deferred(&Request::MemFree { dptr }, Op::MemFree)
     }
 
-    pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> Result<()> {
-        self.call(
+    pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> Result<()> {
+        // Deferred: the bytes are copied into the request, so the caller may
+        // reuse its buffer immediately — synchronous-memcpy semantics hold.
+        self.call_deferred(
             &Request::MemcpyHtoD {
                 dptr,
+                stream,
                 data: data.to_vec(),
             },
             Op::MemcpyHtoD,
         )
-        .map(|_| ())
     }
 
-    pub fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> Result<Vec<u8>> {
-        match self.call(&Request::MemcpyDtoH { dptr, bytes }, Op::MemcpyDtoH)? {
+    pub fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> Result<Vec<u8>> {
+        match self.call(
+            &Request::MemcpyDtoH {
+                dptr,
+                bytes,
+                stream,
+            },
+            Op::MemcpyDtoH,
+        )? {
             Response::Data(d) => Ok(d),
             _ => Err(CudaRpcError::Protocol("expected Data")),
         }
@@ -159,7 +749,10 @@ impl<S: Read + Write> Client<S> {
         stream: u64,
         params: &[Vec<u8>],
     ) -> Result<()> {
-        self.call(
+        // Deferred: kernel launches are asynchronous by CUDA contract; launch
+        // failures surface at the next synchronize (or as a sticky error),
+        // exactly like a real asynchronous launch error.
+        self.call_deferred(
             &Request::LaunchKernel {
                 function,
                 grid,
@@ -170,12 +763,117 @@ impl<S: Read + Write> Client<S> {
             },
             Op::LaunchKernel,
         )
+    }
+
+    /// Exchange the serving thread's stream-capture interaction mode; returns
+    /// the previous mode. Sync: the caller's next op must see the new mode.
+    pub fn thread_exchange_capture_mode(&mut self, mode: i32) -> Result<i32> {
+        match self.call(
+            &Request::ThreadExchangeCaptureMode { mode },
+            Op::ThreadExchangeCaptureMode,
+        )? {
+            Response::Count(old) => Ok(old),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> Result<()> {
+        self.call(
+            &Request::StreamBeginCapture { stream, mode },
+            Op::StreamBeginCapture,
+        )
         .map(|_| ())
     }
 
+    /// Returns the raw `cudaGraph_t` (an opaque host pointer to the guest).
+    pub fn stream_end_capture(&mut self, stream: u64) -> Result<u64> {
+        match self.call(&Request::StreamEndCapture { stream }, Op::StreamEndCapture)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// `(capture_status, capture_id)` straight from the host driver.
+    pub fn stream_capture_info(&mut self, stream: u64) -> Result<(u64, u64)> {
+        match self.call(
+            &Request::StreamCaptureInfo { stream },
+            Op::StreamCaptureInfo,
+        )? {
+            Response::Pair(a, b) => Ok((a, b)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
+    }
+
+    pub fn graph_instantiate(&mut self, graph: u64) -> Result<u64> {
+        match self.call(&Request::GraphInstantiate { graph }, Op::GraphInstantiate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// Replay an instantiated graph — the hot path (one message replays every
+    /// captured kernel), so it pipelines like a kernel launch.
+    pub fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphLaunch { graph_exec, stream },
+            Op::GraphLaunch,
+        )
+    }
+
+    /// Node count of a captured graph (count-only query; PyTorch uses it to
+    /// warn about empty captures).
+    pub fn graph_get_node_count(&mut self, graph: u64) -> Result<u64> {
+        match self.call(&Request::GraphGetNodes { graph }, Op::GraphGetNodes)? {
+            Response::Bytes(n) => Ok(n),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
+    pub fn graph_exec_destroy(&mut self, graph_exec: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphExecDestroy { graph_exec },
+            Op::GraphExecDestroy,
+        )
+    }
+
+    pub fn graph_destroy(&mut self, graph: u64) -> Result<()> {
+        self.call_deferred(&Request::GraphDestroy { graph }, Op::GraphDestroy)
+    }
+
+    /// Stream-ordered memset: capture-safe (recorded into an active graph).
+    pub fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemsetD8Async {
+                dptr,
+                value,
+                bytes,
+                stream,
+            },
+            Op::MemsetD8Async,
+        )
+    }
+
+    /// Stream-ordered device copy: capture-safe.
+    pub fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemcpyDtoDAsync {
+                dst,
+                src,
+                bytes,
+                stream,
+            },
+            Op::MemcpyDtoDAsync,
+        )
+    }
+
     pub fn ctx_synchronize(&mut self) -> Result<()> {
-        self.call(&Request::CtxSynchronize, Op::CtxSynchronize)
-            .map(|_| ())
+        self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
+        // Surface any asynchronous failure collected while draining, the way
+        // cudaDeviceSynchronize reports errors from earlier async work.
+        match self.take_sticky() {
+            0 => Ok(()),
+            code => Err(CudaRpcError::Cuda(code)),
+        }
     }
 
     pub fn driver_get_version(&mut self) -> Result<i32> {
@@ -227,6 +925,20 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
+    /// Set a `CUfunction_attribute` on the host function (round-trip: the caller
+    /// — Triton — checks the status to decide whether the kernel can run).
+    pub fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> Result<()> {
+        self.call(
+            &Request::FuncSetAttribute {
+                function,
+                attrib,
+                value,
+            },
+            Op::FuncSetAttribute,
+        )
+        .map(|_| ())
+    }
+
     pub fn func_get_param_info(&mut self, function: u64) -> Result<Vec<u32>> {
         match self.call(
             &Request::FuncGetParamInfo { function },
@@ -246,8 +958,8 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> Result<()> {
-        self.call(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
-            .map(|_| ())
+        // Deferred: status-only device-side work, same contract as a launch.
+        self.call_deferred(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
     }
 
     /// Returns `(free, total)` device memory in bytes.
@@ -276,6 +988,35 @@ impl<S: Read + Write> Client<S> {
             Op::StreamSynchronize,
         )
         .map(|_| ())
+    }
+
+    /// Raw `cuStreamQuery` code: 0 complete, 600 not ready.
+    pub fn stream_query(&mut self, stream: u64) -> Result<i32> {
+        match self.call(&Request::StreamQuery { stream }, Op::StreamQuery)? {
+            Response::Count(code) => Ok(code),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    /// Deferred like a launch: a stream-ordered dependency edge whose failure
+    /// surfaces at the next fence, exactly like an async launch error.
+    pub fn stream_wait_event(&mut self, stream: u64, event: u64, flags: u32) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamWaitEvent {
+                stream,
+                event,
+                flags,
+            },
+            Op::StreamWaitEvent,
+        )
+    }
+
+    /// Raw `cuEventQuery` code: 0 complete, 600 not ready.
+    pub fn event_query(&mut self, event: u64) -> Result<i32> {
+        match self.call(&Request::EventQuery { event }, Op::EventQuery)? {
+            Response::Count(code) => Ok(code),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
     }
 
     pub fn event_create(&mut self, flags: u32) -> Result<u64> {
@@ -433,19 +1174,98 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Zero-copy H2D via the shared region (data already written at `offset`).
-    pub fn memcpy_shm_htod(&mut self, dptr: u64, offset: u64, size: u64) -> Result<()> {
+    // ---- VMM (torch expandable-segments) — sync control-plane ops ----
+    pub fn mem_address_reserve(&mut self, size: u64, align: u64) -> Result<u64> {
+        match self.call(
+            &Request::MemAddressReserve { size, align },
+            Op::MemAddressReserve,
+        )? {
+            Response::Dptr(va) => Ok(va),
+            _ => Err(CudaRpcError::Protocol("expected Dptr")),
+        }
+    }
+    pub fn mem_create(&mut self, size: u64, device: i32) -> Result<u64> {
+        match self.call(&Request::MemCreate { size, device }, Op::MemCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+    pub fn mem_map(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> Result<()> {
         self.call(
-            &Request::MemcpyShmHtoD { dptr, offset, size },
+            &Request::MemMap {
+                va,
+                size,
+                offset,
+                handle,
+            },
+            Op::MemMap,
+        )
+        .map(|_| ())
+    }
+    pub fn mem_set_access(&mut self, va: u64, size: u64, device: i32) -> Result<()> {
+        self.call(
+            &Request::MemSetAccess { va, size, device },
+            Op::MemSetAccess,
+        )
+        .map(|_| ())
+    }
+    pub fn mem_unmap(&mut self, va: u64, size: u64) -> Result<()> {
+        self.call(&Request::MemUnmap { va, size }, Op::MemUnmap)
+            .map(|_| ())
+    }
+    pub fn mem_release(&mut self, handle: u64) -> Result<()> {
+        self.call(&Request::MemRelease { handle }, Op::MemRelease)
+            .map(|_| ())
+    }
+    pub fn mem_address_free(&mut self, va: u64, size: u64) -> Result<()> {
+        self.call(&Request::MemAddressFree { va, size }, Op::MemAddressFree)
+            .map(|_| ())
+    }
+    pub fn mem_get_allocation_granularity(&mut self, device: i32, flags: u32) -> Result<u64> {
+        match self.call(
+            &Request::MemGetAllocationGranularity { device, flags },
+            Op::MemGetAllocationGranularity,
+        )? {
+            Response::Bytes(g) => Ok(g),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
+    /// Zero-copy H2D via the shared region (data already written at `offset`).
+    pub fn memcpy_shm_htod(
+        &mut self,
+        dptr: u64,
+        offset: u64,
+        size: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.call(
+            &Request::MemcpyShmHtoD {
+                dptr,
+                offset,
+                size,
+                stream,
+            },
             Op::MemcpyShmHtoD,
         )
         .map(|_| ())
     }
 
     /// Zero-copy D2H via the shared region (host writes into `offset`).
-    pub fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64) -> Result<()> {
+    pub fn memcpy_shm_dtoh(
+        &mut self,
+        offset: u64,
+        dptr: u64,
+        size: u64,
+        stream: u64,
+    ) -> Result<()> {
         self.call(
-            &Request::MemcpyShmDtoH { offset, dptr, size },
+            &Request::MemcpyShmDtoH {
+                offset,
+                dptr,
+                size,
+                stream,
+            },
             Op::MemcpyShmDtoH,
         )
         .map(|_| ())
@@ -453,9 +1273,18 @@ impl<S: Read + Write> Client<S> {
 
     /// Zero-copy H2D from guest RAM: the host gathers `segments` (guest-physical)
     /// and DMAs to `dptr`.
-    pub fn memcpy_gpa_htod(&mut self, dptr: u64, segments: Vec<(u64, u64)>) -> Result<()> {
+    pub fn memcpy_gpa_htod(
+        &mut self,
+        dptr: u64,
+        segments: Vec<(u64, u64)>,
+        stream: u64,
+    ) -> Result<()> {
         self.call(
-            &Request::MemcpyGpaHtoD { dptr, segments },
+            &Request::MemcpyGpaHtoD {
+                dptr,
+                stream,
+                segments,
+            },
             Op::MemcpyGpaHtoD,
         )
         .map(|_| ())
@@ -463,11 +1292,119 @@ impl<S: Read + Write> Client<S> {
 
     /// Zero-copy D2H to guest RAM: the host DMAs from `dptr` and scatters into
     /// `segments` (guest-physical).
-    pub fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: Vec<(u64, u64)>) -> Result<()> {
+    pub fn memcpy_gpa_dtoh(
+        &mut self,
+        dptr: u64,
+        segments: Vec<(u64, u64)>,
+        stream: u64,
+    ) -> Result<()> {
         self.call(
-            &Request::MemcpyGpaDtoH { dptr, segments },
+            &Request::MemcpyGpaDtoH {
+                dptr,
+                stream,
+                segments,
+            },
             Op::MemcpyGpaDtoH,
         )
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::QUIET_PREFIX;
+    use std::sync::Mutex;
+
+    /// What the fake bridge callee observed / will serve.
+    static QUIET_LOG: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    static PENDING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    static RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn fake_quiet(req: *const u8, len: usize) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(req, len) }.to_vec();
+        QUIET_LOG.lock().unwrap().push(bytes);
+        0
+    }
+    unsafe extern "C" fn fake_call(
+        req: *const u8,
+        _len: usize,
+        resp: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let payload = if req.is_null() {
+            PENDING.lock().unwrap().take().expect("no stashed response")
+        } else {
+            RESPONSE.lock().unwrap().clone()
+        };
+        if payload.len() > cap {
+            let n = payload.len() as isize;
+            *PENDING.lock().unwrap() = Some(payload);
+            return -n;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), resp, payload.len()) };
+        payload.len() as isize
+    }
+    unsafe extern "C" fn fake_drain() -> i32 {
+        7 // pretend a quiet failure was collected
+    }
+
+    fn bridge() -> Bridge {
+        Bridge {
+            quiet: fake_quiet,
+            call: fake_call,
+            drain: fake_drain,
+        }
+    }
+
+    /// io::Empty satisfies Client<S>'s bounds; a bridged client never touches it.
+    fn client() -> Client<std::io::Cursor<Vec<u8>>> {
+        Client::new_bridged(std::io::Cursor::new(Vec::new()), bridge())
+    }
+
+    #[test]
+    fn bridged_deferred_ops_push_immediately() {
+        QUIET_LOG.lock().unwrap().clear();
+        let mut c = client();
+        c.set_defer_enabled(true);
+        c.mem_free(0xAB).unwrap();
+        let log = QUIET_LOG.lock().unwrap();
+        assert_eq!(log.len(), 1, "quiet op must reach the bridge at call time");
+        assert_eq!(log[0], encode_request(&Request::MemFree { dptr: 0xAB }));
+    }
+
+    #[test]
+    fn bridged_call_retries_oversized_response() {
+        // Encoded Count response for DeviceGetCount, padded past the caller's
+        // first 4 KiB buffer to force the stash-and-retry path.
+        let mut resp = 0i32.to_le_bytes().to_vec(); // status 0
+        resp.extend_from_slice(&3i32.to_le_bytes()); // count 3
+        resp.resize(8192, 0);
+        *RESPONSE.lock().unwrap() = resp;
+        let mut c = client();
+        assert_eq!(c.device_get_count().unwrap(), 3);
+        assert!(PENDING.lock().unwrap().is_none(), "stash must be consumed");
+    }
+
+    #[test]
+    fn bridged_drain_collects_sticky() {
+        let mut c = client();
+        c.drain().unwrap();
+        assert_eq!(c.take_sticky(), 7);
+    }
+
+    #[test]
+    fn raw_quiet_frames_like_call_deferred() {
+        // Serving side: raw_quiet must produce the same wire framing as a
+        // native deferred call, so bridged traffic is indistinguishable.
+        let mut direct: Client<std::io::Cursor<Vec<u8>>> =
+            Client::new(std::io::Cursor::new(Vec::new()));
+        direct.set_defer_enabled(true);
+        let payload = encode_request(&Request::MemFree { dptr: 0xCD });
+        direct.raw_quiet(&payload).unwrap();
+        let mut expect = ((payload.len() + 1) as u32).to_le_bytes().to_vec();
+        expect.push(QUIET_PREFIX);
+        expect.extend_from_slice(&payload);
+        assert_eq!(direct.wbuf, expect);
     }
 }

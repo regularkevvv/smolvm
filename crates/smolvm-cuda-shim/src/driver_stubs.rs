@@ -174,10 +174,6 @@ pub extern "C" fn cuCtxGetId() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuCtxGetLimit() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuCtxGetSharedMemConfig() -> c_int {
     801
 }
@@ -207,10 +203,6 @@ pub extern "C" fn cuCtxSetCacheConfig() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuCtxSetFlags() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuCtxSetLimit() -> c_int {
     801
 }
 #[no_mangle]
@@ -443,10 +435,6 @@ pub extern "C" fn cuFuncLoad() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuFuncSetBlockShape() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuFuncSetCacheConfig() -> c_int {
     801
 }
 #[no_mangle]
@@ -1110,14 +1098,6 @@ pub extern "C" fn cuLaunchHostFunc_v2_ptsz() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuLaunchKernelEx() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuLaunchKernelEx_ptsz() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuLaunchKernel_ptsz() -> c_int {
     801
 }
@@ -1247,14 +1227,6 @@ pub extern "C" fn cuLogsRegisterCallback() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuLogsUnregisterCallback() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuMemAddressFree() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuMemAddressReserve() -> c_int {
     801
 }
 #[no_mangle]
@@ -1602,10 +1574,6 @@ pub extern "C" fn cuMemcpyWithAttributesAsync_ptsz() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuMemCreate() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuMemDiscardAndPrefetchBatchAsync() -> c_int {
     801
 }
@@ -1651,10 +1619,6 @@ pub extern "C" fn cuMemGetAddressRange() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuMemGetAddressRange_v2() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuMemGetAllocationGranularity() -> c_int {
     801
 }
 #[no_mangle]
@@ -1715,10 +1679,6 @@ pub extern "C" fn cuMemHostUnregister() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuMemImportFromShareableHandle() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuMemMap() -> c_int {
     801
 }
 #[no_mangle]
@@ -1806,15 +1766,7 @@ pub extern "C" fn cuMemRangeGetAttributes() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuMemRelease() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuMemRetainAllocationHandle() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuMemSetAccess() -> c_int {
     801
 }
 #[no_mangle]
@@ -1938,10 +1890,6 @@ pub extern "C" fn cuMemSetMemPool() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuMemUnmap() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuMipmappedArrayCreate() -> c_int {
     801
 }
@@ -2026,10 +1974,6 @@ pub extern "C" fn cuOccupancyAvailableDynamicSMemPerBlock() -> c_int {
     801
 }
 #[no_mangle]
-pub extern "C" fn cuOccupancyMaxActiveClusters() -> c_int {
-    801
-}
-#[no_mangle]
 pub extern "C" fn cuOccupancyMaxPotentialBlockSize() -> c_int {
     801
 }
@@ -2059,14 +2003,6 @@ pub extern "C" fn cuParamSetTexRef() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuParamSetv() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuPointerGetAttribute() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuPointerGetAttributes() -> c_int {
     801
 }
 #[no_mangle]
@@ -2171,10 +2107,6 @@ pub extern "C" fn cuStreamCopyAttributes() -> c_int {
 }
 #[no_mangle]
 pub extern "C" fn cuStreamCopyAttributes_ptsz() -> c_int {
-    801
-}
-#[no_mangle]
-pub extern "C" fn cuStreamCreateWithPriority() -> c_int {
     801
 }
 #[no_mangle]
