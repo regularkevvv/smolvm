@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "libc",
  "libloading",
@@ -2373,11 +2373,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.3.1"
+version = "1.5.0"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -2393,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
