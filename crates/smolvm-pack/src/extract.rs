@@ -1787,6 +1787,58 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     Ok(Some(lib_dir))
 }
 
+/// Copy `src` to `dst` while preserving holes (sparseness), regardless of the
+/// platform or filesystem.
+///
+/// `std::fs::copy` is *not* reliably hole-preserving. On Linux it prefers
+/// `copy_file_range`/`sendfile`, but those fall back to a dense byte-for-byte
+/// copy when the source and destination live on different mounts or on a
+/// filesystem where the accelerated path isn't available — both common in CI
+/// containers and under overlayfs. When that happens, a multi-GiB sparse
+/// template (e.g. the 20 GiB `storage-template.ext4`, only ~25 MiB of which is
+/// real data) is rehydrated into its full logical size of literal zeros on
+/// disk, so two extractions can exhaust the runner and fail with ENOSPC.
+///
+/// This copy creates the destination as a sparse skeleton (`set_len` to the
+/// source's logical size) and then writes only the chunks that contain non-zero
+/// bytes, leaving every zero run as a hole. It mirrors the write-side
+/// `assets::sparse_copy_overlay`, so behavior is consistent on both ends and on
+/// APFS/ext4/xfs/NTFS alike. Reading over holes costs no disk I/O (the kernel
+/// serves zero pages from cache), so scanning even a mostly-empty 20 GiB
+/// template is fast.
+fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut src_file = File::open(src)?;
+    let size = src_file.metadata()?.len();
+
+    let mut dst_file = File::create(dst)?;
+    // On Windows/NTFS a fresh file is dense: set_len-ing to a large size and then
+    // writing chunks at high offsets would allocate the whole gap. Mark it sparse
+    // first. Unix filesystems are sparse by default.
+    #[cfg(windows)]
+    mark_file_sparse(&dst_file)?;
+    dst_file.set_len(size)?;
+
+    // Forward pass: read in 512 KiB chunks, writing only chunks that contain a
+    // non-zero byte. Zero chunks are skipped, so they stay as holes in `dst`.
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut offset: u64 = 0;
+    while offset < size {
+        let to_read = (size - offset).min(buf.len() as u64) as usize;
+        let n = src_file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            dst_file.seek(SeekFrom::Start(offset))?;
+            dst_file.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+
+    Ok(())
+}
+
 /// Create a storage disk file (empty sparse file).
 pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
     let file = File::create(path)?;
@@ -1829,7 +1881,9 @@ pub fn copy_overlay_template(
         ));
     }
 
-    fs::copy(&src, dest)?;
+    // Hole-preserving copy: fs::copy can densify a sparse template on some
+    // Linux filesystems/mounts, ballooning the overlay to its full logical size.
+    sparse_copy(&src, dest)?;
 
     // Determine target size: max of the copied size, overlay_logical_size
     // (original sparse extent before trailing-hole truncation), and
@@ -1849,8 +1903,8 @@ pub fn copy_overlay_template(
 
     if target > copied_size {
         let file = fs::OpenOptions::new().write(true).open(dest)?;
-        // fs::copy created a dense file on Windows/NTFS; extending it with
-        // set_len would allocate every byte of the gap. Mark it sparse first.
+        // On Windows/NTFS, extending with set_len would allocate every byte of
+        // the gap unless the file is sparse. Mark it sparse first (idempotent).
         #[cfg(windows)]
         mark_file_sparse(&file)?;
         file.set_len(target)?;
@@ -1875,7 +1929,11 @@ pub fn create_or_copy_storage_disk(
     if let Some(template) = template_path {
         let template_path = resolve_cache_asset_path(cache_dir, template, "storage template")?;
         if template_path.exists() {
-            fs::copy(&template_path, storage_path)?;
+            // Hole-preserving copy: a plain fs::copy densifies the (mostly-empty)
+            // multi-GiB storage template on some Linux filesystems/mounts,
+            // turning ~25 MiB of real data into its full logical size of zeros on
+            // disk and risking ENOSPC when several extractions run.
+            sparse_copy(&template_path, storage_path)?;
             // If a custom size was requested and it's larger than the template,
             // extend the sparse file (resize2fs in the agent will expand the FS).
             if let Some(gb) = size_gb_override {
@@ -1883,8 +1941,9 @@ pub fn create_or_copy_storage_disk(
                 let current = fs::metadata(storage_path)?.len();
                 if desired > current {
                     let file = fs::OpenOptions::new().write(true).open(storage_path)?;
-                    // fs::copy created a dense file on Windows/NTFS; extending it
-                    // with set_len would allocate the whole gap. Mark sparse first.
+                    // On Windows/NTFS, extending with set_len would allocate the
+                    // whole gap unless the file is sparse. Mark sparse first
+                    // (idempotent).
                     #[cfg(windows)]
                     mark_file_sparse(&file)?;
                     file.set_len(desired)?;
@@ -2391,6 +2450,40 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_or_copy_storage_disk_preserves_sparseness() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Build a sparse template: a small run of real data at the front, then a
+        // large trailing hole (the shape of the real storage-template.ext4).
+        let cache_dir = tempfile::tempdir().unwrap();
+        let template = cache_dir.path().join("storage-template.ext4");
+        {
+            let mut f = File::create(&template).unwrap();
+            // A few real (non-zero) bytes at the front...
+            f.write_all(b"real ext4 superblock stand-in").unwrap();
+            // ...then 1 GiB logical size, so the rest is a trailing hole.
+            f.set_len(1024 * 1024 * 1024).unwrap();
+        }
+
+        let dest = cache_dir.path().join("storage.ext4");
+        create_or_copy_storage_disk(cache_dir.path(), Some("storage-template.ext4"), &dest, None)
+            .unwrap();
+
+        let meta = fs::metadata(&dest).unwrap();
+        // Logical size is preserved...
+        assert_eq!(meta.len(), 1024 * 1024 * 1024);
+        // ...but the destination must NOT be densified: allocated blocks
+        // (512-byte units) should be a tiny fraction of the logical size. A
+        // dense copy would report ~2M blocks (1 GiB); a sparse one only a few.
+        let allocated_bytes = meta.blocks() * 512;
+        assert!(
+            allocated_bytes < 16 * 1024 * 1024,
+            "storage disk was densified: {allocated_bytes} bytes allocated for a sparse template"
+        );
     }
 
     #[test]
