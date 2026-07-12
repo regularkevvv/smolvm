@@ -116,6 +116,27 @@ fn sync_forced(req: &Request, op: Op) -> bool {
     false
 }
 
+/// Bench/diagnostic: `SMOLVM_CUDA_RTT_DELAY_US` sleeps this many microseconds
+/// per host round-trip, modeling a remote server's network RTT. Batched
+/// deferred work pays it once per fence (as a real network would), so the
+/// resulting throughput-vs-latency curve shows how tolerant each mode is of
+/// distance. Read once (env lookups aren't free on the hot path).
+fn rtt_tax() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static US: AtomicI64 = AtomicI64::new(-1);
+    let mut v = US.load(Ordering::Relaxed);
+    if v == -1 {
+        v = std::env::var("SMOLVM_CUDA_RTT_DELAY_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        US.store(v, Ordering::Relaxed);
+    }
+    if v > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(v as u64));
+    }
+}
+
 /// Round-trip one encoded request over a [`Bridge`], growing the response
 /// buffer when the callee reports it too small (the callee stashes the
 /// response; an empty request fetches the stash).
@@ -385,6 +406,7 @@ impl<S: Read + Write> Client<S> {
     /// One sync round-trip over the rings.
     fn ring_roundtrip(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         self.ring_push(frame)?;
+        rtt_tax();
         self.ring_pop_response()
     }
 
@@ -440,6 +462,7 @@ impl<S: Read + Write> Client<S> {
         self.wbuf.extend_from_slice(&1u32.to_le_bytes());
         self.wbuf.push(crate::proto::FENCE_OP);
         self.flush_wbuf()?;
+        rtt_tax();
         let payload =
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-fence"))?;
         if payload.len() >= 4 {
@@ -560,6 +583,7 @@ impl<S: Read + Write> Client<S> {
             // (drain) and the MAX_DEFERRED backstop.
             self.flush_wbuf()?;
             write_msg(&mut self.stream, &encode_request(req))?;
+            rtt_tax();
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?
         };
         let (status, resp) = decode_response(op, &payload)?;
@@ -635,6 +659,7 @@ impl<S: Read + Write> Client<S> {
         // Flush, don't fence — see `call`.
         self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;
+        rtt_tax();
         read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
     }
 
