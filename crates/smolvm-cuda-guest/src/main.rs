@@ -43,7 +43,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("connect vsock {HOST_CID}:{CUDA_PORT}: {e}"))?;
     let mut cu = Client::new(stream);
 
-    cu.init()?;
+    // Cross-VM device-memory sharing probe (validates the shared-daemon model):
+    //  writer — retain the primary context, allocate a buffer, write a known
+    //           pattern, print its device pointer, then hold the connection open.
+    //  reader — retain the same primary context (shared daemon → same GPU
+    //           context) and read the writer's pointer back.
+    match std::env::var("SMOLVM_CUDA_TEST").as_deref() {
+        Ok("writer") => return run_writer(&mut cu),
+        Ok("reader") => return run_reader(&mut cu),
+        Ok("loop") => {
+            drop(cu);
+            return run_loop();
+        }
+        _ => {}
+    }
+
+    cu.init(0)?;
     let count = cu.device_get_count()?;
     if count < 1 {
         return Err("no CUDA devices reported by host".into());
@@ -101,6 +116,153 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         c[n - 1]
     );
     println!("SMOLVM-CUDA-OK");
+    Ok(())
+}
+
+/// The shared pattern the writer stores and the reader verifies.
+#[cfg(target_os = "linux")]
+const PROBE_PATTERN: [f32; 4] = [3.14, 2.71, 1.41, 1.61];
+
+#[cfg(target_os = "linux")]
+type VClient = smolvm_cuda::client::Client<vsock::VsockStream>;
+
+/// Open a fresh vsock connection to the CUDA host, run the handshake resuming
+/// `resume_token` (0 first time), and retain the primary context. A short
+/// socket timeout makes a severed connection surface as an error instead of
+/// hanging — the signal a fork clone uses to reconnect (its pid is unchanged
+/// across the VM snapshot, so pid-based detection can't fire).
+#[cfg(target_os = "linux")]
+fn connect_cuda(resume_token: u64) -> Result<(VClient, u64), Box<dyn std::error::Error>> {
+    use vsock::VsockStream;
+    let stream = VsockStream::connect_with_cid_port(HOST_CID, CUDA_PORT)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    let mut cu = VClient::new(stream);
+    let token = cu.init(resume_token)?;
+    cu.primary_ctx_retain(0)?;
+    Ok((cu, token))
+}
+
+/// Long-lived probe for the VM-fork path: allocate a buffer with a known
+/// pattern, then loop reading it back. On a transport error (the clone's
+/// inherited connection is dead after the fork), reconnect — resuming the
+/// parent session's token — and keep reading. Because every VM shares the
+/// daemon's one GPU context, the reconnected clone reads the SAME device
+/// pointer the parent allocated. Ticks are appended to `SMOLVM_CUDA_OUT` with a
+/// per-boot tag so the host can see the golden vs. the clone.
+#[cfg(target_os = "linux")]
+fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let out = std::env::var("SMOLVM_CUDA_OUT").unwrap_or_else(|_| "/dev/stderr".into());
+    let tag = std::fs::read_to_string("/etc/machine-id")
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let mut append = |line: String| {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&out) {
+            let _ = writeln!(f, "{line}");
+        }
+    };
+
+    let (mut cu, mut token) = connect_cuda(0)?;
+    let dptr = cu.mem_alloc(16)?;
+    cu.memcpy_htod(dptr, as_bytes(&PROBE_PATTERN), 0)?;
+    cu.ctx_synchronize()?;
+    append(format!("BOOT tag={tag} dptr=0x{dptr:x} token={token}"));
+
+    for tick in 0.. {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        match cu.memcpy_dtoh(dptr, 16, 0) {
+            Ok(bytes) => {
+                let v: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                    .collect();
+                let ok = v
+                    .iter()
+                    .zip(PROBE_PATTERN.iter())
+                    .all(|(g, e)| (g - e).abs() < 1e-3);
+                append(format!("TICK tag={tag} n={tick} t={now} ok={ok} v={v:?}"));
+            }
+            Err(e) => {
+                append(format!("SEVERED tag={tag} n={tick} t={now} err={e}"));
+                match connect_cuda(token) {
+                    Ok((c, t)) => {
+                        cu = c;
+                        token = t;
+                        let t2 = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        append(format!("RECONNECT tag={tag} n={tick} t={t2} token={token}"));
+                    }
+                    Err(e2) => append(format!("RECONNECT-FAIL tag={tag} n={tick} err={e2}")),
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_writer(
+    cu: &mut smolvm_cuda::client::Client<vsock::VsockStream>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cu.init(0)?;
+    cu.primary_ctx_retain(0)?;
+    let dptr = cu.mem_alloc(16)?;
+    cu.memcpy_htod(dptr, as_bytes(&PROBE_PATTERN), 0)?;
+    cu.ctx_synchronize()?;
+    // The device pointer is a raw GPU address, valid in the daemon's shared
+    // context for any other VM's connection.
+    println!("DPTR=0x{dptr:x}");
+    println!("WRITER-READY");
+    // stdout is block-buffered when piped through the VM console; flush so the
+    // orchestrator sees the pointer before we block holding the connection.
+    std::io::Write::flush(&mut std::io::stdout())?;
+    // Robust side channel: also publish the pointer to a writable mount so the
+    // host can read it without depending on live console relay.
+    if let Ok(path) = std::env::var("SMOLVM_CUDA_OUT") {
+        std::fs::write(&path, format!("0x{dptr:x}\n"))?;
+    }
+    // Hold the connection (and thus the primary-context retain + allocation)
+    // while a second VM reads it.
+    std::thread::sleep(std::time::Duration::from_secs(180));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_reader(
+    cu: &mut smolvm_cuda::client::Client<vsock::VsockStream>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cu.init(0)?;
+    cu.primary_ctx_retain(0)?;
+    let ptr_env = std::env::var("SMOLVM_CUDA_PTR")?;
+    let dptr = u64::from_str_radix(ptr_env.trim().trim_start_matches("0x"), 16)?;
+    let out = cu.memcpy_dtoh(dptr, 16, 0)?;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .collect();
+    let ok = got
+        .iter()
+        .zip(PROBE_PATTERN.iter())
+        .all(|(g, e)| (g - e).abs() < 1e-3);
+    println!("READER read {got:?} from 0x{dptr:x} (expect {PROBE_PATTERN:?})");
+    println!(
+        "{}",
+        if ok {
+            "CROSS-VM-SHARED-OK"
+        } else {
+            "CROSS-VM-SHARED-FAIL"
+        }
+    );
     Ok(())
 }
 

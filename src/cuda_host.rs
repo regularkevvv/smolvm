@@ -47,12 +47,28 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
         .name("cuda-host".into())
         .spawn(move || {
             tracing::info!(path = path_display, "CUDA host server listening");
+            // Shared-daemon mode: when SMOLVM_CUDA_DAEMON=<host:port> is set, relay
+            // every guest connection to one external CUDA daemon instead of
+            // serving it in-process. All VMs then share that daemon's single GPU
+            // context — the prerequisite for a forked clone to reuse a golden
+            // VM's device memory (which lives in the daemon, not per-VM).
+            let daemon = std::env::var("SMOLVM_CUDA_DAEMON").ok();
+            if let Some(ref addr) = daemon {
+                tracing::info!(daemon = %addr, "cuda-host: shared-daemon proxy mode");
+            }
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        let daemon = daemon.clone();
                         thread::Builder::new()
                             .name("cuda-host-conn".into())
                             .spawn(move || {
+                                if let Some(addr) = daemon {
+                                    if let Err(e) = proxy_to_daemon(stream, &addr) {
+                                        tracing::debug!(error = %e, "CUDA daemon proxy ended");
+                                    }
+                                    return;
+                                }
                                 let mut backend = make_backend();
                                 if let Err(e) = serve(stream, backend.as_mut()) {
                                     tracing::debug!(error = %e, "CUDA host connection ended");
@@ -67,6 +83,26 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             }
         })?;
 
+    Ok(())
+}
+
+/// Relay one guest connection to the shared CUDA daemon at `addr` (a byte pump
+/// in both directions — the RPC is end-to-end between the guest shim and the
+/// daemon, so smolvm only forwards frames). This is the minimal form of the
+/// shared-host-daemon architecture: every VM's traffic lands in one process, so
+/// they share a single GPU context and device memory.
+fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
+    let daemon = std::net::TcpStream::connect(addr)?;
+    let _ = daemon.set_nodelay(true);
+    let mut guest_rd = guest.try_clone()?;
+    let mut daemon_wr = daemon.try_clone()?;
+    let up = thread::spawn(move || {
+        let _ = std::io::copy(&mut guest_rd, &mut daemon_wr);
+    });
+    let mut daemon_rd = daemon;
+    let mut guest_wr = guest;
+    let _ = std::io::copy(&mut daemon_rd, &mut guest_wr);
+    let _ = up.join();
     Ok(())
 }
 

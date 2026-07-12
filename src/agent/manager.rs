@@ -1686,6 +1686,11 @@ impl AgentManager {
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
             }
+            // Shared CUDA daemon: forward so this VM's embedded host proxies to
+            // the one daemon (shared GPU context across VMs / fork clones).
+            if let Ok(daemon) = std::env::var("SMOLVM_CUDA_DAEMON") {
+                v.push(("SMOLVM_CUDA_DAEMON", daemon));
+            }
             v
         };
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
