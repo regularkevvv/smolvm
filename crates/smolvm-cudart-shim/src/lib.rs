@@ -1963,6 +1963,15 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
     // binaryVersion (i32 @ 24/28/32/36). Forward the real values — the old
     // fixed fakes (numRegs=0) divided by zero in occupancy math.
     unsafe { std::ptr::write_bytes(attr as *mut u8, 0, 72) };
+    // Kernel attributes are immutable — memoize the packed 72-byte blob per
+    // function (torch may query per-launch; each miss is 7 host round-trips).
+    static FUNC_ATTRS: Mutex<Option<HashMap<usize, [u8; 72]>>> = Mutex::new(None);
+    if let Ok(mut g) = FUNC_ATTRS.lock() {
+        if let Some(blob) = g.get_or_insert_with(HashMap::new).get(&(func as usize)) {
+            unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), attr as *mut u8, 72) };
+            return set_last(CUDA_SUCCESS);
+        }
+    }
     // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
     // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
     let r = with_state(|s| {
@@ -1992,6 +2001,14 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
         }
         Ok(())
     });
+    if r.is_ok() {
+        if let Ok(mut g) = FUNC_ATTRS.lock() {
+            let mut blob = [0u8; 72];
+            unsafe { std::ptr::copy_nonoverlapping(attr as *const u8, blob.as_mut_ptr(), 72) };
+            g.get_or_insert_with(HashMap::new)
+                .insert(func as usize, blob);
+        }
+    }
     set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 /// Forward the shared-memory opt-in (`cudaFuncAttributeMaxDynamicSharedMemorySize`
