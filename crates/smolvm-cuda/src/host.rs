@@ -692,6 +692,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
         }
     }
+    // Modules and functions are raw host handles on the wire (like streams):
+    // the real CUmodule/CUfunction is context-scoped and every connection
+    // retains the same device primary context, so a handle minted on one
+    // connection stays valid on another (this is what lets a forked VM clone
+    // reconnect and keep using its parent's loaded modules). The tables only
+    // translate ids minted by pre-raw guests; a raw value passes through.
+    fn raw_module(sess: &Session, m: u64) -> u64 {
+        sess.modules.get(&m).copied().unwrap_or(m)
+    }
+    fn raw_fn_h(sess: &Session, f: u64) -> u64 {
+        sess.functions.get(&f).copied().unwrap_or(f)
+    }
     fn raw_graph(sess: &Session, h: u64) -> u64 {
         // Virtual graph/exec handle → real; untagged values pass through.
         if h & VHANDLE_TAG != 0 {
@@ -754,28 +766,28 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
+            // Return the raw CUmodule as the wire handle (context-scoped, so it
+            // survives a fork-clone reconnect). Still tracked for reclaim.
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
-            let id = sess.mint();
-            sess.modules.insert(id, raw);
-            Ok(Response::Handle(id))
+            Ok(Response::Handle(raw))
         }
         Request::ModuleGetFunction { module, name } => {
-            let raw_mod = raw(&sess.modules, module)?;
+            let raw_mod = raw_module(sess, module);
+            // Raw CUfunction on the wire: valid across connections in the shared
+            // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
-            let id = sess.mint();
-            sess.functions.insert(id, raw_fn);
-            Ok(Response::Handle(id))
+            Ok(Response::Handle(raw_fn))
         }
         Request::ModuleUnload { module } => {
-            let raw_mod = raw(&sess.modules, module)?;
+            let raw_mod = raw_module(sess, module);
             b.module_unload(raw_mod)?;
             sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
         }
         Request::FuncGetParamInfo { function } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             let sizes = b.func_get_param_info(raw_fn)?;
             let mut out = Vec::with_capacity(sizes.len() * 4);
             for s in sizes {
@@ -788,12 +800,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             attrib,
             value,
         } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
         Request::FuncGetAttribute { function, attrib } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             b.func_get_attribute(raw_fn, attrib).map(Response::Count)
         }
         Request::MemAlloc { bytes } => {
@@ -841,7 +853,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             stream,
             params,
         } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             let raw_str = raw_stream(sess, stream)?;
             b.launch_kernel(raw_fn, grid, block, shared_bytes, raw_str, &params)
                 .map(|_| Response::Ok)
@@ -1862,6 +1874,61 @@ mod tests {
         let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 4 });
         assert_eq!(st, 0);
         std::env::remove_var("SMOLVM_CUDA_VRAM_LIMIT_MB");
+    }
+    // Modules and functions are raw host handles on the wire, so a handle minted
+    // on one connection resolves on another (both retain the same primary
+    // context). This is what lets a forked VM clone reconnect on a fresh session
+    // and keep launching the parent's kernels instead of getting INVALID_HANDLE.
+    #[test]
+    fn function_handle_survives_across_sessions() {
+        let mut backend = CpuBackend::default();
+        // Session A loads a module and resolves a function.
+        let mut sess_a = Session::default();
+        let (st, r) = dispatch(
+            &mut sess_a,
+            &mut backend,
+            Request::ModuleLoadData { image: vec![0u8; 8] },
+        );
+        assert_eq!(st, 0);
+        let module = match r {
+            Response::Handle(h) => h,
+            _ => unreachable!("module load returns a handle"),
+        };
+        let (st, r) = dispatch(
+            &mut sess_a,
+            &mut backend,
+            Request::ModuleGetFunction { module, name: "vecadd".into() },
+        );
+        assert_eq!(st, 0);
+        let function = match r {
+            Response::Handle(h) => h,
+            _ => unreachable!("get-function returns a handle"),
+        };
+        // Session B is a brand-new session (the clone's fresh connection). It
+        // never loaded the module, yet resolving A's function must succeed —
+        // pre-raw-handle code returned INVALID_HANDLE here.
+        let mut sess_b = Session::default();
+        assert!(
+            sess_b.functions.is_empty(),
+            "clone session starts with no local function ids"
+        );
+        let (st, r) = dispatch(
+            &mut sess_b,
+            &mut backend,
+            Request::FuncGetParamInfo { function },
+        );
+        assert_eq!(st, 0, "function from another session must resolve, not fault");
+        match r {
+            Response::Data(d) => assert_eq!(
+                d,
+                [8u32, 8, 8, 4]
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                "resolved the right function's param layout"
+            ),
+            other => panic!("expected param data, got {other:?}"),
+        }
     }
     // The connect handshake rejects a client whose wire fingerprint differs
     // (stale shim/server), so protocol skew fails loudly instead of decoding
