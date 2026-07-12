@@ -677,7 +677,21 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
     let r: CuResult<Response> = (|| match req {
-        Request::Init => b.init().map(|_| Response::Ok),
+        Request::Init { proto_hash } => {
+            if proto_hash != crate::PROTO_HASH {
+                eprintln!(
+                    "[smolvm-cuda] PROTOCOL MISMATCH: client wire hash {:016x} != server {:016x} \
+                     — the guest shim and host server were built from different source. \
+                     Rebuild and restage both. Refusing the connection to avoid corruption.",
+                    proto_hash,
+                    crate::PROTO_HASH
+                );
+                // CUDA_ERROR_NOT_SUPPORTED — surfaced at cuInit, loud and early.
+                Err(CUDA_ERROR_NOT_SUPPORTED)
+            } else {
+                b.init().map(|_| Response::Ok)
+            }
+        }
         Request::DeviceGetCount => b.device_get_count().map(Response::Count),
         Request::DeviceGetName { device } => b.device_get_name(device).map(Response::Name),
         Request::DeviceTotalMem { device } => b.device_total_mem(device).map(Response::Bytes),
@@ -1798,5 +1812,32 @@ mod tests {
         let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 4 });
         assert_eq!(st, 0);
         std::env::remove_var("SMOLVM_CUDA_VRAM_LIMIT_MB");
+    }
+    // The connect handshake rejects a client whose wire fingerprint differs
+    // (stale shim/server), so protocol skew fails loudly instead of decoding
+    // the wrong bytes and corrupting silently.
+    #[test]
+    fn init_rejects_proto_mismatch() {
+        let mut sess = Session::default();
+        let mut b = CpuBackend::default();
+        let (st, _) = dispatch(
+            &mut sess,
+            &mut b,
+            Request::Init {
+                proto_hash: crate::PROTO_HASH,
+            },
+        );
+        assert_eq!(st, 0, "matching proto hash must connect");
+        let (st, _) = dispatch(
+            &mut sess,
+            &mut b,
+            Request::Init {
+                proto_hash: crate::PROTO_HASH ^ 0x1,
+            },
+        );
+        assert_eq!(
+            st, CUDA_ERROR_NOT_SUPPORTED,
+            "mismatched proto hash must be rejected"
+        );
     }
 }

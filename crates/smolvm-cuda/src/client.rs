@@ -639,7 +639,13 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn init(&mut self) -> Result<()> {
-        self.call(&Request::Init, Op::Init).map(|_| ())
+        self.call(
+            &Request::Init {
+                proto_hash: crate::PROTO_HASH,
+            },
+            Op::Init,
+        )
+        .map(|_| ())
     }
 
     pub fn device_get_count(&mut self) -> Result<i32> {

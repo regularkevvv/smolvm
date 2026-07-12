@@ -201,7 +201,11 @@ impl Op {
 /// A decoded request. Handles are opaque ids; device pointers are real values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Init,
+    /// Connect handshake. `proto_hash` is the client's wire fingerprint
+    /// (`crate::PROTO_HASH`); the host rejects a mismatch (stale binary).
+    Init {
+        proto_hash: u64,
+    },
     DeviceGetCount,
     DeviceGetName {
         device: i32,
@@ -668,7 +672,10 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut b = Vec::new();
     match req {
-        Request::Init => w_u8(&mut b, Op::Init as u8),
+        Request::Init { proto_hash } => {
+            w_u8(&mut b, Op::Init as u8);
+            w_u64(&mut b, *proto_hash);
+        }
         Request::DeviceGetCount => w_u8(&mut b, Op::DeviceGetCount as u8),
         Request::DeviceGetName { device } => {
             w_u8(&mut b, Op::DeviceGetName as u8);
@@ -1114,7 +1121,9 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
     let mut c = Cur::new(payload);
     let op = Op::from_u8(c.u8()?).ok_or_else(bad)?;
     Ok(match op {
-        Op::Init => Request::Init,
+        Op::Init => Request::Init {
+            proto_hash: c.u64()?,
+        },
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
         Op::DeviceTotalMem => Request::DeviceTotalMem { device: c.i32()? },
@@ -1477,7 +1486,9 @@ mod tests {
 
     #[test]
     fn request_roundtrips() {
-        roundtrip(Request::Init);
+        roundtrip(Request::Init {
+            proto_hash: 0xdeadbeef,
+        });
         roundtrip(Request::DeviceGetCount);
         roundtrip(Request::DeviceGetName { device: 3 });
         roundtrip(Request::DeviceTotalMem { device: 0 });

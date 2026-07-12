@@ -472,17 +472,30 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     )
 }
 
-/// `cudaMallocManaged` served as plain device memory: bitsandbytes links it
-/// (its paged optimizers host-access managed pointers — those would fault —
-/// but its 4-bit/8-bit compute paths only need the symbol to resolve and the
-/// pointer to be device-valid).
+/// `cudaMallocManaged` — unified memory the CPU and GPU both access by the same
+/// pointer. Through API remoting to a discrete GPU that cannot page-fault into
+/// guest RAM, that is unserviceable: a guest-CPU dereference of a real host
+/// device address reads garbage. So by default we FAIL (writing a NULL
+/// out-pointer), turning silent corruption into an immediate, obvious crash —
+/// this is exactly bitsandbytes' *paged* optimizer path (`get_paged` wraps the
+/// pointer as a host numpy array). `SMOLVM_CUDA_MANAGED=device` restores the
+/// old device-backed behavior for workloads that only ever touch the pointer
+/// on the GPU (never on the CPU); use it only when you know that holds.
 #[no_mangle]
 pub extern "C" fn cudaMallocManaged(
     dev_ptr: *mut *mut c_void,
     size: usize,
     _flags: c_uint,
 ) -> c_int {
-    cudaMalloc(dev_ptr, size)
+    if std::env::var("SMOLVM_CUDA_MANAGED").as_deref() == Ok("device") {
+        return cudaMalloc(dev_ptr, size);
+    }
+    if !dev_ptr.is_null() {
+        unsafe { *dev_ptr = std::ptr::null_mut() };
+    }
+    // cudaErrorNotSupported: host-coherent managed memory can't cross the
+    // forwarding boundary. (SMOLVM_CUDA_MANAGED=device to override.)
+    set_last(801)
 }
 
 /// Managed-memory prefetch hint: nothing to do, our "managed" memory is
@@ -1030,6 +1043,26 @@ pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
         Ok(()) => CUDA_SUCCESS,
         Err(e) => e,
     })
+}
+
+/// `cudaLaunchHostFunc` — a host callback that must run AFTER all prior work on
+/// `stream`. The deferred pipeline means that prior work may not have executed
+/// host-side yet, so we synchronize the stream first; invoking the callback
+/// immediately (as the old stub did) let it observe stale GPU results.
+#[no_mangle]
+pub extern "C" fn cudaLaunchHostFunc(
+    stream: *mut c_void,
+    func: Option<unsafe extern "C" fn(*mut c_void)>,
+    user_data: *mut c_void,
+) -> c_int {
+    let rc = with_client(|c| c.stream_synchronize(stream as u64));
+    if let Err(e) = rc {
+        return set_last(e);
+    }
+    if let Some(f) = func {
+        unsafe { f(user_data) };
+    }
+    CUDA_SUCCESS
 }
 
 // ---- device queries, events, stream/mempool surface (PyTorch runtime API) ----
@@ -1752,7 +1785,12 @@ pub extern "C" fn cudaStreamAddCallback(
     user_data: *mut c_void,
     _flags: c_uint,
 ) -> c_int {
-    // Work up to here has already run, so invoke the callback immediately.
+    // The callback must run after all prior work on `stream`. Under the
+    // deferred pipeline that work may not have executed host-side yet, so
+    // synchronize first — invoking it immediately let it observe stale results.
+    if let Err(e) = with_client(|c| c.stream_synchronize(stream as u64)) {
+        return set_last(e);
+    }
     if let Some(cb) = callback {
         unsafe { cb(stream, CUDA_SUCCESS, user_data) };
     }

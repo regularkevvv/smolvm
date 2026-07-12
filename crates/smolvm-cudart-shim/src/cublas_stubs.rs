@@ -534,19 +534,6 @@ pub extern "C" fn cudaStreamGetPriority(_s: *mut c_void, priority: *mut c_int) -
     }
     0
 }
-/// `cudaLaunchHostFunc` — run a host callback in stream order. Our serving thread
-/// is in-order, so all prior work is done: invoke it immediately.
-#[no_mangle]
-pub extern "C" fn cudaLaunchHostFunc(
-    _s: *mut c_void,
-    func: Option<unsafe extern "C" fn(*mut c_void)>,
-    user_data: *mut c_void,
-) -> c_int {
-    if let Some(f) = func {
-        unsafe { f(user_data) }
-    }
-    0
-}
 #[no_mangle]
 pub extern "C" fn cudaMemcpy2DAsync() -> c_int {
     rt_stub("cudaMemcpy2DAsync")
