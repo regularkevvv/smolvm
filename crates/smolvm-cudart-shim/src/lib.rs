@@ -508,7 +508,12 @@ fn with_client<T>(
                         st.conn_token
                     );
                 }
-                let (client, token, fd) = bring_up_client(st.conn_token)?;
+                // Carry the not-yet-sent deferred pipeline across the reconnect
+                // so buffered quiet ops (e.g. torch's queued matmuls) replay on
+                // the fresh connection instead of being dropped.
+                let (wbuf, deferred, sticky) = st.client.take_pending();
+                let (mut client, token, fd) = bring_up_client(st.conn_token)?;
+                client.restore_pending(wbuf, deferred, sticky);
                 st.client = client;
                 st.conn_token = token;
                 st.conn_pid = pid;

@@ -429,6 +429,32 @@ impl<S: Read + Write> Client<S> {
         self.defer_enabled = on;
     }
 
+    /// Take this client's pending deferred pipeline (framed-but-unsent quiet
+    /// requests + their count + sticky status), clearing it. On a VM-fork clone
+    /// whose connection died mid-flush, these requests never reached the host —
+    /// so they must move to the reconnected client and re-flush there, or the
+    /// buffered work (e.g. torch's queued cuBLAS matmuls before a `.item()`)
+    /// would be silently dropped and the next read returns stale data.
+    pub fn take_pending(&mut self) -> (Vec<u8>, usize, i32) {
+        let sticky = self.sticky;
+        self.sticky = 0;
+        let deferred = self.deferred;
+        self.deferred = 0;
+        (std::mem::take(&mut self.wbuf), deferred, sticky)
+    }
+
+    /// Adopt a pending deferred pipeline taken from a prior (dead) client. The
+    /// requests reference handles that stay valid in the shared primary context
+    /// (and are restored by the Init handoff), so re-flushing them on this fresh
+    /// connection replays exactly the not-yet-executed work.
+    pub fn restore_pending(&mut self, wbuf: Vec<u8>, deferred: usize, sticky: i32) {
+        self.wbuf = wbuf;
+        self.deferred = deferred;
+        if self.sticky == 0 {
+            self.sticky = sticky;
+        }
+    }
+
     /// Settle all fire-and-forget work with a single fence round-trip: quiet
     /// requests produce no per-op responses (each response read costs a guest
     /// wake-up on vsock), so one fence reply carries the first failure among
