@@ -575,12 +575,20 @@ pub extern "C" fn cuCtxGetCurrent(pctx: *mut *mut c_void) -> c_int {
     if let Err(e) = ensure_connected(&mut g) {
         return e;
     }
-    let cur = g
-        .as_ref()
-        .expect("connected")
+    let s = g.as_ref().expect("connected");
+    // Report the explicitly-pushed context if there is one; otherwise fall back
+    // to a retained primary context. Real `cudaSetDevice`/runtime init leaves the
+    // device's primary context current, so torch/cuBLAS expect a non-null current
+    // context here. Returning 0 makes torch lazily retain+bind the primary on
+    // first cuBLAS use — harmless in eager (a warning that self-heals) but FATAL
+    // during CUDA-graph capture, where context ops aren't allowed and cuBLAS then
+    // fails `CUBLAS_STATUS_NOT_INITIALIZED`. Surfacing the primary avoids the lazy
+    // bind entirely, which is what lets a graph-capturing engine (vLLM) work.
+    let cur = s
         .ctx_stack
         .last()
         .copied()
+        .or_else(|| s.primary_ctx.values().next().copied())
         .unwrap_or(0);
     ret(unsafe { out(pctx, cur as *mut c_void) })
 }
