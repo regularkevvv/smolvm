@@ -1,8 +1,9 @@
 name: Publish pacman repo
 
-# Builds Arch packages from the release binaries and publishes them to
-# rolling releases (pacman-repo-x86_64 / pacman-repo-aarch64) that serve
-# as pacman repository endpoints. See docs/install/arch.md.
+# Builds Arch packages from the release binaries and publishes them to the
+# GitHub Pages `pacman-repo` branch, served at
+# https://smol-machines.github.io/smolvm/pacman/$arch — a single stable
+# repository endpoint (no per-arch release entries). See docs/install-arch.md.
 #
 # Triggers:
 #  - workflow_call: invoked by release.yml right after it creates the GitHub
@@ -46,7 +47,7 @@ jobs:
           echo "pkgver=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install tooling
-        run: pacman -Syu --noconfirm pacman-contrib github-cli git
+        run: pacman -Syu --noconfirm pacman-contrib git
 
       - uses: actions/checkout@v4
 
@@ -66,29 +67,35 @@ jobs:
           sudo -u builder env CARCH=aarch64 makepkg -df --noconfirm --ignorearch
           ls -l *.pkg.tar.zst
 
-      - name: Publish to rolling pacman repo releases
+      - name: Publish to the GitHub Pages pacman repo (branch pacman-repo)
         run: |
-          git config --global --add safe.directory "$PWD"
           cd /home/builder/build
+          git config --global user.name  'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config --global --add safe.directory '*'
+          # Pages serves the pacman-repo branch at https://<owner>.github.io/<repo>/
+          # (Deploy from a branch); the pacman endpoint is pacman/$arch/. Pushing
+          # to the branch triggers the Pages build.
+          auth="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git clone --depth 1 --branch pacman-repo "$auth" pages
           for arch in x86_64 aarch64; do
-            roll="pacman-repo-$arch"
-            mkdir -p "repo-$arch" && cd "repo-$arch"
-            cp ../smolvm-*-"$arch".pkg.tar.zst .
-            # fetch existing db (first run: absent)
-            gh release download "$roll" -R "$GITHUB_REPOSITORY" \
-              -p 'smol-machines.db.tar.gz' -p 'smol-machines.files.tar.gz' 2>/dev/null || true
-            repo-add smol-machines.db.tar.gz smolvm-*-"$arch".pkg.tar.zst
-            # rolling release exists? create once
-            gh release view "$roll" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-              gh release create "$roll" -R "$GITHUB_REPOSITORY" --prerelease \
-                --title "pacman repo ($arch)" \
-                --notes "Rolling pacman repository endpoint for $arch. Do not delete. See docs/install/arch.md."
-            # upload package + db (db symlink targets must be uploaded as real files)
-            cp --remove-destination "$(readlink -f smol-machines.db)" smol-machines.db
-            cp --remove-destination "$(readlink -f smol-machines.files)" smol-machines.files
-            gh release upload "$roll" -R "$GITHUB_REPOSITORY" --clobber \
-              smolvm-*-"$arch".pkg.tar.zst \
-              smol-machines.db.tar.gz smol-machines.files.tar.gz \
-              smol-machines.db smol-machines.files
-            cd ..
+            dir="pages/pacman/$arch"
+            mkdir -p "$dir"
+            # Rolling repo: keep only the current version's package so the branch
+            # stays small. repo-add then builds a fresh single-entry db.
+            rm -f "$dir"/smolvm-*.pkg.tar.zst "$dir"/smol-machines.db* "$dir"/smol-machines.files*
+            cp smolvm-*-"$arch".pkg.tar.zst "$dir/"
+            (
+              cd "$dir"
+              repo-add smol-machines.db.tar.gz smolvm-*-"$arch".pkg.tar.zst
+              # GitHub Pages does not serve broken symlinks — materialize the
+              # convenience `.db`/`.files` names as real copies of their targets.
+              cp --remove-destination "$(readlink -f smol-machines.db)" smol-machines.db
+              cp --remove-destination "$(readlink -f smol-machines.files)" smol-machines.files
+            )
           done
+          cd pages
+          git add -A
+          git commit -m "pacman: publish ${{ steps.tag.outputs.tag }}" \
+            || { echo "no package changes to publish"; exit 0; }
+          git push origin pacman-repo
