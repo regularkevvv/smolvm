@@ -458,3 +458,16 @@ jobs:
     uses: ./.github/workflows/pacman-repo.yml
     with:
       tag: ${{ github.ref_name }}
+
+  # Build + publish the .deb / .rpm repos. Same reasoning as publish-pacman
+  # (the `release: published` event never fires for a GITHUB_TOKEN release).
+  # Runs after publish-pacman so the sequential pushes to the shared Pages
+  # branch (pacman-repo) never race.
+  publish-deb-rpm:
+    name: Publish deb/rpm repos
+    needs: publish-pacman
+    permissions:
+      contents: write
+    uses: ./.github/workflows/deb-rpm-repo.yml
+    with:
+      tag: ${{ github.ref_name }}
