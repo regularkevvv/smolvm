@@ -655,6 +655,9 @@ impl PackCreateCmd {
         manifest.network = pack_config.net.unwrap_or(vm.network);
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
+        // Preserve the source VM's CUDA-over-vsock flag so the packed run starts
+        // a host CUDA server and bridges the guest's CUDA client to it.
+        manifest.cuda = vm.cuda;
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {

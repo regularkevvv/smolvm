@@ -39,6 +39,17 @@ use std::time::Duration;
 /// it for such machines with `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
 const AGENT_READY_TIMEOUT_DEFAULT_SECS: u64 = 30;
 
+/// Truthy env-var flag (`1`, `true`, `yes`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve the agent-ready timeout, honoring `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
 fn agent_ready_timeout() -> Duration {
     let secs = std::env::var("SMOLVM_AGENT_READY_TIMEOUT_SECS")
@@ -252,6 +263,12 @@ pub struct PackRunCmd {
     /// Enable debug output
     #[arg(long)]
     pub debug: bool,
+
+    /// Enable CUDA-over-vsock: run a host CUDA server and bridge the guest's
+    /// CUDA client to it. Also enabled automatically when the packed machine
+    /// was created with CUDA, or via `SMOLVM_CUDA=1`.
+    #[arg(long)]
+    pub cuda: bool,
 }
 
 impl PackRunCmd {
@@ -353,6 +370,13 @@ impl PackRunCmd {
         let storage_path = runtime_dir.path().join("storage.ext4");
         let vsock_path = runtime_dir.path().join("agent.sock");
 
+        // CUDA-over-vsock: enabled by the packed machine's manifest flag, the
+        // `--cuda` override, or `SMOLVM_CUDA=1`. When on, the parent runs a host
+        // CUDA server on `cuda_sock` and the launcher bridges the guest's vsock
+        // CUDA port to it (the guest's LD_PRELOADed shims connect out).
+        let cuda_enabled = manifest.cuda || self.cuda || env_flag("SMOLVM_CUDA");
+        let cuda_sock = runtime_dir.path().join("cuda.sock");
+
         // Compute auto-sized storage before creating the disk so both the
         // disk file and VmResources use the same value.
         let storage_gib = storage_gib_for_manifest(self.storage, &manifest);
@@ -420,6 +444,7 @@ impl PackRunCmd {
         #[cfg(unix)]
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
+            let cuda_sock_clone = cuda_sock.clone();
             smolvm::process::fork_session_leader(move || {
                 // Child process: load libkrun via dlopen and launch VM
                 let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -441,6 +466,11 @@ impl PackRunCmd {
                     overlay_path: overlay_runtime_path.as_deref(),
                     debug: self.debug,
                     console_log: console_log_path,
+                    cuda_socket: if cuda_enabled {
+                        Some(cuda_sock_clone.as_path())
+                    } else {
+                        None
+                    },
                 };
 
                 // Detach from parent's terminal so libkrun doesn't
@@ -575,6 +605,26 @@ impl PackRunCmd {
 
         if self.debug {
             eprintln!("debug: forked VM process with PID {}", child_pid);
+        }
+
+        // Start the host CUDA server in the parent (which owns the run's
+        // lifetime). The guest's LD_PRELOADed shims connect out to vsock port
+        // `ports::CUDA`, which the launcher (in the child) bridges to this
+        // AF_UNIX socket. Started after the fork so the child never inherits any
+        // CUDA-driver state, and before `wait_for_agent` so the socket is
+        // serving well before the guest workload dials in.
+        #[cfg(unix)]
+        if cuda_enabled {
+            match smolvm::cuda_host::start(&cuda_sock) {
+                Ok(()) => {
+                    if self.debug {
+                        eprintln!("debug: CUDA host serving {}", cuda_sock.display());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to start CUDA host server: {e} — CUDA disabled");
+                }
+            }
         }
 
         // Guard ensures the VM child is terminated and runtime dir is
@@ -1079,6 +1129,11 @@ struct PackedRunArgs {
     /// Overlay disk size in GiB
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
+
+    /// Enable CUDA-over-vsock (also implied by the packed machine's manifest or
+    /// `SMOLVM_CUDA=1`).
+    #[arg(long)]
+    cuda: bool,
 }
 
 /// Arguments for the `start` subcommand (persistent daemon).
@@ -1264,6 +1319,7 @@ fn run_ephemeral(
                 force_extract,
                 info: false,
                 debug,
+                cuda: args.cuda,
             };
             cmd.run()
         }
@@ -1423,6 +1479,9 @@ fn run_from_cache(
             overlay_path: overlay_runtime_path.as_deref(),
             debug,
             console_log: console_log_path,
+            // CUDA-over-vsock for the persistent/daemon packed paths is not
+            // wired yet; the `run` path starts the host server.
+            cuda_socket: None,
         };
 
         // Detach from parent's terminal so libkrun doesn't
@@ -1842,6 +1901,9 @@ fn daemon_start(
             overlay_path: overlay_daemon_path.as_deref(),
             debug,
             console_log: console_log_path,
+            // CUDA-over-vsock for the persistent/daemon packed paths is not
+            // wired yet; the `run` path starts the host server.
+            cuda_socket: None,
         };
 
         // Detach from parent's terminal before launching the VM.

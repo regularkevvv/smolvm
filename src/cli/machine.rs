@@ -809,6 +809,7 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
+                cuda: false,
             }
             .run();
         }
@@ -923,6 +924,7 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
+                cuda: false,
             }
             .run();
         }

@@ -375,6 +375,13 @@ pub struct PackManifest {
     #[serde(default)]
     pub gpu: bool,
 
+    /// Enable CUDA-over-vsock: the runtime starts a host CUDA server and bridges
+    /// the guest's CUDA client to it. Preserved from the source VM's `cuda` flag
+    /// when packing `--from-vm`. `#[serde(default)]` keeps older sidecars (which
+    /// lack the field) loadable.
+    #[serde(default)]
+    pub cuda: bool,
+
     /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
     /// Distinct from `platform` which is the guest architecture (always linux).
     /// Used for registry Image Index resolution.
@@ -469,6 +476,7 @@ impl PackManifest {
             image_size: 0,
             network: false,
             gpu: false,
+            cuda: false,
             host_platform,
             created: rfc3339_now(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
