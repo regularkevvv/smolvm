@@ -65,6 +65,11 @@ pub struct PackedLaunchConfig<'a> {
     /// Path to redirect VM console output (prevents libkrun from putting
     /// the inherited terminal into raw mode).
     pub console_log: PathBuf,
+    /// Host CUDA-over-vsock server socket. When set, the guest's CUDA client
+    /// (vsock port [`ports::CUDA`]) is bridged to this AF_UNIX path, where a
+    /// `cuda_host` server loaded the real driver. Mirrors the non-packed
+    /// launcher's `cuda_socket`.
+    pub cuda_socket: Option<&'a Path>,
 }
 
 /// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
@@ -470,6 +475,25 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) } < 0
     {
         free_ctx_on_err!("krun_add_vsock_port2 failed");
+    }
+
+    // Bridge the guest CUDA client (vsock port `ports::CUDA`) to the host CUDA
+    // server socket. `listen=false`: the guest connects out and libkrun forwards
+    // to the AF_UNIX path where `cuda_host::start` is serving. Mirrors the
+    // non-packed launcher; keeps this launcher policy-free (the caller owns the
+    // server lifecycle).
+    if let Some(cuda_sock) = config.cuda_socket {
+        let cuda_sock_c = try_or_free_ctx!(
+            path_to_cstring(cuda_sock),
+            "cuda socket path contains null byte"
+        );
+        // SAFETY: ctx is valid, cuda_sock_c is a valid C string.
+        if unsafe { (krun.add_vsock_port2)(ctx, ports::CUDA, cuda_sock_c.as_ptr(), false) } < 0 {
+            free_ctx_on_err!("krun_add_vsock_port2 (CUDA) failed");
+        }
+        if config.debug {
+            eprintln!("debug: CUDA-over-vsock bridged to {}", cuda_sock.display());
+        }
     }
 
     // Redirect console output to a log file so libkrun doesn't put the
