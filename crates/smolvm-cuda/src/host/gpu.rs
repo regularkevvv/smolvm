@@ -1265,7 +1265,10 @@ impl CudnnBackend {
                 if handle_bearing(ty) {
                     for chunk in elems.chunks_exact_mut(8) {
                         let h = u64::from_le_bytes(chunk.try_into().unwrap());
-                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                        // VOID_PTR(6) = device pointer (fork-translate); HANDLE(0)
+                        // / BACKEND_DESCRIPTOR(15) = opaque handle (vh_resolve).
+                        let r = if ty == 6 { dptr_resolve(h) } else { vh_resolve(vh, h) };
+                        chunk.copy_from_slice(&r.to_le_bytes());
                     }
                 }
                 let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
@@ -1289,7 +1292,8 @@ impl CudnnBackend {
                 if handle_bearing(ty) {
                     for chunk in buf[..seed].chunks_exact_mut(8) {
                         let h = u64::from_le_bytes(chunk.try_into().unwrap());
-                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                        let r = if ty == 6 { dptr_resolve(h) } else { vh_resolve(vh, h) };
+                        chunk.copy_from_slice(&r.to_le_bytes());
                     }
                 }
                 let mut count: i64 = 0;
@@ -1549,18 +1553,21 @@ impl CublasLt {
                 let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let desc = vh_resolve(vh, rd_u64(8)) as *mut c_void;
                 let alpha = &args[16..32];
-                let a = rd_u64(32) as *mut c_void;
+                // A/B/C/D and the workspace are device pointers — translate them
+                // through the fork-isolation map so a clone's matmul hits its
+                // private copies (untranslated for normal sessions).
+                let a = dptr_resolve(rd_u64(32)) as *mut c_void;
                 let adesc = vh_resolve(vh, rd_u64(40)) as *mut c_void;
-                let b = rd_u64(48) as *mut c_void;
+                let b = dptr_resolve(rd_u64(48)) as *mut c_void;
                 let bdesc = vh_resolve(vh, rd_u64(56)) as *mut c_void;
                 let beta = &args[64..80];
-                let c = rd_u64(80) as *mut c_void;
+                let c = dptr_resolve(rd_u64(80)) as *mut c_void;
                 let cdesc = vh_resolve(vh, rd_u64(88)) as *mut c_void;
-                let dd = rd_u64(96) as *mut c_void;
+                let dd = dptr_resolve(rd_u64(96)) as *mut c_void;
                 let ddesc = vh_resolve(vh, rd_u64(104)) as *mut c_void;
                 let algo = &args[112..176];
                 let algo_present = rd_u64(176) != 0;
-                let workspace = rd_u64(184) as *mut c_void;
+                let workspace = dptr_resolve(rd_u64(184)) as *mut c_void;
                 let ws_size = rd_u64(192) as usize;
                 // Session-minted stream id → real host stream (see stream_resolve).
                 let stream = stream_resolve(streams, rd_u64(200)) as *mut c_void;
@@ -1632,6 +1639,43 @@ fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
     } else {
         map.get(&s).copied().unwrap_or(s)
     }
+}
+
+// Fork-isolation pointer translation for forwarded library calls (cuBLAS/cuDNN).
+// The generated `dispatch` reads each DevPtr arg through `dptr_resolve`, so a
+// clone's inherited device pointers hit its private copies — TYPED at the exact
+// arg offset, unlike the byte-scan used for opaque kernel args. Kept in a
+// thread-local (one serve thread per connection) so the generated code needs no
+// extra parameter; `host::dispatch` refreshes it whenever the map changes.
+thread_local! {
+    static LIB_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install this connection's `(base, size, copy)` translation ranges for the
+/// generated library dispatch. No-op cost when empty (the common case).
+pub(super) fn set_lib_trans(trans: &[(u64, u64, u64)]) {
+    LIB_TRANS.with(|c| {
+        let mut v = c.borrow_mut();
+        v.clear();
+        v.extend_from_slice(trans);
+    });
+}
+
+/// Translate a device pointer arg of a forwarded library call to the clone's
+/// private copy; untranslated pointers (weights, fresh allocations) pass through.
+pub(super) fn dptr_resolve(p: u64) -> u64 {
+    if p == 0 {
+        return 0;
+    }
+    LIB_TRANS.with(|c| {
+        for &(base, size, copy) in c.borrow().iter() {
+            if p >= base && p < base + size {
+                return copy + (p - base);
+            }
+        }
+        p
+    })
 }
 
 /// Little-endian cursor over a hand-packed argument blob (host side of the

@@ -792,9 +792,12 @@ fn gen_host(lib: &Lib) -> String {
                     call.push(p.name.to_string());
                 }
                 Kind::DevPtr => {
+                    // Translate through the fork-isolation map so a clone's
+                    // inherited device pointers hit its private copies (no-op
+                    // for normal sessions).
                     let _ = writeln!(
                         binds,
-                        "                let {} = __c.u64() as {};",
+                        "                let {} = super::dptr_resolve(__c.u64()) as {};",
                         p.name, p.cty
                     );
                     call.push(p.name.to_string());

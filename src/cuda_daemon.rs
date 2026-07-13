@@ -158,11 +158,22 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     let _ = std::fs::remove_file(&sock); // stale node from a dead daemon
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
+    // Dev diagnostic: SMOLVM_CUDA_DAEMON_STDERR=<path> captures the daemon's
+    // stderr (fork-isolation traces, backend selection) instead of dropping it.
+    let stderr = match std::env::var_os("SMOLVM_CUDA_DAEMON_STDERR") {
+        Some(p) => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null()),
+        None => Stdio::null(),
+    };
     Command::new(exe)
         .args(["_cuda-daemon", &sock.to_string_lossy()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         // Own process group so the daemon outlives the VM that first spawned it.
         .process_group(0)
         .spawn()?;

@@ -297,6 +297,23 @@ struct Session {
     owned_streams: std::collections::HashSet<u64>,
     owned_events: std::collections::HashSet<u64>,
     primary_retains: u32,
+    /// This session's live device allocations (dptr → size), shared via
+    /// [`DPTR_HANDOFF`] so a fork clone in isolation mode can enumerate the
+    /// parent's buffers and give itself private copies. Mirrors `owned_dptrs`.
+    alloc_table: std::sync::Arc<std::sync::Mutex<HashMap<u64, (u64, bool)>>>,
+    /// Fork-isolation pointer map: `(parent_base, size, private_copy_base)`.
+    /// Empty unless this session is an isolating clone. Every inherited dptr the
+    /// guest sends is rewritten through these ranges to the clone's own copy, so
+    /// two clones of one golden write disjoint VRAM instead of colliding.
+    dptr_trans: Vec<(u64, u64, u64)>,
+    /// Parent lineage token whose allocations must be copied privately on the
+    /// first `PrimaryCtxRetain` (when a context is finally current). 0 = none.
+    pending_isolate: u64,
+    /// Inherited read-only (weight) buffers this isolating clone SHARES with its
+    /// parent: `(base, size)`. Shared until the clone writes one, at which point
+    /// it's copied-on-write into `dptr_trans` and dropped from here. Lets clones
+    /// share gigabytes of weights while still isolating anything they mutate.
+    shared_ranges: Vec<(u64, u64)>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
@@ -369,6 +386,289 @@ fn graph_handoff_register(dst: &std::sync::Arc<GraphVhMap>, resume_token: u64, m
     }
     reg.retain(|_, w| w.strong_count() > 0);
     reg.insert(my_token, std::sync::Arc::downgrade(dst));
+}
+
+/// Opt-in (`SMOLVM_CUDA_FORK_ISOLATE=1`): fork clones get PRIVATE copies of the
+/// golden's device memory instead of sharing it. Independent serving (two clones
+/// running different requests) needs this; the default shared-memory fork is for
+/// "resume the golden's exact work" (checkpoint/continue), which this would break.
+fn fork_isolate_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
+}
+
+/// Registry of live sessions' allocation tables, keyed by lineage token, so an
+/// isolating clone can enumerate its parent's device buffers to copy them.
+/// `Weak` so a session's entry evaporates when its connection closes. Parallels
+/// [`GRAPH_HANDOFF`].
+/// dptr → (size, loaded). `loaded` = written via a host-to-device copy, i.e. a
+/// weight/constant streamed in at load time. Such buffers are read-only during
+/// inference, so clones SHARE them (M4) instead of each copying gigabytes of
+/// weights; only the un-loaded buffers (KV cache, activations) get private copies.
+type AllocTable = std::sync::Mutex<HashMap<u64, (u64, bool)>>;
+static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
+    std::sync::Mutex::new(None);
+
+fn dptr_handoff_register(table: &std::sync::Arc<AllocTable>, my_token: u64) {
+    let mut reg = DPTR_HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(HashMap::new);
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(my_token, std::sync::Arc::downgrade(table));
+}
+
+/// Snapshot of `token`'s current `(dptr, size, loaded)` allocations, or `None`
+/// if that lineage is gone.
+fn dptr_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
+    let reg = DPTR_HANDOFF.lock().unwrap();
+    let table = reg.as_ref()?.get(&token)?.upgrade()?;
+    let snap = table
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&d, &(s, l))| (d, s, l))
+        .collect();
+    Some(snap)
+}
+
+/// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
+/// weight). Called on every host-to-device copy on the golden.
+fn mark_loaded(table: &AllocTable, dptr: u64) {
+    let mut t = table.lock().unwrap();
+    if let Some(v) = t.get_mut(&dptr) {
+        v.1 = true;
+        return;
+    }
+    for (&base, v) in t.iter_mut() {
+        if dptr >= base && dptr < base + v.0 {
+            v.1 = true;
+            return;
+        }
+    }
+}
+
+/// Copy-on-write a shared (inherited read-only) buffer that this clone is about
+/// to WRITE, so the write hits a private copy instead of the parent's buffer.
+/// Moves it from `shared_ranges` into `dptr_trans`. No-op if `dptr` isn't shared.
+fn cow_one(sess: &mut Session, b: &mut dyn Backend, dptr: u64) {
+    let Some(i) = sess
+        .shared_ranges
+        .iter()
+        .position(|&(base, size)| dptr >= base && dptr < base + size)
+    else {
+        return;
+    };
+    let (base, size) = sess.shared_ranges.swap_remove(i);
+    if let Ok(cdptr) = b.mem_alloc(size) {
+        let _ = b.memcpy_dtod(cdptr, base, size);
+        sess.dptr_trans.push((base, size, cdptr));
+        sess.owned_dptrs.insert(cdptr, size);
+        sess.alloc_table.lock().unwrap().insert(cdptr, (size, false));
+        gpu::set_lib_trans(&sess.dptr_trans); // keep the cuBLAS/cuDNN map current
+    }
+}
+
+/// COW any shared buffer this request WRITES (host-to-device copies, memset,
+/// device-to-device destination). Kernel outputs are undetectable, but the only
+/// shared buffers are H2D-loaded weights, which kernels only read.
+fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
+    if sess.shared_ranges.is_empty() {
+        return;
+    }
+    match req {
+        Request::MemcpyHtoD { dptr, .. }
+        | Request::MemsetD8 { dptr, .. }
+        | Request::MemsetD8Async { dptr, .. }
+        | Request::MemcpyShmHtoD { dptr, .. }
+        | Request::MemcpyGpaHtoD { dptr, .. } => cow_one(sess, b, *dptr),
+        Request::MemcpyDtoD { dst, .. } | Request::MemcpyDtoDAsync { dst, .. } => {
+            cow_one(sess, b, *dst)
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite a guest device pointer through the clone's private-copy ranges. A
+/// pointer inside an inherited allocation `[base, base+size)` maps to the same
+/// offset in the clone's copy; everything else (fresh post-fork allocations,
+/// non-isolating sessions) passes through untouched.
+fn xlat(trans: &[(u64, u64, u64)], p: u64) -> u64 {
+    if p == 0 {
+        return 0;
+    }
+    for &(base, size, copy) in trans {
+        if p >= base && p < base + size {
+            return copy + (p - base);
+        }
+    }
+    p
+}
+
+/// Rewrite every inherited device pointer in a memory-op request to the clone's
+/// private copy. No-op when `trans` is empty (the common, non-isolating path).
+fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
+    if trans.is_empty() {
+        return req;
+    }
+    match req {
+        Request::MemcpyHtoD { dptr, stream, data } => Request::MemcpyHtoD {
+            dptr: xlat(trans, dptr),
+            stream,
+            data,
+        },
+        Request::MemcpyDtoH {
+            dptr,
+            bytes,
+            stream,
+        } => Request::MemcpyDtoH {
+            dptr: xlat(trans, dptr),
+            bytes,
+            stream,
+        },
+        Request::MemcpyDtoD { dst, src, bytes } => Request::MemcpyDtoD {
+            dst: xlat(trans, dst),
+            src: xlat(trans, src),
+            bytes,
+        },
+        Request::MemcpyDtoDAsync {
+            dst,
+            src,
+            bytes,
+            stream,
+        } => Request::MemcpyDtoDAsync {
+            dst: xlat(trans, dst),
+            src: xlat(trans, src),
+            bytes,
+            stream,
+        },
+        Request::MemsetD8 { dptr, value, bytes } => Request::MemsetD8 {
+            dptr: xlat(trans, dptr),
+            value,
+            bytes,
+        },
+        Request::MemsetD8Async {
+            dptr,
+            value,
+            bytes,
+            stream,
+        } => Request::MemsetD8Async {
+            dptr: xlat(trans, dptr),
+            value,
+            bytes,
+            stream,
+        },
+        Request::MemcpyShmHtoD {
+            dptr,
+            offset,
+            size,
+            stream,
+        } => Request::MemcpyShmHtoD {
+            dptr: xlat(trans, dptr),
+            offset,
+            size,
+            stream,
+        },
+        Request::MemcpyShmDtoH {
+            offset,
+            dptr,
+            size,
+            stream,
+        } => Request::MemcpyShmDtoH {
+            offset,
+            dptr: xlat(trans, dptr),
+            size,
+            stream,
+        },
+        Request::MemcpyGpaHtoD {
+            dptr,
+            segments,
+            stream,
+        } => Request::MemcpyGpaHtoD {
+            dptr: xlat(trans, dptr),
+            segments,
+            stream,
+        },
+        Request::MemcpyGpaDtoH {
+            dptr,
+            segments,
+            stream,
+        } => Request::MemcpyGpaDtoH {
+            dptr: xlat(trans, dptr),
+            segments,
+            stream,
+        },
+        Request::MemFree { dptr } => Request::MemFree {
+            dptr: xlat(trans, dptr),
+        },
+        Request::LaunchKernel {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            mut params,
+        } => {
+            // A kernel's pointer arguments are device addresses embedded in the
+            // per-arg byte buffers. CUDA doesn't tell us which args are pointers,
+            // so scan each arg's 8-byte-aligned windows and remap any value that
+            // lands inside an inherited allocation. Each arg is its own buffer, so
+            // a standalone pointer arg is a clean 8-byte read; non-pointer scalars
+            // essentially never fall inside a live device-address range.
+            for p in params.iter_mut() {
+                let mut off = 0;
+                while off + 8 <= p.len() {
+                    let v = u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
+                    let t = xlat(trans, v);
+                    if t != v {
+                        p[off..off + 8].copy_from_slice(&t.to_le_bytes());
+                    }
+                    off += 8;
+                }
+            }
+            Request::LaunchKernel {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                params,
+            }
+        }
+        Request::CublasSgemm {
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_bits,
+            a,
+            lda,
+            b,
+            ldb,
+            beta_bits,
+            c,
+            ldc,
+        } => Request::CublasSgemm {
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_bits,
+            a: xlat(trans, a),
+            lda,
+            b: xlat(trans, b),
+            ldb,
+            beta_bits,
+            c: xlat(trans, c),
+            ldc,
+        },
+        // LibCall (cuBLAS/cuDNN) device-pointer args are translated TYPED in the
+        // generated dispatch via `gpu::dptr_resolve` (a byte-scan of the packed,
+        // mixed-width arg buffer would mis-align and corrupt scalars), driven by
+        // the thread-local map that `dispatch` keeps in sync — see `set_lib_trans`.
+        other => other,
+    }
 }
 
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
@@ -760,6 +1060,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Same raw-on-the-wire convention as streams.
         Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
+    // Copy-on-write any shared weight buffer this request writes, then rewrite
+    // inherited device pointers to this clone's private copies (both no-ops
+    // unless this is an isolating clone).
+    cow_written(sess, b, &req);
+    let req = translate_dptrs(&sess.dptr_trans, req);
     let r: CuResult<Response> = (|| match req {
         Request::Init {
             proto_hash,
@@ -782,6 +1087,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // the session-level captured-graph map under the same token.
                 let token = b.begin_session(resume_token);
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
+                dptr_handoff_register(&sess.alloc_table, token);
+                // Isolation-mode clone: defer copying the parent's buffers until
+                // the first PrimaryCtxRetain, when a context is actually current.
+                if resume_token != 0 && fork_isolate_enabled() {
+                    sess.pending_isolate = resume_token;
+                }
                 b.init().map(|_| Response::Handle(token))
             }
         }
@@ -812,6 +1123,44 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.primary_retains += 1;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
+            // Copy-on-fork (isolation mode): now that the primary context is
+            // current on this thread, give this clone private copies of the
+            // parent's device buffers and record the pointer translation, so its
+            // inherited dptrs resolve to disjoint VRAM from sibling clones.
+            if sess.pending_isolate != 0 {
+                let parent = std::mem::take(&mut sess.pending_isolate);
+                // SMOLVM_CUDA_FORK_COPY_ALL forces every buffer private (weights
+                // too) — maximal isolation at N× the VRAM. Default shares the
+                // read-only weights (copy-on-write) so clones fit alongside the golden.
+                let copy_all = std::env::var_os("SMOLVM_CUDA_FORK_COPY_ALL").is_some();
+                let (mut copied, mut shared, mut cbytes, mut sbytes) = (0u64, 0u64, 0u64, 0u64);
+                if let Some(allocs) = dptr_handoff_snapshot(parent) {
+                    for (gdptr, size, loaded) in allocs {
+                        if loaded && !copy_all {
+                            // Weight/constant: share the parent's copy (read in
+                            // place, no translation). Copied-on-write only if the
+                            // clone actually writes it (see `cow_written`).
+                            sess.shared_ranges.push((gdptr, size));
+                            shared += 1;
+                            sbytes += size;
+                            continue;
+                        }
+                        if let Ok(cdptr) = b.mem_alloc(size) {
+                            let _ = b.memcpy_dtod(cdptr, gdptr, size);
+                            sess.dptr_trans.push((gdptr, size, cdptr));
+                            sess.owned_dptrs.insert(cdptr, size);
+                            sess.alloc_table.lock().unwrap().insert(cdptr, (size, false));
+                            copied += 1;
+                            cbytes += size;
+                        }
+                    }
+                }
+                gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
+                eprintln!(
+                    "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
+                     ({cbytes} B), {shared} shared read-only ({sbytes} B)"
+                );
+            }
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
@@ -873,17 +1222,22 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             b.mem_alloc(bytes).map(|d| {
                 sess.owned_dptrs.insert(d, bytes);
+                sess.alloc_table.lock().unwrap().insert(d, (bytes, false));
                 Response::Dptr(d)
             })
         }
         Request::MemFree { dptr } => {
+            // `dptr` is already translated to the clone's copy (if inherited).
             sess.owned_dptrs.remove(&dptr);
+            sess.alloc_table.lock().unwrap().remove(&dptr);
             // (removal returns the freed size to the quota ledger)
             b.mem_free(dptr).map(|_| Response::Ok)
         }
-        Request::MemcpyHtoD { dptr, stream, data } => b
-            .memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        Request::MemcpyHtoD { dptr, stream, data } => {
+            mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
+            b.memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyDtoH {
             dptr,
             bytes,
@@ -1155,9 +1509,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             offset,
             size,
             stream,
-        } => b
-            .memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        } => {
+            mark_loaded(&sess.alloc_table, dptr);
+            b.memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyShmDtoH {
             offset,
             dptr,
@@ -1170,9 +1526,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             dptr,
             stream,
             segments,
-        } => b
-            .memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        } => {
+            mark_loaded(&sess.alloc_table, dptr);
+            b.memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyGpaDtoH {
             dptr,
             stream,
