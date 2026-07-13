@@ -105,6 +105,17 @@ pub trait Backend: Send {
     fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
     /// Replay an instantiated graph on `stream`.
     fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    /// Rewrite `exec`'s node params so device pointers baked in at capture are
+    /// translated through `trans` to a fork clone's private copies (Path 2).
+    /// Default: no-op (a backend without graph support has nothing to patch).
+    fn graph_exec_patch(
+        &mut self,
+        _exec: u64,
+        _graph: u64,
+        _trans: &[(u64, u64, u64)],
+    ) -> CuResult<()> {
+        Ok(())
+    }
     fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()>;
     fn graph_destroy(&mut self, graph: u64) -> CuResult<()>;
     /// Number of nodes in a captured graph (PyTorch warns on empty graphs).
@@ -314,6 +325,10 @@ struct Session {
     /// it's copied-on-write into `dptr_trans` and dropped from here. Lets clones
     /// share gigabytes of weights while still isolating anything they mutate.
     shared_ranges: Vec<(u64, u64)>,
+    /// Per-clone patched graph execs: inherited exec (real) → this clone's own
+    /// exec (real) with node pointers translated to its private copies. Freed via
+    /// `owned_graph_reals` on teardown. Empty for non-isolating sessions.
+    clone_graph_execs: HashMap<u64, u64>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
@@ -372,6 +387,47 @@ type GraphVhMap = std::sync::Mutex<HashMap<u64, u64>>;
 static GRAPH_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<GraphVhMap>>>> =
     std::sync::Mutex::new(None);
 
+/// Maps an instantiated graph exec (real handle) → its source graph template
+/// (real handle). Populated at GraphInstantiate; lets an isolating fork clone
+/// re-instantiate + patch an inherited exec (Path 2 graph-mode isolation).
+/// Real handles are context-global, so one process-wide map serves all sessions.
+static EXEC_TEMPLATES: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+fn exec_template_register(exec: u64, graph: u64) {
+    EXEC_TEMPLATES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(exec, graph);
+}
+
+fn exec_template_lookup(exec: u64) -> Option<u64> {
+    EXEC_TEMPLATES.lock().unwrap().as_ref()?.get(&exec).copied()
+}
+
+/// Graph templates an isolating clone may need to re-instantiate. PyTorch/vLLM
+/// destroy the cuGraph right after instantiating its exec, so we keep templates
+/// alive (leaking them — acceptable on the opt-in isolation path) so a clone can
+/// re-instantiate + patch them later.
+static TEMPLATE_GRAPHS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+fn template_graph_mark(graph: u64) {
+    TEMPLATE_GRAPHS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(graph);
+}
+
+fn template_graph_is(graph: u64) -> bool {
+    TEMPLATE_GRAPHS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.contains(&graph))
+}
+
 /// Copy `resume_token`'s captured-graph map into `dst`, then register `dst`
 /// under `my_token` (the same token the backend minted for cuBLAS handoff, so
 /// both handle families share one lineage). The reals are context-scoped host
@@ -394,6 +450,16 @@ fn graph_handoff_register(dst: &std::sync::Arc<GraphVhMap>, resume_token: u64, m
 /// "resume the golden's exact work" (checkpoint/continue), which this would break.
 fn fork_isolate_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
+}
+
+/// Experimental (`SMOLVM_CUDA_FORK_GRAPH_PATCH=1`): let an isolating clone launch
+/// an INHERITED cudagraph by re-instantiating it and translating its node
+/// pointers (Path 2). Incomplete — it patches kernel/memset/memcpy node pointers
+/// but does NOT yet copy allocations made through the graph capture mempool / VMM
+/// path, so graph output can still be wrong. Off by default: graph mode fails
+/// loud rather than risk silent corruption.
+fn graph_patch_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_FORK_GRAPH_PATCH").is_some()
 }
 
 /// Registry of live sessions' allocation tables, keyed by lineage token, so an
@@ -1160,6 +1226,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
                 );
+                if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
+                    let plo = sess.dptr_trans.iter().map(|&(b, _, _)| b).min().unwrap_or(0);
+                    let phi = sess.dptr_trans.iter().map(|&(b, s, _)| b + s).max().unwrap_or(0);
+                    let slo = sess.shared_ranges.iter().map(|&(b, _)| b).min().unwrap_or(0);
+                    let shi = sess.shared_ranges.iter().map(|&(b, s)| b + s).max().unwrap_or(0);
+                    eprintln!(
+                        "[cuda-fork-isolate] private span [{plo:#x},{phi:#x}) shared span [{slo:#x},{shi:#x})"
+                    );
+                }
             }
             Ok(Response::Handle(id))
         }
@@ -1301,6 +1376,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::GraphInstantiate { graph, exec_vh } => {
             let real_graph = raw_graph(sess, graph);
             let e = b.graph_instantiate(real_graph)?;
+            exec_template_register(e, real_graph); // for Path 2 clone re-instantiation
+            if fork_isolate_enabled() {
+                template_graph_mark(real_graph); // keep it alive for clones
+            }
             if exec_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(exec_vh, e);
                 sess.owned_graph_reals.insert(e);
@@ -1309,25 +1388,58 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::GraphLaunch { graph_exec, stream } => {
             let real = raw_graph(sess, graph_exec);
-            // Fork isolation + an INHERITED cudagraph is silent corruption: the
-            // graph baked in the golden's device addresses at capture time and
-            // `cuGraphLaunch` replays them un-translated, so the clone would write
-            // the golden's / a sibling's memory. Fail loud until per-clone graph
-            // node patching lands (docs/cuda-fork-production-plan.md, Path 2). A
-            // graph the clone captured ITSELF (in owned_graph_reals) is fine —
-            // its nodes were translated at capture time. Eager mode has no graphs,
-            // so this never fires there.
-            if !sess.dptr_trans.is_empty() && !sess.owned_graph_reals.contains(&real) {
+            // Fork isolation + an INHERITED cudagraph: the graph baked in the
+            // golden's device addresses at capture time, so replaying it verbatim
+            // would write the golden's / a sibling's memory. A graph the clone
+            // captured itself (owned_graph_reals) is already correct; eager mode
+            // has no graphs, so this branch never fires there.
+            let inherited_isolated =
+                !sess.dptr_trans.is_empty() && !sess.owned_graph_reals.contains(&real);
+            if inherited_isolated && !graph_patch_enabled() {
+                // Default: fail loud rather than silently corrupt. The Path 2
+                // graph-node-patch path (below) is experimental + incomplete.
                 eprintln!(
                     "[cuda-fork-isolate] refusing to launch an inherited CUDA graph in an \
-                     isolated clone (baked-in pointers would corrupt across clones). Run the \
-                     workload with enforce_eager, or land Path 2 graph-node patching."
+                     isolated clone. Run with enforce_eager, or set \
+                     SMOLVM_CUDA_FORK_GRAPH_PATCH=1 for the experimental graph-patch path."
                 );
-                Err(CUDA_ERROR_NOT_SUPPORTED)
-            } else {
-                let raw = raw_stream(sess, stream)?;
-                b.graph_launch(real, raw).map(|_| Response::Ok)
+                return Err(CUDA_ERROR_NOT_SUPPORTED);
             }
+            // Path 2 (experimental): re-instantiate the template and translate its
+            // node pointers to this clone's private copies.
+            let launch = if inherited_isolated {
+                match sess.clone_graph_execs.get(&real).copied() {
+                    Some(patched) => patched,
+                    None => {
+                        let template = exec_template_lookup(real).ok_or_else(|| {
+                            eprintln!(
+                                "[cuda-fork-isolate] inherited graph exec {real:#x} has no known \
+                                 template; refusing to launch (would corrupt across clones)"
+                            );
+                            CUDA_ERROR_NOT_SUPPORTED
+                        })?;
+                        let dbg = std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some();
+                        let patched = b.graph_instantiate(template).inspect_err(|e| {
+                            if dbg {
+                                eprintln!("[gpatch] reinstantiate template {template:#x} FAILED: {e}")
+                            }
+                        })?;
+                        b.graph_exec_patch(patched, template, &sess.dptr_trans)
+                            .inspect_err(|e| {
+                                if dbg {
+                                    eprintln!("[gpatch] patch exec {patched:#x} FAILED: {e}")
+                                }
+                            })?;
+                        sess.clone_graph_execs.insert(real, patched);
+                        sess.owned_graph_reals.insert(patched);
+                        patched
+                    }
+                }
+            } else {
+                real
+            };
+            let raw = raw_stream(sess, stream)?;
+            b.graph_launch(launch, raw).map(|_| Response::Ok)
         }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
@@ -1343,7 +1455,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::GraphDestroy { graph } => {
             let real = raw_graph(sess, graph);
             sess.graph_vhandles.lock().unwrap().remove(&graph);
-            if sess.owned_graph_reals.remove(&real) {
+            let owned = sess.owned_graph_reals.remove(&real);
+            if template_graph_is(real) {
+                // Keep the template alive so isolating clones can still
+                // re-instantiate + patch it (Path 2). Leaks the cuGraph.
+                Ok(Response::Ok)
+            } else if owned {
                 b.graph_destroy(real).map(|_| Response::Ok)
             } else {
                 Ok(Response::Ok)
