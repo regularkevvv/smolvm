@@ -2414,6 +2414,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-nvml-shim"
+version = "1.5.2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "smolvm-pack"
 version = "1.5.2"
 dependencies = [
