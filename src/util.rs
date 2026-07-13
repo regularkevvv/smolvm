@@ -99,6 +99,40 @@ pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
     env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
 }
 
+/// Parse a byte size like `16GiB`, `16G`, `512M`, or a plain byte count
+/// (`17179869184`). Suffixes are binary (1K = 1024); `K/M/G/T`, optionally with
+/// a trailing `i` and/or `B`, are accepted case-insensitively.
+pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("size must not be empty".to_string());
+    }
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let value: f64 = num
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid size (expected a number, optional K/M/G/T)"))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "ki" | "kib" | "kb" => 1 << 10,
+        "m" | "mi" | "mib" | "mb" => 1 << 20,
+        "g" | "gi" | "gib" | "gb" => 1 << 30,
+        "t" | "ti" | "tib" | "tb" => 1u64 << 40,
+        other => {
+            return Err(format!(
+                "invalid size unit '{other}' in '{s}' (use K, M, G, or T)"
+            ))
+        }
+    };
+    let bytes = (value * mult as f64) as u64;
+    if bytes == 0 {
+        return Err(format!("size '{s}' must be greater than zero"));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

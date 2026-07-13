@@ -1782,17 +1782,18 @@ impl AgentClient {
         })?;
 
         let mut total = 0u64;
+        let cap = file_transfer_max_total();
         loop {
             match self.recv_raw()? {
                 AgentResponse::DataChunk { data, done } => {
                     let next_total = total.saturating_add(data.len() as u64);
-                    if next_total > FILE_TRANSFER_MAX_TOTAL {
+                    if next_total > cap {
                         let _ = std::fs::remove_file(local_path);
                         return Err(Error::agent(
                             "read file",
                             format!(
                                 "guest streamed {} bytes, exceeding the {} byte cap",
-                                next_total, FILE_TRANSFER_MAX_TOTAL
+                                next_total, cap
                             ),
                         ));
                     }
@@ -2162,12 +2163,25 @@ where
 ///   with kilobytes instead of gigabytes).
 ///
 /// Both delegate to [`consume_streamed_read_inner`].
+/// The file-transfer size cap, in bytes. Defaults to the protocol's
+/// [`FILE_TRANSFER_MAX_TOTAL`] (4 GiB) and can be raised at runtime with
+/// `SMOLVM_FILE_TRANSFER_MAX_BYTES` (accepts a plain byte count or a suffixed
+/// size like `16GiB`). This lets an operator pack a VM snapshot whose overlay
+/// carries a large dependency tree (e.g. a ~5 GiB torch + CUDA-wheels env)
+/// without lowering the default DoS bound for everyone else.
+pub fn file_transfer_max_total() -> u64 {
+    std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|s| crate::util::parse_size_bytes(s.trim()).ok())
+        .unwrap_or(FILE_TRANSFER_MAX_TOTAL)
+}
+
 fn consume_streamed_read_with_progress<F, P>(next_response: F, on_progress: P) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<AgentResponse>,
     P: FnMut(u64),
 {
-    consume_streamed_read_inner(next_response, FILE_TRANSFER_MAX_TOTAL, on_progress)
+    consume_streamed_read_inner(next_response, file_transfer_max_total(), on_progress)
 }
 
 #[cfg(test)]

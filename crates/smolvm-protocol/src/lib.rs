@@ -103,9 +103,16 @@ pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
 /// dropped. This protects the host process from OOM if the guest
 /// (compromised or merely buggy) streams unbounded data.
 ///
-/// 4 GiB matches the order-of-magnitude of the default overlay disk
-/// and the `gpu_vram_mib` cap. Callers that need to move larger
-/// blobs should stage via a virtiofs mount instead of `cp`.
+/// 4 GiB matches the order-of-magnitude of the default overlay disk and the
+/// `gpu_vram_mib` cap. It is the compiled-in default. The host-side transfer
+/// paths (read/export, including `pack create --from-vm`) raise it at runtime
+/// via `SMOLVM_FILE_TRANSFER_MAX_BYTES` (see
+/// `agent::client::file_transfer_max_total`) so a VM snapshot whose overlay
+/// carries a large dependency tree (e.g. a torch + CUDA-wheels environment is
+/// ~5 GiB) can be packed without lowering the DoS bound for everyone else. The
+/// guest agent's write-path check runs inside the VM and cannot see that host
+/// env var, so it always enforces this const. Callers that need to move larger
+/// blobs routinely should stage via a virtiofs mount instead of `cp`.
 pub const FILE_TRANSFER_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Filename of the virtiofs-visible marker the agent creates when it is
