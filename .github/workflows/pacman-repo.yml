@@ -36,6 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
+      # fakeroot's SysV IPC breaks under GitHub's default container seccomp
+      # profile ("libfakeroot: payload not recognized" during makepkg package());
+      # unconfined seccomp lets faked's msgsnd/msgrcv through.
+      options: --security-opt seccomp=unconfined
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
