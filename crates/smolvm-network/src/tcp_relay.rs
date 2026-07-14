@@ -26,9 +26,11 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
+use crate::connector::{ConnectCancellation, ConnectTarget, OutboundConnector};
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use crate::virtual_dns::VirtualDns;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
@@ -64,6 +66,9 @@ pub struct TcpRelayTable {
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
     egress: EgressPolicy,
+    connector: Arc<dyn OutboundConnector>,
+    virtual_dns: Option<VirtualDns>,
+    cancellation: ConnectCancellation,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -124,7 +129,11 @@ struct PendingProxyEndpoints {
 #[derive(Debug)]
 pub enum RelayTarget {
     /// Open a new outbound host `TcpStream` to the destination.
-    Connect(SocketAddr),
+    Connect {
+        target: ConnectTarget,
+        connector: Arc<dyn OutboundConnector>,
+        cancellation: ConnectCancellation,
+    },
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
 }
@@ -184,7 +193,13 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(max_connections: Option<usize>, egress: EgressPolicy) -> Self {
+    pub fn new(
+        max_connections: Option<usize>,
+        egress: EgressPolicy,
+        connector: Arc<dyn OutboundConnector>,
+        virtual_dns: Option<VirtualDns>,
+        cancellation: ConnectCancellation,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
@@ -192,6 +207,9 @@ impl TcpRelayTable {
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
             egress,
+            connector,
+            virtual_dns,
+            cancellation,
         }
     }
 
@@ -227,16 +245,38 @@ impl TcpRelayTable {
             return false;
         }
 
-        // Egress policy: drop the guest SYN before any socket is created when the
-        // destination isn't allowed, so the guest just sees the connection fail.
-        // Inbound published-port flows take a separate path and are unaffected.
-        if !self.egress.allows(destination.ip()) {
-            tracing::debug!(
-                %destination,
-                "virtio-net: blocking outbound connection by egress policy"
-            );
-            return false;
-        }
+        // Recover a hostname for synthetic proxy-mode destinations before the
+        // policy check. A stale/unknown synthetic address is never treated as a
+        // literal address, or it could escape the hostname policy.
+        let target = match (destination, self.virtual_dns.as_ref()) {
+            (SocketAddr::V4(address), Some(virtual_dns)) if VirtualDns::contains(*address.ip()) => {
+                let Some(hostname) = virtual_dns.resolve(*address.ip()) else {
+                    tracing::debug!(%destination, "virtio-net: rejecting unknown virtual-DNS destination");
+                    return false;
+                };
+                if !self.egress.allows_hostname_connect(&hostname) {
+                    tracing::debug!(
+                        hostname,
+                        "virtio-net: blocking outbound hostname by egress policy"
+                    );
+                    return false;
+                }
+                ConnectTarget::Domain {
+                    hostname,
+                    port: address.port(),
+                }
+            }
+            _ => {
+                if !self.egress.allows(destination.ip()) {
+                    tracing::debug!(
+                        %destination,
+                        "virtio-net: blocking outbound connection by egress policy"
+                    );
+                    return false;
+                }
+                ConnectTarget::Ip(destination)
+            }
+        };
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
@@ -267,7 +307,11 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(destination),
+                    relay_target: RelayTarget::Connect {
+                        target,
+                        connector: self.connector.clone(),
+                        cancellation: self.cancellation.clone(),
+                    },
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -609,15 +653,19 @@ fn tcp_relay_loop(
     // 3. Non-blockingly read remote payloads from the socket into the channel.
     // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
     let mut stream = match relay_target {
-        RelayTarget::Connect(destination) => {
+        RelayTarget::Connect {
+            target,
+            connector,
+            cancellation,
+        } => {
             virtio_net_log!(
-                "virtio-net: connecting host TCP relay socket destination={}",
-                destination
+                "virtio-net: connecting host TCP relay socket target={:?}",
+                target
             );
-            let stream = TcpStream::connect(destination)?;
+            let stream = connector.connect(&target, &cancellation)?;
             virtio_net_log!(
-                "virtio-net: host TCP relay socket connected destination={}",
-                destination
+                "virtio-net: host TCP relay socket connected target={:?}",
+                target
             );
             stream
         }
@@ -792,6 +840,8 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::{outbound_connector, EgressProxy};
+    use std::net::TcpListener;
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -825,5 +875,98 @@ mod tests {
 
         assert!(connection.buffered_guest_data.is_none());
         assert_eq!(from_smoltcp.recv().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn synthetic_dns_destination_becomes_socks_domain_connect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).unwrap();
+
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).unwrap();
+            assert_eq!(&header[..4], &[0x05, 0x01, 0x00, 0x03]);
+            let mut hostname = vec![0u8; header[4] as usize];
+            stream.read_exact(&mut hostname).unwrap();
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(hostname, b"through-proxy.example");
+            assert_eq!(u16::from_be_bytes(port), 443);
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .unwrap();
+        });
+
+        let virtual_dns = VirtualDns::default();
+        let synthetic = virtual_dns.allocate("through-proxy.example").unwrap();
+        let proxy: EgressProxy = format!("socks5://{proxy_address}").parse().unwrap();
+        let connector = outbound_connector(Some(proxy));
+        let cancellation = ConnectCancellation::default();
+        let mut table = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted(),
+            connector,
+            Some(virtual_dns),
+            cancellation,
+        );
+        let source = "100.96.0.2:40000".parse().unwrap();
+        let destination = SocketAddr::new(synthetic.into(), 443);
+        let mut sockets = SocketSet::new(vec![]);
+        assert!(table.create_tcp_socket(source, destination, &mut sockets));
+
+        let pending = table
+            .connections
+            .values_mut()
+            .next()
+            .unwrap()
+            .pending_proxy_endpoints
+            .take()
+            .unwrap();
+        let RelayTarget::Connect {
+            target,
+            connector,
+            cancellation,
+        } = pending.relay_target
+        else {
+            panic!("outbound flow unexpectedly used an attached socket");
+        };
+        assert_eq!(
+            target,
+            ConnectTarget::Domain {
+                hostname: "through-proxy.example".into(),
+                port: 443,
+            }
+        );
+        drop(connector.connect(&target, &cancellation).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_synthetic_and_disallowed_hostnames_are_rejected_before_dial() {
+        let cancellation = ConnectCancellation::default();
+        let direct = outbound_connector(None);
+        let virtual_dns = VirtualDns::default();
+        let hosts = vec!["allowed.example".to_string()];
+        let mut table = TcpRelayTable::new(
+            None,
+            EgressPolicy::new(None, Some(&hosts)),
+            direct,
+            Some(virtual_dns.clone()),
+            cancellation,
+        );
+        let mut sockets = SocketSet::new(vec![]);
+        let source = "100.96.0.2:40000".parse().unwrap();
+        assert!(!table.create_tcp_socket(source, "198.18.9.9:443".parse().unwrap(), &mut sockets,));
+        let blocked = virtual_dns.allocate("blocked.example").unwrap();
+        assert!(!table.create_tcp_socket(
+            source,
+            SocketAddr::new(blocked.into(), 443),
+            &mut sockets,
+        ));
     }
 }

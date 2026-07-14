@@ -50,6 +50,7 @@
 //! smoltcp emitted frames  -> host_wake   -> frame writer
 //! ```
 
+use crate::connector::{ConnectCancellation, OutboundConnector};
 use crate::device::VirtioNetworkDevice;
 use crate::dns;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
@@ -60,6 +61,7 @@ use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
 use crate::udp_relay;
 use crate::virtio_net_log;
+use crate::virtual_dns::{VirtualDns, DEFAULT_VIRTUAL_DNS_TTL};
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
 };
@@ -157,6 +159,9 @@ pub fn start_network_stack(
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    connector: Arc<dyn OutboundConnector>,
+    virtual_dns: Option<VirtualDns>,
+    cancellation: ConnectCancellation,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -166,7 +171,17 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress))
+        .spawn(move || {
+            run_network_stack(
+                queues,
+                config,
+                tcp_receiver,
+                egress,
+                connector,
+                virtual_dns,
+                cancellation,
+            )
+        })
 }
 
 fn run_network_stack(
@@ -174,6 +189,9 @@ fn run_network_stack(
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    connector: Arc<dyn OutboundConnector>,
+    virtual_dns: Option<VirtualDns>,
+    cancellation: ConnectCancellation,
 ) {
     // Poll loop overview:
     //
@@ -211,7 +229,20 @@ fn run_network_stack(
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone());
+    let proxy_mode = connector.proxy_mode();
+    if proxy_mode {
+        virtio_net_log!(
+            "virtio-net: SOCKS5 egress enabled; non-DNS UDP and external ICMP are rejected"
+        );
+    }
+    let proxy_non_tcp_deny = proxy_mode.then(|| EgressPolicy::from_allowed_cidrs(Some(&[])));
+    let mut relays = TcpRelayTable::new(
+        None,
+        egress.clone(),
+        connector,
+        virtual_dns.clone(),
+        cancellation,
+    );
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();
@@ -293,7 +324,7 @@ fn run_network_stack(
                 FrameAction::UdpFlow { destination } => {
                     // Same egress policy as TCP; a denied destination's datagram
                     // is silently dropped (a guest sees a normal UDP black hole).
-                    if udp_relay::should_relay_udp(destination, &egress)
+                    if should_relay_guest_udp(proxy_mode, destination, &egress)
                         && udp_sockets.ensure_socket(destination, &mut sockets)
                     {
                         if matches!(
@@ -330,11 +361,15 @@ fn run_network_stack(
         // Enqueue guest DNS queries to the offload thread (or answer blocked
         // ones locally), then deliver any answers it has produced back to the
         // guest. Neither step blocks on the upstream resolver.
+        let dns_egress = DnsEgress {
+            policy: &egress,
+            virtual_dns: virtual_dns.as_ref(),
+        };
         let mut woke_dns = false;
         woke_dns |= dispatch_dns_udp(
             dns_socket_handle,
             &mut sockets,
-            &egress,
+            dns_egress,
             config.upstream_dns,
             &mut dns_gateway,
             &dns_channels.to_relay,
@@ -343,7 +378,7 @@ fn run_network_stack(
             &dns_tcp_handles,
             &mut dns_tcp_conns,
             &mut sockets,
-            &egress,
+            dns_egress,
             config.upstream_dns,
             &mut dns_gateway,
             &dns_channels.to_relay,
@@ -373,11 +408,12 @@ fn run_network_stack(
         // ingress above. Forward external pings to the relay (answering gateway
         // pings locally), then send back any replies it produced.
         let mut woke_icmp = false;
+        let icmp_egress = proxy_non_tcp_deny.as_ref().unwrap_or(&egress);
         woke_icmp |= drain_icmp_echo(
             &mut sockets,
             icmp4_handle,
             false,
-            &egress,
+            icmp_egress,
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -385,7 +421,7 @@ fn run_network_stack(
             &mut sockets,
             icmp6_handle,
             true,
-            &egress,
+            icmp_egress,
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -433,6 +469,14 @@ fn run_network_stack(
         events.clear();
         let _ = poller.wait(&mut events, timeout);
     }
+}
+
+fn should_relay_guest_udp(
+    proxy_mode: bool,
+    destination: SocketAddr,
+    egress: &EgressPolicy,
+) -> bool {
+    !proxy_mode && udp_relay::should_relay_udp(destination, egress)
 }
 
 fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig) -> Interface {
@@ -756,16 +800,42 @@ enum DnsDecision {
     Forward { learn: bool },
 }
 
+#[derive(Clone, Copy)]
+struct DnsEgress<'a> {
+    policy: &'a EgressPolicy,
+    virtual_dns: Option<&'a VirtualDns>,
+}
+
 /// Classify a query under the allow-host policy. When the DNS filter is
 /// inactive everything is forwarded (no learning); otherwise only allow-listed
 /// names are forwarded and learned, others get NXDOMAIN and unparseable ones
 /// SERVFAIL. Identical policy to the old `filtered_dns_response`.
-fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
-    if !egress.dns_filter_active() {
+fn classify_dns_query(query: &[u8], egress: DnsEgress<'_>) -> DnsDecision {
+    if let Some(virtual_dns) = egress.virtual_dns {
+        return match dns::question_name(query) {
+            Some(name) if !egress.policy.allows_hostname_connect(&name) => {
+                virtio_net_log!(
+                    "virtio-net: blocking virtual DNS query by egress policy name={}",
+                    name
+                );
+                DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
+            }
+            Some(name) => match virtual_dns.allocate(&name) {
+                Some(address) => DnsDecision::Immediate(dns::synthetic_response(
+                    query,
+                    address,
+                    DEFAULT_VIRTUAL_DNS_TTL.as_secs() as u32,
+                )),
+                None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+            },
+            None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+        };
+    }
+    if !egress.policy.dns_filter_active() {
         return DnsDecision::Forward { learn: false };
     }
     match dns::question_name(query) {
-        Some(name) if egress.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
+        Some(name) if egress.policy.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
         Some(name) => {
             virtio_net_log!(
                 "virtio-net: blocking DNS query by allow-host policy name={}",
@@ -784,7 +854,7 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
 fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
+    egress: DnsEgress<'_>,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
@@ -959,7 +1029,7 @@ fn process_dns_tcp(
     handles: &[SocketHandle],
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
+    egress: DnsEgress<'_>,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
@@ -1220,6 +1290,20 @@ mod tests {
         f
     }
 
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query
+    }
+
     #[test]
     fn dns_tcp_to_gateway_is_intercepted_not_relayed() {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
@@ -1248,6 +1332,61 @@ mod tests {
         assert!(matches!(
             classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw]),
             FrameAction::TcpSyn { .. }
+        ));
+    }
+
+    #[test]
+    fn proxy_dns_synthesizes_a_and_suppresses_aaaa_without_upstream_io() {
+        let virtual_dns = VirtualDns::default();
+        let policy = EgressPolicy::unrestricted();
+        let a_query = dns_query("api.example.test", 1);
+        let egress = DnsEgress {
+            policy: &policy,
+            virtual_dns: Some(&virtual_dns),
+        };
+        let DnsDecision::Immediate(a_response) = classify_dns_query(&a_query, egress) else {
+            panic!("proxy DNS query was forwarded upstream");
+        };
+        let records = dns::answer_ip_records(&a_response);
+        assert_eq!(records.len(), 1);
+        let IpAddr::V4(address) = records[0].0 else {
+            panic!("expected synthetic IPv4 address");
+        };
+        assert!(VirtualDns::contains(address));
+        assert_eq!(
+            virtual_dns.resolve(address).as_deref(),
+            Some("api.example.test")
+        );
+
+        let DnsDecision::Immediate(aaaa_response) =
+            classify_dns_query(&dns_query("api.example.test", 28), egress)
+        else {
+            panic!("proxy AAAA query was forwarded upstream");
+        };
+        assert!(dns::answer_ip_records(&aaaa_response).is_empty());
+    }
+
+    #[test]
+    fn proxy_dns_and_non_dns_udp_fail_closed_under_policy() {
+        let hosts = vec!["allowed.example".to_string()];
+        let policy = EgressPolicy::new(None, Some(&hosts));
+        let virtual_dns = VirtualDns::default();
+        let DnsDecision::Immediate(response) = classify_dns_query(
+            &dns_query("blocked.example", 1),
+            DnsEgress {
+                policy: &policy,
+                virtual_dns: Some(&virtual_dns),
+            },
+        ) else {
+            panic!("blocked proxy DNS query was forwarded");
+        };
+        assert!(dns::answer_ip_records(&response).is_empty());
+
+        let destination = "203.0.113.10:443".parse().unwrap();
+        assert!(!should_relay_guest_udp(
+            true,
+            destination,
+            &EgressPolicy::unrestricted()
         ));
     }
 }

@@ -26,6 +26,7 @@
 #   cli             test_cli.sh
 #   api             test_api.sh
 #   virtio-net      test_virtio_net.sh
+#   egress-proxy    test_egress_proxy.sh (requires source-matched agent rootfs)
 #   smolfile        test_smolfile.sh
 #   secrets         test_secrets.sh
 #   pack            test_pack.sh
@@ -66,6 +67,7 @@ get_suite() {
         cli)         echo "$SCRIPT_DIR/test_cli.sh" ;;
         api)         echo "$SCRIPT_DIR/test_api.sh" ;;
         virtio-net)  echo "$SCRIPT_DIR/test_virtio_net.sh" ;;
+        egress-proxy) echo "$SCRIPT_DIR/test_egress_proxy.sh" ;;
         smolfile)    echo "$SCRIPT_DIR/test_smolfile.sh" ;;
         secrets)     echo "$SCRIPT_DIR/test_secrets.sh" ;;
         pack)        echo "$SCRIPT_DIR/test_pack.sh" ;;
@@ -155,7 +157,7 @@ else
         get_suite "$group" > /dev/null || {
             echo "Unknown group: $group"
             echo "Feature suites: bare db network volumes ports storage resources reliability run image local-image fork-base packed"
-            echo "Extended suites: cli api virtio-net smolfile pack pack-quick gpu scale"
+            echo "Extended suites: cli api virtio-net egress-proxy smolfile pack pack-quick gpu scale"
             echo "Other: bench"
             exit 1
         }

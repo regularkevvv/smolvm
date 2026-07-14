@@ -41,6 +41,46 @@ pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
     }
 }
 
+#[cfg(test)]
+mod egress_proxy_launch_tests {
+    use super::*;
+
+    fn proxy(port: u16) -> smolvm::network::EgressProxy {
+        format!("socks5://clone-user:clone-pass@127.0.0.1:{port}")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn forkable_start_carries_the_current_launch_endpoint() {
+        let launch = forkable_launch("golden").with_egress_proxy(Some(proxy(41001)));
+        assert!(launch.forkable);
+        assert!(launch.control_socket.is_some());
+        assert_eq!(
+            launch.egress_proxy.as_ref().unwrap().expose_secret(),
+            "socks5://clone-user:clone-pass@127.0.0.1:41001"
+        );
+    }
+
+    #[test]
+    fn clone_launches_can_receive_fresh_endpoints() {
+        let first = ForkLaunch {
+            snapshot_dir: Some("/tmp/snapshot".into()),
+            ..Default::default()
+        }
+        .with_egress_proxy(Some(proxy(41002)));
+        let second = ForkLaunch {
+            snapshot_dir: Some("/tmp/snapshot".into()),
+            ..Default::default()
+        }
+        .with_egress_proxy(Some(proxy(41003)));
+        assert_ne!(
+            first.egress_proxy.unwrap().expose_secret(),
+            second.egress_proxy.unwrap().expose_secret()
+        );
+    }
+}
+
 /// Get the agent manager for an optional name (default if `None`).
 ///
 /// When no name is given, uses `AgentManager::new_default()` which is
@@ -684,6 +724,15 @@ pub struct ForkLaunch {
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Control socket path (set together with `forkable`).
     pub control_socket: Option<std::path::PathBuf>,
+    /// Current launch's transient SOCKS5 endpoint.
+    pub egress_proxy: Option<smolvm::network::EgressProxy>,
+}
+
+impl ForkLaunch {
+    pub fn with_egress_proxy(mut self, egress_proxy: Option<smolvm::network::EgressProxy>) -> Self {
+        self.egress_proxy = egress_proxy;
+        self
+    }
 }
 
 /// Fork parameters for starting `name` as a forkable base (memfd RAM + a control
@@ -693,6 +742,7 @@ pub fn forkable_launch(name: &str) -> ForkLaunch {
         forkable: true,
         control_socket: Some(smolvm::agent::fork::control_socket_path(name)),
         snapshot_dir: None,
+        egress_proxy: None,
     }
 }
 
@@ -707,6 +757,7 @@ pub fn fork_vm(
     clone: &str,
     clone_forkable: bool,
     pinned_ports: &[(u16, u16)],
+    egress_proxy: Option<smolvm::network::EgressProxy>,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
@@ -735,7 +786,8 @@ pub fn fork_vm(
         ForkLaunch {
             snapshot_dir: Some(prep.snapshot_dir.clone()),
             ..Default::default()
-        },
+        }
+        .with_egress_proxy(egress_proxy),
     );
     if result.is_ok() {
         // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
@@ -845,6 +897,11 @@ pub fn start_vm_named(
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let mut resources = record.vm_resources();
+    let proxy_egress = fork.egress_proxy.is_some();
+    if proxy_egress {
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+    }
 
     // Re-resolve allow_hosts to fresh CIDRs at start time.
     // Hostnames for CDN-backed services (e.g. dl-cdn.alpinelinux.org) rotate
@@ -859,16 +916,18 @@ pub fn start_vm_named(
     // egress restriction at all (fail-open). With it, the policy starts as
     // deny-all and launcher.rs's ensure_dns_in_cidrs adds 1.1.1.1/32 as the
     // minimum (fail-closed: only DNS reachable until resolution succeeds).
-    if let Some(ref hosts) = record.dns_filter_hosts {
-        if !hosts.is_empty() {
-            let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
-            for host in hosts {
-                match crate::cli::parsers::resolve_host_to_cidrs(host) {
-                    Ok(cidrs) => existing.extend(cidrs),
-                    Err(e) => eprintln!(
-                        "Warning: could not resolve '{}' for egress policy: {}",
-                        host, e
-                    ),
+    if !proxy_egress {
+        if let Some(ref hosts) = record.dns_filter_hosts {
+            if !hosts.is_empty() {
+                let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
+                for host in hosts {
+                    match crate::cli::parsers::resolve_host_to_cidrs(host) {
+                        Ok(cidrs) => existing.extend(cidrs),
+                        Err(e) => eprintln!(
+                            "Warning: could not resolve '{}' for egress policy: {}",
+                            host, e
+                        ),
+                    }
                 }
             }
         }
@@ -931,6 +990,7 @@ pub fn start_vm_named(
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
     features.control_socket = fork.control_socket;
+    features.egress_proxy = fork.egress_proxy;
     // A machine created from a local image archive/dir persists a `local:…`
     // reference; re-derive its virtiofs mount dir so the guest assembles the
     // rootfs from it instead of pulling.
@@ -1267,7 +1327,11 @@ fn check_port_conflicts(
 }
 
 /// Start the default machine.
-pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
+pub fn start_vm_default(
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    egress_proxy: Option<smolvm::network::EgressProxy>,
+) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
@@ -1283,7 +1347,14 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     cli_recover_if_unreachable("default");
 
     eprintln!("Starting machine 'default'...");
-    manager.ensure_running()?;
+    let mut resources = smolvm::agent::VmResources::default();
+    let mut features = smolvm::agent::LaunchFeatures::default();
+    if let Some(egress_proxy) = egress_proxy {
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+        features.egress_proxy = Some(egress_proxy);
+    }
+    manager.ensure_running_with_full_config(Vec::new(), Vec::new(), resources, features)?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;

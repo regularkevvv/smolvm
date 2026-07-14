@@ -235,6 +235,14 @@ pub struct PackRunCmd {
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Route guest TCP egress through a launch-only SOCKS5 proxy.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://[USER:PASS@]HOST:PORT",
+        help_heading = "Network"
+    )]
+    pub egress_proxy: Option<crate::cli::parsers::EgressProxyArg>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -273,6 +281,7 @@ pub struct PackRunCmd {
 impl PackRunCmd {
     /// Execute the pack run command.
     pub fn run(self) -> smolvm::Result<()> {
+        let egress_proxy = crate::cli::parsers::parse_egress_proxy(self.egress_proxy.as_ref())?;
         // 1. Resolve sidecar path
         let sidecar_path = resolve_sidecar_path(self.sidecar.as_deref())?;
 
@@ -400,11 +409,23 @@ impl PackRunCmd {
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
 
+        if egress_proxy.is_some() && self.net_backend == Some(NetworkBackend::Tsi) {
+            return Err(Error::config(
+                "--egress-proxy",
+                "SOCKS5 egress requires --net-backend virtio-net",
+            ));
+        }
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || manifest.network || !self.port.is_empty(),
-            network_backend: self.net_backend,
+            network: self.net
+                || manifest.network
+                || !self.port.is_empty()
+                || egress_proxy.is_some(),
+            network_backend: egress_proxy
+                .as_ref()
+                .map(|_| NetworkBackend::VirtioNet)
+                .or(self.net_backend),
             dns: None,
             gpu: manifest.gpu,
             storage_gib,
@@ -444,6 +465,7 @@ impl PackRunCmd {
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
             let cuda_sock_clone = cuda_sock.clone();
+            let egress_proxy_for_child = egress_proxy.clone();
             smolvm::process::fork_session_leader(move || {
                 // Child process: load libkrun via dlopen and launch VM
                 let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -470,6 +492,7 @@ impl PackRunCmd {
                     } else {
                         None
                     },
+                    egress_proxy: egress_proxy_for_child,
                 };
 
                 // Detach from parent's terminal so libkrun doesn't
@@ -552,6 +575,9 @@ impl PackRunCmd {
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
+            }
+            if let Some(ref proxy) = egress_proxy {
+                cmd.env("SMOLVM_EGRESS_PROXY", proxy.expose_secret());
             }
             // Detach from the launching console and give the VM its own process
             // group so a Ctrl-C in the launcher isn't forwarded — mirrors the
@@ -1314,6 +1340,7 @@ fn run_ephemeral(
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
+                egress_proxy: None,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1484,6 +1511,7 @@ fn run_from_cache(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            egress_proxy: None,
         };
 
         // Detach from parent's terminal so libkrun doesn't
@@ -1908,6 +1936,7 @@ fn daemon_start(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            egress_proxy: None,
         };
 
         // Detach from parent's terminal before launching the VM.

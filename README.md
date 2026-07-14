@@ -60,6 +60,11 @@ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget 
 
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
 # fails — not in allow list
+
+# route guest TCP through SOCKS5 while preserving hostnames at the proxy
+smolvm machine run --image alpine \
+  --egress-proxy socks5://user:pass@127.0.0.1:1080 -- wget -qO- https://example.com
+# the endpoint is launch-only; non-DNS UDP is rejected in proxy mode
 ```
 
 **Pack into portable executables** — turn any workload into a self-contained binary. All dependencies are pre-baked — no install step, no runtime downloads, boots in <200ms.

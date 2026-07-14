@@ -74,6 +74,47 @@ pub fn question_name(packet: &[u8]) -> Option<String> {
     Some(name)
 }
 
+/// Type of the first (and only) DNS question.
+pub fn question_type(packet: &[u8]) -> Option<u16> {
+    let end = question_section_end(packet)?;
+    read_u16(packet, end - DNS_QUESTION_FIXED_LEN)
+}
+
+/// Build a successful virtual-DNS response.
+///
+/// An A query receives `address`; every other type receives NOERROR with an
+/// empty answer section. In particular, proxy mode intentionally returns no
+/// AAAA records until a synthetic IPv6 design is available.
+pub fn synthetic_response(query: &[u8], address: Ipv4Addr, ttl: u32) -> Vec<u8> {
+    let Some(question_end) = question_section_end(query) else {
+        return error_response(query, DNS_RCODE_SERVFAIL);
+    };
+    let qtype = question_type(query).unwrap_or(0);
+    let id = &query[..DNS_ID_LEN];
+    let req_flags = read_u16(query, DNS_FLAGS_OFFSET).unwrap_or(0);
+    let flags =
+        DNS_FLAG_RESPONSE | (req_flags & DNS_FLAG_RECURSION_DESIRED) | DNS_FLAG_RECURSION_AVAILABLE;
+    let answer_count = u16::from(qtype == DNS_TYPE_A);
+    let mut response = Vec::with_capacity(question_end + 16);
+    response.extend_from_slice(id);
+    response.extend_from_slice(&flags.to_be_bytes());
+    response.extend_from_slice(&DNS_ONE_QUESTION.to_be_bytes());
+    response.extend_from_slice(&answer_count.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]);
+    if answer_count == 1 {
+        // The answer name points at the question name at offset 12.
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
+        response.extend_from_slice(&address.octets());
+    }
+    response
+}
+
 /// Extract `(IpAddr, ttl)` pairs from the A and AAAA records in a DNS response.
 pub fn answer_ip_records(packet: &[u8]) -> Vec<(IpAddr, u32)> {
     parse_answer_ip_records(packet).unwrap_or_default()
@@ -270,6 +311,24 @@ mod tests {
             question_name(&query_for("www.example.com")).as_deref(),
             Some("www.example.com")
         );
+    }
+
+    #[test]
+    fn builds_synthetic_a_and_empty_aaaa_responses() {
+        let query = query_for("proxy.example");
+        let response = synthetic_response(&query, Ipv4Addr::new(198, 18, 0, 7), 60);
+        assert_eq!(read_u16(&response, DNS_ANCOUNT_OFFSET), Some(1));
+        assert_eq!(
+            answer_ip_records(&response),
+            vec![(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 7)), 60)]
+        );
+
+        let mut aaaa = query;
+        let qtype = aaaa.len() - DNS_QUESTION_FIXED_LEN;
+        aaaa[qtype..qtype + 2].copy_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
+        let response = synthetic_response(&aaaa, Ipv4Addr::new(198, 18, 0, 8), 60);
+        assert_eq!(read_u16(&response, DNS_ANCOUNT_OFFSET), Some(0));
+        assert!(answer_ip_records(&response).is_empty());
     }
 
     #[test]

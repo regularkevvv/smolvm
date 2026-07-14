@@ -70,6 +70,8 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Launch-only SOCKS5 endpoint for transparent virtio-net egress.
+    pub egress_proxy: Option<crate::network::EgressProxy>,
 }
 
 /// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
@@ -325,6 +327,9 @@ pub fn launch_agent_vm_dynamic(
             let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
                 config.resources.allowed_cidrs.as_deref(),
             );
+            // Own the launch-only value before the Windows accept thread so
+            // that thread never captures the borrowed `PackedLaunchConfig`.
+            let egress_proxy = config.egress_proxy.clone();
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX
             // stream: a socketpair fd on Unix, a per-VM path listener libkrun
@@ -340,6 +345,7 @@ pub fn launch_agent_vm_dynamic(
                     guest_network,
                     &port_mappings,
                     egress,
+                    egress_proxy.clone(),
                 ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
@@ -399,7 +405,13 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress) {
+                            match start_virtio_network(
+                                sock,
+                                guest_network,
+                                &port_mappings,
+                                egress,
+                                egress_proxy.clone(),
+                            ) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")

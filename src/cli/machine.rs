@@ -60,13 +60,18 @@ fn resolve_egress_flags(
     allow_host: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
+    resolve_hosts_on_host: bool,
 ) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
-    // Resolve hostnames to CIDRs — fail hard on resolution errors
-    for host in &allow_host {
-        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
-            .map_err(|e| smolvm::Error::config("--allow-host", e))?;
-        tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
-        allow_cidr.extend(cidrs);
+    // Direct egress learns concrete IPs for the allow-list. Proxy egress must
+    // preserve names and let the SOCKS endpoint resolve them in its VPN/split-
+    // DNS context, so it deliberately skips host resolution here.
+    if resolve_hosts_on_host {
+        for host in &allow_host {
+            let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
+                .map_err(|e| smolvm::Error::config("--allow-host", e))?;
+            tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
+            allow_cidr.extend(cidrs);
+        }
     }
 
     if outbound_localhost_only {
@@ -406,6 +411,15 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
 
+    /// Route all guest TCP egress through this launch-only SOCKS5 proxy.
+    /// Hostnames are preserved with virtual DNS; non-DNS UDP is rejected.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://[USER:PASS@]HOST:PORT",
+        help_heading = "Network"
+    )]
+    pub egress_proxy: Option<crate::cli::parsers::EgressProxyArg>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long, help_heading = "Resources")]
     pub gpu: bool,
@@ -625,6 +639,16 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+fn should_use_init_cache(
+    no_init_cache: bool,
+    detach: bool,
+    image: Option<&str>,
+    has_init: bool,
+    proxy_egress: bool,
+) -> bool {
+    !proxy_egress && !no_init_cache && !detach && image_bakeable(image) && has_init
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -783,6 +807,14 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        let egress_proxy = crate::cli::parsers::parse_egress_proxy(self.egress_proxy.as_ref())?;
+        if egress_proxy.is_some() && self.net_backend == Some(NetworkBackend::Tsi) {
+            return Err(Error::config(
+                "--egress-proxy",
+                "SOCKS5 egress requires --net-backend virtio-net",
+            ));
+        }
+
         // --max-image-size raises the archive cap for this invocation by setting
         // the env var the resolver reads (image_source::max_archive_bytes).
         if let Some(bytes) = self.max_image_size {
@@ -807,6 +839,9 @@ impl RunCmd {
                 port: self.port,
                 net: self.net,
                 net_backend: self.net_backend,
+                egress_proxy: egress_proxy.as_ref().map(|proxy| {
+                    crate::cli::parsers::EgressProxyArg::from_secret(proxy.expose_secret())
+                }),
                 cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
                 mem: (self.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(self.mem),
                 storage: self.storage,
@@ -843,7 +878,8 @@ impl RunCmd {
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
-            self.net,
+            self.net || egress_proxy.is_some(),
+            egress_proxy.is_none(),
         )?;
 
         let params = crate::cli::smolfile::build_create_params(
@@ -856,7 +892,10 @@ impl RunCmd {
             self.volume,
             self.port,
             net,
-            self.net_backend,
+            egress_proxy
+                .as_ref()
+                .map(|_| NetworkBackend::VirtioNet)
+                .or(self.net_backend),
             self.dns,
             vec![],
             self.env,
@@ -894,11 +933,17 @@ impl RunCmd {
         // `--image -` archive can't be re-read by the bake's child subprocess
         // (null stdin) anyway. Local images take the direct path below, which
         // stages the archive once in this process and runs init inline (#459).
-        if !self.no_init_cache
-            && !self.detach
-            && image_bakeable(params.image.as_deref())
-            && !params.init.is_empty()
-        {
+        // A proxy launch must perform image pull/init inside the actual proxied
+        // VM. The cache baker is a separate CLI subprocess; forwarding the
+        // credential in its argv would violate the launch-only secrecy contract,
+        // while omitting it would allow that helper VM to bypass the proxy.
+        if should_use_init_cache(
+            self.no_init_cache,
+            self.detach,
+            params.image.as_deref(),
+            !params.init.is_empty(),
+            egress_proxy.is_some(),
+        ) {
             let cached =
                 ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
             // The real workload: CLI trailing args win, else the Smolfile's
@@ -922,6 +967,9 @@ impl RunCmd {
                 port: params.port.clone(),
                 net: params.net,
                 net_backend: params.network_backend,
+                egress_proxy: egress_proxy.as_ref().map(|proxy| {
+                    crate::cli::parsers::EgressProxyArg::from_secret(proxy.expose_secret())
+                }),
                 cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
                 mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
                 storage: params.storage_gb,
@@ -1091,6 +1139,7 @@ impl RunCmd {
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
+            egress_proxy,
             ..Default::default()
         };
 
@@ -1632,6 +1681,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_egress_disables_the_unproxied_init_cache_baker() {
+        assert!(should_use_init_cache(
+            false,
+            false,
+            Some("alpine:latest"),
+            true,
+            false,
+        ));
+        assert!(!should_use_init_cache(
+            false,
+            false,
+            Some("alpine:latest"),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
     fn parse_cli_secret_refs_builds_env_and_file_refs() {
         let refs = parse_cli_secret_refs(
             &["GUEST_TOKEN=HOST_TOKEN".to_string()],
@@ -1681,6 +1748,87 @@ mod tests {
         };
         assert_eq!(cmd.name, Some("foo".to_string()));
         assert!(cmd.detach);
+    }
+
+    #[test]
+    fn run_start_and_fork_accept_launch_only_egress_proxy() {
+        let run = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "--egress-proxy",
+            "socks5://user:pass@127.0.0.1:1080",
+        ]);
+        let MachineCmd::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            run.egress_proxy.as_ref().map(|arg| arg.expose_secret()),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+
+        let start = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--forkable",
+            "--egress-proxy",
+            "socks5://127.0.0.1:1081",
+        ]);
+        let MachineCmd::Start(start) = start.command else {
+            panic!("expected start command");
+        };
+        assert!(start.forkable);
+        assert_eq!(
+            crate::cli::parsers::parse_egress_proxy(start.egress_proxy.as_ref())
+                .unwrap()
+                .unwrap()
+                .port(),
+            1081
+        );
+
+        let fork = TestMachineCli::parse_from([
+            "machine",
+            "fork",
+            "--golden",
+            "golden",
+            "--name",
+            "clone",
+            "--egress-proxy",
+            "socks5://127.0.0.1:1082",
+        ]);
+        let MachineCmd::Fork(fork) = fork.command else {
+            panic!("expected fork command");
+        };
+        assert_eq!(
+            crate::cli::parsers::parse_egress_proxy(fork.egress_proxy.as_ref())
+                .unwrap()
+                .unwrap()
+                .port(),
+            1082
+        );
+    }
+
+    #[test]
+    fn egress_proxy_rejects_non_socks_scheme_without_echoing_credentials() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--egress-proxy",
+            "http://cli-user:cli-pass@127.0.0.1:1080",
+        ])
+        .unwrap();
+        let MachineCmd::Start(start) = cli.command else {
+            panic!("expected start command");
+        };
+        let error = crate::cli::parsers::parse_egress_proxy(start.egress_proxy.as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected socks5://"));
+        assert!(!error.contains("cli-user"));
+        assert!(!error.contains("cli-pass"));
     }
 
     // Documents the clap parsing behaviour: positionals before "--" land in
@@ -2223,6 +2371,7 @@ impl CreateCmd {
             self.allow_host,
             self.outbound_localhost_only,
             self.net,
+            true,
         )?;
 
         let name = self
@@ -2578,6 +2727,14 @@ pub struct StartCmd {
     #[arg(long)]
     pub forkable: bool,
 
+    /// Route this launch through a SOCKS5 proxy without persisting the endpoint.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://[USER:PASS@]HOST:PORT",
+        help_heading = "Network"
+    )]
+    pub egress_proxy: Option<crate::cli::parsers::EgressProxyArg>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2590,19 +2747,25 @@ impl StartCmd {
         let no_proxy = self.proxy_opts.no_proxy();
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
+        let egress_proxy = crate::cli::parsers::parse_egress_proxy(self.egress_proxy.as_ref())?;
         let fork = if self.forkable {
             vm_common::forkable_launch(&name)
         } else {
             vm_common::ForkLaunch::default()
-        };
+        }
+        .with_egress_proxy(egress_proxy);
         match vm_common::start_vm_named(
-            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+            &name,
+            proxy,
+            no_proxy,
+            /* from_snapshot */ false,
+            fork.clone(),
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
+                vm_common::start_vm_default(proxy, no_proxy, fork.egress_proxy)
             }
             Err(e) => Err(e),
         }
@@ -2640,12 +2803,27 @@ pub struct ForkCmd {
     /// golden's forwards are remapped to freshly-allocated host ports.
     #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
     pub port: Vec<PortMapping>,
+
+    /// Route the clone through this fresh, launch-only SOCKS5 endpoint.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://[USER:PASS@]HOST:PORT",
+        help_heading = "Network"
+    )]
+    pub egress_proxy: Option<crate::cli::parsers::EgressProxyArg>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-        vm_common::fork_vm(&self.golden, &self.clone, self.forkable, &ports)
+        let egress_proxy = crate::cli::parsers::parse_egress_proxy(self.egress_proxy.as_ref())?;
+        vm_common::fork_vm(
+            &self.golden,
+            &self.clone,
+            self.forkable,
+            &ports,
+            egress_proxy,
+        )
     }
 }
 

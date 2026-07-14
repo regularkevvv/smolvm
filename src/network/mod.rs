@@ -12,3 +12,4 @@ pub use launch::{
     LaunchNetworkPlan,
 };
 pub use policy::get_dns_server;
+pub use smolvm_network::EgressProxy;

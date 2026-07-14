@@ -4,6 +4,9 @@
 //! to eliminate code duplication and ensure consistent validation.
 
 use smolvm::data::storage::HostMount;
+use std::convert::Infallible;
+use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Parse a duration string (e.g., "30s", "5m", "1h").
@@ -99,11 +102,63 @@ pub fn record_mounts_to_runconfig_bindings(
 }
 
 // Network helpers delegated to the library.
+
+/// Raw CLI holder whose formatting is always redacted. Parsing is intentionally
+/// deferred until command execution so clap never reflects a credential-bearing
+/// invalid value in its own validation error.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EgressProxyArg(Box<str>);
+
+impl EgressProxyArg {
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub fn from_secret(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl FromStr for EgressProxyArg {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_secret(value))
+    }
+}
+
+impl fmt::Debug for EgressProxyArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EgressProxyArg(<redacted>)")
+    }
+}
+
+/// Parse a launch-only SOCKS5 URI without ever reflecting the input (which may
+/// contain credentials) into the returned diagnostic.
+pub fn parse_egress_proxy(
+    value: Option<&EgressProxyArg>,
+) -> smolvm::Result<Option<smolvm::network::EgressProxy>> {
+    value
+        .map(|value| {
+            value.expose_secret().parse().map_err(|_| {
+                smolvm::Error::config("--egress-proxy", "expected socks5://[USER:PASS@]HOST:PORT")
+            })
+        })
+        .transpose()
+}
 pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_proxy_arg_debug_is_redacted() {
+        let arg: EgressProxyArg = "socks5://arg-user:arg-pass@127.0.0.1:1080".parse().unwrap();
+        let rendered = format!("{arg:?}");
+        assert!(!rendered.contains("arg-user"));
+        assert!(!rendered.contains("arg-pass"));
+    }
 
     #[test]
     fn parse_gpu_vram_mib_rejects_zero() {
