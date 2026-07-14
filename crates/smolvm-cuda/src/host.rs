@@ -452,6 +452,45 @@ fn fork_isolate_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
 }
 
+/// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
+/// can derive calls-per-token (the number that decides whether CUDA-over-network
+/// survives WAN round-trips). `SMOLVM_CUDA_RPC_STATS=1` logs the running count with
+/// a wall-clock stamp every 2000 calls; `SMOLVM_CUDA_RPC_DELAY_US=<n>` injects `n`
+/// microseconds of latency per call to model network RTT. Both cached so a normal
+/// run pays only one relaxed atomic add.
+static RPC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Subset of RPCs that actually block the client on a reply (non-quiet responses +
+/// fences). This — not the raw RPC count — is what a network RTT multiplies, since
+/// quiet/fire-and-forget requests pipeline.
+static ROUNDTRIP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn rpc_stats_enabled() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("SMOLVM_CUDA_RPC_STATS").is_some())
+}
+fn rpc_delay_us() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_RPC_DELAY_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+/// Models network round-trip time: `SMOLVM_CUDA_RTT_US` microseconds of latency
+/// added at each BLOCKING round-trip (fence / non-quiet response) only — quiet
+/// fire-and-forget requests are untouched, exactly as a real network would leave
+/// pipelined sends overlapped. Lets us confirm the P0 latency model on a live
+/// workload over the existing transport, without netem.
+fn rtt_us() -> u64 {
+    static R: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_RTT_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Let an isolating clone launch an INHERITED cudagraph by re-instantiating it and
 /// translating its node pointers to the clone's private copies (Path 2). ON by
 /// default: `graph_exec_patch` now translates device pointers embedded in by-value
@@ -788,6 +827,11 @@ fn serve_inner<S: Read + Write>(
             }
             // Fence: report (and clear) the sticky quiet failure.
             Some(&crate::proto::FENCE_OP) if payload.len() == 1 => {
+                ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rtt = rtt_us();
+                if rtt > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(rtt));
+                }
                 let st = std::mem::take(&mut quiet_sticky);
                 write_msg(&mut stream, &encode_response(st, &Response::Ok))?;
             }
@@ -818,6 +862,11 @@ fn serve_inner<S: Read + Write>(
                             continue;
                         }
                     }
+                }
+                ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rtt = rtt_us();
+                if rtt > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(rtt));
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
@@ -1094,6 +1143,22 @@ fn vram_limit() -> u64 {
 }
 
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
+    // P0 transport-viability: count every RPC; optionally inject per-call latency
+    // to model network RTT, and periodically log the count vs wall-clock so
+    // calls/sec (and thus calls-per-token) can be derived.
+    let rpc_n = RPC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let delay = rpc_delay_us();
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(delay));
+    }
+    if rpc_stats_enabled() && rpc_n.is_multiple_of(2000) {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let rt = ROUNDTRIP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[rpc-stats] count={rpc_n} roundtrips={rt} wall={wall:.6}");
+    }
     // Translate an opaque id to the backend's raw handle, or error.
     fn raw(map: &HashMap<u64, u64>, id: u64) -> CuResult<u64> {
         map.get(&id).copied().ok_or(CUDA_ERROR_INVALID_HANDLE)
