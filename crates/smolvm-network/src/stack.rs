@@ -448,12 +448,14 @@ fn run_network_stack(
             );
         }
 
-        relays.cleanup_closed(&mut sockets);
-
         // Second egress pass: DNS responses or relay data may have queued more
-        // packets for the guest.
+        // packets for the guest. In particular, a host connector failure calls
+        // `tcp::Socket::abort()`, which leaves one RST queued in a Closed socket.
+        // Flush before cleanup or the guest never sees that reset and can hang
+        // indefinitely on a connection whose proxy dial already failed.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
+        relays.cleanup_closed(&mut sockets);
 
         let timeout = interface
             .poll_delay(now, &sockets)

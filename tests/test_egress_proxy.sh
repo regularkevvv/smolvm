@@ -93,4 +93,33 @@ if rg -a -l 'golden-pass|clone-pass' "$TEST_DIR"; then
     exit 1
 fi
 
+# Killing the launch-only proxy must fail a fresh guest connection promptly.
+# The host deadline is intentional: BusyBox wget delegates TLS to ssl_client,
+# which does not reliably honor wget's own -T timeout if the guest TCP socket
+# never receives a reset.
+kill "$PROXY2_PID"
+wait "$PROXY2_PID" 2>/dev/null || true
+PROXY2_PID=""
+"$SMOLVM" machine exec --name "$CLONE" -- sh -c \
+    'wget -T 3 -qO- https://www.iana.org >/dev/null' &
+FAIL_CLOSED_PID=$!
+FAIL_CLOSED_DONE=0
+for _ in $(seq 1 100); do
+    if ! kill -0 "$FAIL_CLOSED_PID" 2>/dev/null; then
+        FAIL_CLOSED_DONE=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ $FAIL_CLOSED_DONE -ne 1 ]]; then
+    kill "$FAIL_CLOSED_PID" 2>/dev/null || true
+    wait "$FAIL_CLOSED_PID" 2>/dev/null || true
+    echo "guest connection did not fail promptly after egress proxy exit" >&2
+    exit 1
+fi
+if wait "$FAIL_CLOSED_PID"; then
+    echo "guest connection bypassed the stopped egress proxy" >&2
+    exit 1
+fi
+
 echo "egress-proxy-fork-https-ok"

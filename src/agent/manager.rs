@@ -2351,16 +2351,26 @@ impl AgentManager {
                     let mut inner = self.inner.lock();
                     if let Some(ref mut child) = inner.child {
                         if !child.is_running() {
+                            let exit_code = child.exit_code();
+                            let log = std::fs::read_to_string(&self.startup_error_log)
+                                .ok()
+                                .map(|content| content.trim().to_string())
+                                .filter(|content| !content.is_empty());
                             return Err(Error::agent(
                                 "monitor agent",
-                                "clone agent process exited during startup".to_string(),
+                                format!(
+                                    "clone agent process exited during startup: {}",
+                                    boot_failure_reason(exit_code, log.as_deref())
+                                ),
                             ));
                         }
                     }
                 }
                 if self.vsock_socket.exists() {
                     if let Ok(mut client) =
-                        super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
+                        super::AgentClient::connect_with_clone_boot_probe_timeout(
+                            &self.vsock_socket,
+                        )
                     {
                         if client.ping().is_ok() {
                             tracing::info!(

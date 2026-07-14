@@ -523,6 +523,16 @@ impl AgentClient {
         Self::connect_with_timeouts_ms(socket_path.as_ref(), 5, 5)
     }
 
+    /// Connect for a restored clone's readiness ping.
+    ///
+    /// Unlike the marker-first cold-boot fallback above, a clone can only
+    /// prove readiness by answering this ping. Give its already-running agent
+    /// enough time to schedule and reply under host/network load; a 5ms read
+    /// deadline can otherwise create a retry storm of abandoned connections.
+    pub fn connect_with_clone_boot_probe_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 250, 250)
+    }
+
     /// Internal connect implementation (single attempt).
     fn connect_once(socket_path: &Path) -> Result<Self> {
         Self::connect_with_timeouts(
@@ -2777,5 +2787,57 @@ mod stalled_body_tests {
         );
 
         server.join().expect("server thread joined");
+    }
+}
+
+#[cfg(test)]
+mod clone_boot_probe_tests {
+    use super::*;
+    use crate::platform::uds::UdsListener;
+    use smolvm_protocol::{encode_message, AgentResponse};
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn clone_probe_allows_a_scheduled_agent_time_to_reply() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        #[cfg(unix)]
+        let socket_path = PathBuf::from(format!("/tmp/svmp-{}-{nonce}.sock", std::process::id()));
+        #[cfg(windows)]
+        let socket_path =
+            std::env::temp_dir().join(format!("svmp-{}-{nonce}.sock", std::process::id()));
+        let listener = UdsListener::bind(&socket_path).expect("bind clone probe socket");
+
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().expect("accept clone probe");
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).expect("read ping length");
+            let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut payload).expect("read ping payload");
+
+            // Reproduces the real regression: the restored agent accepted the
+            // connection immediately but host load delayed its response beyond
+            // the old 5ms deadline.
+            std::thread::sleep(Duration::from_millis(25));
+            stream
+                .write_all(
+                    &encode_message(&AgentResponse::Pong {
+                        version: PROTOCOL_VERSION,
+                    })
+                    .expect("encode pong"),
+                )
+                .expect("write delayed pong");
+        });
+
+        let mut client = AgentClient::connect_with_clone_boot_probe_timeout(&socket_path)
+            .expect("connect clone probe");
+        assert_eq!(client.ping().expect("delayed clone pong"), PROTOCOL_VERSION);
+        server.join().expect("clone probe server");
+        std::fs::remove_file(socket_path).expect("remove clone probe socket");
     }
 }
