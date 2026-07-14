@@ -17,6 +17,7 @@ TEST_DIR=$(mktemp -d /private/tmp/smolvm-egress.XXXXXX)
 HOST_HOME="$HOME"
 GOLDEN="egress-proxy-golden-$$"
 CLONE="egress-proxy-clone-$$"
+MISSING="egress-proxy-missing-$$"
 PROXY1_PORT=$((43000 + ($$ % 1000)))
 PROXY2_PORT=$((44000 + ($$ % 1000)))
 PROXY1_PID=""
@@ -39,6 +40,7 @@ cleanup() {
         echo "preserving failed egress test state at $TEST_DIR" >&2
     else
         "$SMOLVM" machine delete --name "$CLONE" -f >/dev/null 2>&1 || true
+        "$SMOLVM" machine delete --name "$MISSING" -f >/dev/null 2>&1 || true
         "$SMOLVM" machine delete --name "$GOLDEN" -f >/dev/null 2>&1 || true
         rm -rf "$TEST_DIR"
     fi
@@ -59,6 +61,30 @@ start_proxy() {
     done
     cat "$log" >&2
     return 1
+}
+
+expect_guest_https_failure_bounded() {
+    local machine="$1" url="$2" failure="$3" pid done=0
+    "$SMOLVM" machine exec --name "$machine" -- sh -c \
+        'wget -T 3 -qO- "$1" >/dev/null' sh "$url" &
+    pid=$!
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            done=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ $done -ne 1 ]]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        echo "$failure did not fail within the 10s host deadline" >&2
+        return 1
+    fi
+    if wait "$pid"; then
+        echo "$failure unexpectedly bypassed the configured egress proxy" >&2
+        return 1
+    fi
 }
 
 PROXY1_PID=$(start_proxy "$PROXY1_PORT" golden-pass "$TEST_DIR/proxy1.log")
@@ -88,7 +114,19 @@ PROXY2_PID=$(start_proxy "$PROXY2_PORT" clone-pass "$TEST_DIR/proxy2.log")
 '
 
 grep -q '^CONNECT example.com:443$' "$TEST_DIR/proxy2.log"
-if rg -a -l 'golden-pass|clone-pass' "$TEST_DIR"; then
+
+# A proxy that is absent from launch must also fail closed and promptly. This
+# is distinct from terminating a previously healthy endpoint below.
+MISSING_PORT=$(python3 -c \
+    'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+"$SMOLVM" machine fork \
+    --golden "$GOLDEN" \
+    --name "$MISSING" \
+    --egress-proxy "socks5://phase1:missing-pass@127.0.0.1:$MISSING_PORT"
+expect_guest_https_failure_bounded \
+    "$MISSING" https://www.iana.org "missing launch proxy"
+
+if rg -a -l 'golden-pass|clone-pass|missing-pass' "$TEST_DIR"; then
     echo "proxy credentials leaked into persistent SmolVM state" >&2
     exit 1
 fi
@@ -100,26 +138,7 @@ fi
 kill "$PROXY2_PID"
 wait "$PROXY2_PID" 2>/dev/null || true
 PROXY2_PID=""
-"$SMOLVM" machine exec --name "$CLONE" -- sh -c \
-    'wget -T 3 -qO- https://www.iana.org >/dev/null' &
-FAIL_CLOSED_PID=$!
-FAIL_CLOSED_DONE=0
-for _ in $(seq 1 100); do
-    if ! kill -0 "$FAIL_CLOSED_PID" 2>/dev/null; then
-        FAIL_CLOSED_DONE=1
-        break
-    fi
-    sleep 0.1
-done
-if [[ $FAIL_CLOSED_DONE -ne 1 ]]; then
-    kill "$FAIL_CLOSED_PID" 2>/dev/null || true
-    wait "$FAIL_CLOSED_PID" 2>/dev/null || true
-    echo "guest connection did not fail promptly after egress proxy exit" >&2
-    exit 1
-fi
-if wait "$FAIL_CLOSED_PID"; then
-    echo "guest connection bypassed the stopped egress proxy" >&2
-    exit 1
-fi
+expect_guest_https_failure_bounded \
+    "$CLONE" https://www.iana.org "connection after egress proxy exit"
 
 echo "egress-proxy-fork-https-ok"
