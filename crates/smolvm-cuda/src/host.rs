@@ -462,6 +462,13 @@ fn graph_patch_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_GRAPH_PATCH").is_some()
 }
 
+/// Diagnostic: patch the golden's exec IN PLACE instead of re-instantiating, to
+/// tell whether the re-instantiation or the patching is what breaks graph mode.
+/// Single-clone only (mutates the shared exec).
+fn graph_inplace_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_GRAPH_INPLACE").is_some()
+}
+
 /// Registry of live sessions' allocation tables, keyed by lineage token, so an
 /// isolating clone can enumerate its parent's device buffers to copy them.
 /// `Weak` so a session's entry evaporates when its connection closes. Parallels
@@ -1227,12 +1234,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
                 );
                 if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
-                    let plo = sess.dptr_trans.iter().map(|&(b, _, _)| b).min().unwrap_or(0);
-                    let phi = sess.dptr_trans.iter().map(|&(b, s, _)| b + s).max().unwrap_or(0);
-                    let slo = sess.shared_ranges.iter().map(|&(b, _)| b).min().unwrap_or(0);
-                    let shi = sess.shared_ranges.iter().map(|&(b, s)| b + s).max().unwrap_or(0);
+                    let mut cs: Vec<u64> = sess.dptr_trans.iter().map(|&(_, s, _)| s).collect();
+                    let mut ss: Vec<u64> = sess.shared_ranges.iter().map(|&(_, s)| s).collect();
+                    cs.sort_unstable_by(|a, b| b.cmp(a));
+                    ss.sort_unstable_by(|a, b| b.cmp(a));
                     eprintln!(
-                        "[cuda-fork-isolate] private span [{plo:#x},{phi:#x}) shared span [{slo:#x},{shi:#x})"
+                        "[cuda-fork-isolate] top COPIED sizes: {:?}; top SHARED sizes: {:?}",
+                        &cs[..cs.len().min(6)],
+                        &ss[..ss.len().min(6)]
                     );
                 }
             }
@@ -1404,6 +1413,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                      SMOLVM_CUDA_FORK_GRAPH_PATCH=1 for the experimental graph-patch path."
                 );
                 return Err(CUDA_ERROR_NOT_SUPPORTED);
+            }
+            // Diagnostic: patch the golden's exec IN PLACE (no re-instantiate).
+            if inherited_isolated && graph_inplace_enabled() {
+                if let Some(template) = exec_template_lookup(real) {
+                    if !sess.clone_graph_execs.contains_key(&real) {
+                        b.graph_exec_patch(real, template, &sess.dptr_trans)?;
+                        sess.clone_graph_execs.insert(real, real); // patch once
+                    }
+                }
+                let raw = raw_stream(sess, stream)?;
+                return b.graph_launch(real, raw).map(|_| Response::Ok);
             }
             // Path 2 (experimental): re-instantiate the template and translate its
             // node pointers to this clone's private copies.

@@ -401,10 +401,10 @@ impl GpuBackend {
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
                 graph_node_get_type: sym(&lib, b"cuGraphNodeGetType\0")?,
-                graph_kernel_node_get_params: sym(&lib, b"cuGraphKernelNodeGetParams\0")?,
+                graph_kernel_node_get_params: sym(&lib, b"cuGraphKernelNodeGetParams_v2\0")?,
                 graph_exec_kernel_node_set_params: sym(
                     &lib,
-                    b"cuGraphExecKernelNodeSetParams\0",
+                    b"cuGraphExecKernelNodeSetParams_v2\0",
                 )?,
                 graph_memset_node_get_params: sym(&lib, b"cuGraphMemsetNodeGetParams\0")?,
                 graph_exec_memset_node_set_params: sym(
@@ -1012,18 +1012,36 @@ impl Backend for GpuBackend {
                         continue; // args packed via `extra` — not translated
                     }
                     let sizes = self.func_get_param_info(kp.func as u64)?;
-                    let mut new_vals: Vec<u64> = vec![0; sizes.len()];
+                    // Copy EVERY arg value (full size, 8-byte-aligned) into our own
+                    // buffer, translating 8-byte pointers, and point the new
+                    // kernelParams entirely into it — never reuse the driver's
+                    // returned arg pointers.
+                    let mut offsets = Vec::with_capacity(sizes.len());
+                    let mut total = 0usize;
+                    for &sz in &sizes {
+                        total = total.next_multiple_of(8);
+                        offsets.push(total);
+                        total += sz as usize;
+                    }
+                    let mut buf = vec![0u8; total.max(8)];
                     let mut changed = false;
                     for (i, &sz) in sizes.iter().enumerate() {
-                        let argptr = unsafe { *kp.kernel_params.add(i) };
-                        if sz == 8 && !argptr.is_null() {
-                            let v = unsafe { *(argptr as *const u64) };
+                        let sz = sz as usize;
+                        let argptr = unsafe { *kp.kernel_params.add(i) } as *const u8;
+                        if argptr.is_null() || sz == 0 {
+                            continue;
+                        }
+                        let o = offsets[i];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(argptr, buf.as_mut_ptr().add(o), sz);
+                        }
+                        if sz == 8 {
+                            let v = u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
                             let t = xlat_range(trans, v);
-                            new_vals[i] = t;
-                            changed |= t != v;
-                            // Diagnostic: a plausible device pointer that we did
-                            // NOT translate — a candidate missed allocation.
-                            if dbg && t == v && v > 0x1000_0000_0000 {
+                            if t != v {
+                                buf[o..o + 8].copy_from_slice(&t.to_ne_bytes());
+                                changed = true;
+                            } else if dbg && v > 0x1000_0000_0000 {
                                 untranslated.insert(v);
                             }
                         }
@@ -1031,17 +1049,12 @@ impl Backend for GpuBackend {
                     if !changed {
                         continue;
                     }
-                    let mut new_ptrs: Vec<*mut c_void> = Vec::with_capacity(sizes.len());
-                    for (i, &sz) in sizes.iter().enumerate() {
-                        let argptr = unsafe { *kp.kernel_params.add(i) };
-                        if sz == 8 && !argptr.is_null() {
-                            new_ptrs.push(unsafe { new_vals.as_mut_ptr().add(i) } as *mut c_void);
-                        } else {
-                            new_ptrs.push(argptr);
-                        }
-                    }
+                    let new_ptrs: Vec<*mut c_void> = offsets
+                        .iter()
+                        .map(|&o| unsafe { buf.as_mut_ptr().add(o) } as *mut c_void)
+                        .collect();
                     let mut kp2 = kp;
-                    kp2.kernel_params = new_ptrs.as_mut_ptr();
+                    kp2.kernel_params = new_ptrs.as_ptr() as *mut *mut c_void;
                     let rc = unsafe {
                         (self.graph_exec_kernel_node_set_params)(exec as *mut c_void, node, &kp2)
                     };
@@ -2295,9 +2308,10 @@ impl Drop for GpuBackend {
     }
 }
 
-/// `CUDA_KERNEL_NODE_PARAMS` (v1) — a graph kernel node's launch config. We read
-/// it to translate a fork clone's inherited pointer args, then set it on the exec.
-/// Fields are read by the driver via FFI, not individually in Rust.
+/// `CUDA_KERNEL_NODE_PARAMS_v2` — a graph kernel node's launch config (CUDA 12+;
+/// torch captures kernels through the v2 API, so we use v2 get/set with the extra
+/// `kern`/`ctx` tail). We read it to translate a fork clone's inherited pointer
+/// args, then set it on the exec. Fields are read by the driver via FFI.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -2312,6 +2326,8 @@ pub struct KernelNodeParams {
     shared_mem_bytes: c_uint,
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
+    kern: *mut c_void, // v2: CUkernel
+    ctx: *mut c_void,  // v2: CUcontext
 }
 
 /// `CUDA_MEMSET_NODE_PARAMS` — a graph memset node's target + fill.
