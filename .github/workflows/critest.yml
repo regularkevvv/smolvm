@@ -1,0 +1,106 @@
+name: critest (K8s CRI conformance)
+
+# CRI conformance for the Kubernetes containerd shim runtime. critest boots a
+# real microVM per pod, so it needs /dev/kvm — GitHub-hosted runners don't have
+# nested virt. It runs on a SELF-HOSTED runner labelled `kvm` that is provisioned
+# with:
+#   - containerd 2.x with the smolvm runtime registered
+#     ([plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.smolvm]
+#      runtime_type = 'io.containerd.smolvm.v2'), plus a CNI (e.g. the bridge
+#     plugin in /opt/cni/bin with a conflist in /etc/cni/net.d),
+#   - the smolvm runtime base under /var/lib/smolvm (libkrun, init.krun,
+#     smolvm-vmm, agent-rootfs) — see scripts/install-k8s-runtime.sh,
+#   - critest + crictl (cri-tools) on PATH,
+#   - the Rust toolchain with the x86_64-unknown-linux-musl target.
+#
+# Manual (workflow_dispatch) only: it requires a self-hosted KVM runner, so it is
+# not wired to push events — dispatch it once a labelled runner is online. Add a
+# `push: { branches: [k8s-shim] }` trigger then if you want it on every push.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  critest:
+    name: critest (self-hosted KVM)
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the shim (host) and agent (musl)
+        run: |
+          cargo build --release -p smolvm-shim
+          cargo build --release -p smolvm-agent --target x86_64-unknown-linux-musl
+
+      - name: Install shim + agent over the provisioned runtime base
+        run: |
+          sudo ./scripts/install-k8s-runtime.sh --shim target/release/containerd-shim-smolvm-v2
+          sudo cp target/x86_64-unknown-linux-musl/release/smolvm-agent \
+            /var/lib/smolvm/agent-rootfs/usr/local/bin/smolvm-agent
+
+      - name: Run critest (does not gate the job — the xfail check below does)
+        run: |
+          sudo crictl rmp -fa || true
+          # critest exits non-zero because of the known xfails; the next step
+          # decides pass/fail from the JUnit report, so don't let this fail here.
+          sudo critest \
+            -runtime-endpoint unix:///run/containerd/containerd.sock \
+            -runtime-handler smolvm \
+            --ginkgo.junit-report critest-report.xml | tee critest.log || true
+
+      - name: Conformance gate (fail only on unexpected regressions)
+        run: |
+          python3 - <<'PY'
+          import sys, re, xml.etree.ElementTree as ET
+
+          # A VM-per-pod runtime cannot pass these (Kata skips them too):
+          #   - host IPC / host Network namespace sharing (guest has its own kernel ns)
+          #   - mount propagation rshared/rslave/rprivate (needs a shared mount ns
+          #     across the VM boundary)
+          # And port-forward is deferred until the shim owns the stream via the
+          # containerd sandbox-controller API (proxying into the guest over vsock).
+          # See docs/kubernetes-runtime.md. Any failure NOT in this set is a real
+          # regression and fails the job.
+          KNOWN_XFAILS = [
+              r"HostIpc is true",
+              r"HostNetwork is true",
+              r"should support portforward",       # both portforward specs
+              r"mount with 'rprivate'",
+              r"mount with 'rshared'",
+              r"mount with 'rslave'",
+          ]
+
+          tree = ET.parse("critest-report.xml")
+          failures = [
+              tc.get("name")
+              for tc in tree.iter("testcase")
+              if tc.find("failure") is not None or tc.find("error") is not None
+          ]
+          unexpected = [
+              name for name in failures
+              if not any(re.search(p, name) for p in KNOWN_XFAILS)
+          ]
+
+          print(f"{len(failures)} failure(s); {len(unexpected)} unexpected regression(s).")
+          for name in failures:
+              tag = "REGRESSION" if name in unexpected else "xfail"
+              print(f"  [{tag}] {name}")
+
+          if unexpected:
+              print("\nFAIL: unexpected critest regressions above.")
+              sys.exit(1)
+          print("\nOK: only the documented VM-per-pod xfails failed.")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critest-results
+          path: |
+            critest.log
+            critest-report.xml
