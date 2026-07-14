@@ -4932,7 +4932,10 @@ fn handle_run(
     // USER stays root. Bare-VM exec (`handle_vm_exec`) never reaches here, so it
     // is unaffected.
     let image_user = if user.is_none() {
-        storage::query_image(image).ok().flatten().and_then(|i| i.user)
+        storage::query_image(image)
+            .ok()
+            .flatten()
+            .and_then(|i| i.user)
     } else {
         None
     };
