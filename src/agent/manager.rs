@@ -33,6 +33,15 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn append_egress_proxy_launch_env(
+    env: &mut Vec<(&'static str, String)>,
+    proxy: Option<&crate::network::EgressProxy>,
+) {
+    if let Some(proxy) = proxy {
+        env.push(("SMOLVM_EGRESS_PROXY", proxy.expose_secret().to_string()));
+    }
+}
+
 /// Running VM configuration persisted to disk so new CLI invocations
 /// can restore the actual config of a detached VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1651,7 +1660,7 @@ impl AgentManager {
         // `std::env::set_var`. A process-global env var is a data race in the
         // multithreaded `serve` process, where concurrent forks would clobber
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
-        let fork_env: Vec<(&str, String)> = {
+        let launch_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
             if features.forkable {
                 v.push(("SMOLVM_FORKABLE", "1".to_string()));
@@ -1662,6 +1671,7 @@ impl AgentManager {
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
             }
+            append_egress_proxy_launch_env(&mut v, features.egress_proxy.as_ref());
             // Shared CUDA daemon: forward an explicit operator setting as-is.
             // SHARED=1 => smolvm spawns/manages the daemon; DAEMON=X => external.
             let mut shared_set = false;
@@ -1881,7 +1891,7 @@ impl AgentManager {
             )
             // Forkable / fork-clone vars set explicitly on the child (not via
             // inherited process-global env) — see fork_env above.
-            .envs(fork_env)
+            .envs(launch_env)
             // Per-VM uid drop (privileged launcher only) — see uid_env above.
             .envs(uid_env)
             // Per-VM readiness marker name — forwarded by the launcher into the
@@ -2364,16 +2374,26 @@ impl AgentManager {
                     let mut inner = self.inner.lock();
                     if let Some(ref mut child) = inner.child {
                         if !child.is_running() {
+                            let exit_code = child.exit_code();
+                            let log = std::fs::read_to_string(&self.startup_error_log)
+                                .ok()
+                                .map(|content| content.trim().to_string())
+                                .filter(|content| !content.is_empty());
                             return Err(Error::agent(
                                 "monitor agent",
-                                "clone agent process exited during startup".to_string(),
+                                format!(
+                                    "clone agent process exited during startup: {}",
+                                    boot_failure_reason(exit_code, log.as_deref())
+                                ),
                             ));
                         }
                     }
                 }
                 if self.vsock_socket.exists() {
                     if let Ok(mut client) =
-                        super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
+                        super::AgentClient::connect_with_clone_boot_probe_timeout(
+                            &self.vsock_socket,
+                        )
                     {
                         if client.ping().is_ok() {
                             tracing::info!(
@@ -2605,6 +2625,19 @@ mod tests {
         // Callers rely on this to locate existing VM data across processes.
         assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
         assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
+    }
+
+    #[test]
+    fn proxy_secret_is_only_emitted_as_launch_environment() {
+        let proxy: crate::network::EgressProxy = "socks5://launch-user:launch-pass@127.0.0.1:1080"
+            .parse()
+            .unwrap();
+        let mut env = Vec::new();
+        append_egress_proxy_launch_env(&mut env, Some(&proxy));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "SMOLVM_EGRESS_PROXY");
+        assert_eq!(env[0].1, proxy.expose_secret());
+        assert!(!format!("{proxy:?}").contains("launch-pass"));
     }
 
     #[test]

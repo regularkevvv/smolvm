@@ -231,6 +231,9 @@ pub struct LaunchFeatures {
     /// carries its CNI-assigned IP and is reachable at L2. Runtime-only (never
     /// persisted in `VmRecord`); requires the virtio-net backend.
     pub pod_netns: Option<std::path::PathBuf>,
+    /// Launch-only SOCKS5 endpoint for transparent virtio-net egress. The
+    /// custom type redacts credentials from Debug and is never serialized.
+    pub egress_proxy: Option<crate::network::EgressProxy>,
 }
 
 impl LaunchFeatures {
@@ -419,6 +422,8 @@ pub struct LaunchConfig<'a> {
     pub pod_net: Option<crate::agent::pod_net::PodNetLaunch>,
     /// Resolved and verified custom guest-kernel configuration.
     pub guest_boot: Option<&'a crate::data::guest_boot::GuestBootConfig>,
+    /// Launch-only SOCKS5 endpoint for the virtio-net gateway.
+    pub egress_proxy: Option<crate::network::EgressProxy>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -460,6 +465,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_telemetry,
         pod_net,
         guest_boot,
+        egress_proxy,
     } = config;
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
@@ -881,6 +887,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     egress_refresh_hosts.as_deref(),
                 );
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
+                // Own the launch-only value before the Windows accept thread so
+                // that thread never captures the borrowed `LaunchConfig`.
+                let egress_proxy = egress_proxy.clone();
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX
                 // stream. On Unix we hand libkrun one end of a socketpair fd and run
@@ -950,6 +959,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                egress_proxy.clone(),
                             ) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
@@ -1035,6 +1045,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                egress_proxy.clone(),
                             ) {
                                 Ok(runtime) => {
                                     if let Some(path) = egress_path {

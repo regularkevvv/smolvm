@@ -280,6 +280,21 @@ impl EgressPolicy {
         }
     }
 
+    /// Whether a hostname-preserving proxy connection is permitted.
+    ///
+    /// An unrestricted policy permits every hostname. A restricted policy
+    /// requires an explicit allow-host match; CIDR-only rules cannot safely be
+    /// applied when resolution intentionally happens at the SOCKS proxy.
+    pub fn allows_hostname_connect(&self, hostname: &str) -> bool {
+        match &self.inner {
+            None => true,
+            Some(list) => list
+                .allowed_hosts
+                .as_ref()
+                .is_some_and(|hosts| dns::hostname_allowed(hostname, hosts)),
+        }
+    }
+
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
     pub fn allows(&self, ip: IpAddr) -> bool {
         // Platform hard-floor: deny per the resolved FloorMode (metadata-only
@@ -377,6 +392,18 @@ mod tests {
         assert!(policy.is_restricted());
         assert!(!policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(!policy.allows_v6("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn proxy_hostname_connections_require_allow_host_when_restricted() {
+        let cidrs = vec!["203.0.113.0/24".to_string()];
+        let cidr_only = EgressPolicy::new(Some(&cidrs), None);
+        assert!(!cidr_only.allows_hostname_connect("api.example"));
+
+        let hosts = vec!["example".to_string()];
+        let host_policy = EgressPolicy::new(None, Some(&hosts));
+        assert!(host_policy.allows_hostname_connect("api.example"));
+        assert!(!host_policy.allows_hostname_connect("notexample"));
     }
 
     #[test]

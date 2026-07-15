@@ -40,6 +40,7 @@ These are not included in the default run. Pass the group name explicitly:
 ./tests/run_tests.sh cli
 ./tests/run_tests.sh api
 ./tests/run_tests.sh virtio-net
+./tests/run_tests.sh egress-proxy  # requires SMOLVM_AGENT_ROOTFS
 ./tests/run_tests.sh smolfile
 ./tests/run_tests.sh pack
 ./tests/run_tests.sh pack-quick     # pack tests, skip large image pulls
@@ -51,6 +52,7 @@ These are not included in the default run. Pass the group name explicitly:
 | `cli` | `test_cli.sh` | 10 |
 | `api` | `test_api.sh` | 25 |
 | `virtio-net` | `test_virtio_net.sh` | 6 |
+| `egress-proxy` | `test_egress_proxy.sh` | 1 forked-guest HTTPS gate |
 | `smolfile` | `test_smolfile.sh` | 49 |
 | `pack` / `pack-quick` | `test_pack.sh` | 39 |
 | `gpu` | `test_gpu.sh` | 14 |
@@ -94,4 +96,3 @@ Tests find the `smolvm` binary in this order:
 3. `dist/smolvm-*-darwin-*/smolvm` or `dist/smolvm-*-linux-*/smolvm`
 
 ---
-

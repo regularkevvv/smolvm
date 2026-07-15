@@ -57,6 +57,7 @@
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
 
+pub mod connector;
 pub mod device;
 pub mod dns;
 pub mod dns_relay;
@@ -74,7 +75,9 @@ pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
 pub mod udp_relay;
+pub mod virtual_dns;
 
+pub use connector::{ConnectCancellation, ConnectTarget, EgressProxy, OutboundConnector};
 pub use egress::EgressPolicy;
 
 use socket2::Socket;
@@ -255,6 +258,7 @@ pub struct VirtioNetworkRuntime {
     _frame_bridge: FrameStreamBridge,
     published_ports: Option<TcpPortListeners>,
     poll_handle: Option<JoinHandle<()>>,
+    connect_cancellation: ConnectCancellation,
 }
 
 /// Start the host-side virtio-net runtime for one guest NIC.
@@ -310,6 +314,7 @@ pub fn start_virtio_network(
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
+    egress_proxy: Option<EgressProxy>,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
@@ -331,6 +336,10 @@ pub fn start_virtio_network(
             queues.relay_wake.clone(),
         )?)
     };
+    let proxy_mode = egress_proxy.is_some();
+    let connector = connector::outbound_connector(egress_proxy);
+    let virtual_dns = proxy_mode.then(virtual_dns::VirtualDns::default);
+    let connect_cancellation = ConnectCancellation::default();
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -345,6 +354,9 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
+        connector,
+        virtual_dns,
+        connect_cancellation.clone(),
     )?;
 
     Ok(VirtioNetworkRuntime {
@@ -352,6 +364,7 @@ pub fn start_virtio_network(
         _frame_bridge: frame_bridge,
         published_ports: tcp_listeners,
         poll_handle: Some(poll_handle),
+        connect_cancellation,
     })
 }
 
@@ -392,6 +405,7 @@ impl Drop for VirtioNetworkRuntime {
     /// they can exit on their own. We only explicitly join the poll thread
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
+        self.connect_cancellation.cancel();
         self.queues.begin_shutdown();
         self.published_ports = None;
         if let Some(handle) = self.poll_handle.take() {

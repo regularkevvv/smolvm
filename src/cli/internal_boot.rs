@@ -31,6 +31,28 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDi
 pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     let t_proc = std::time::Instant::now();
 
+    // Consume the launch-only proxy endpoint before starting worker threads.
+    // It never enters BootConfig or argv and is removed from the boot process's
+    // environment so later guest-side subprocesses cannot inherit it.
+    let egress_proxy = match std::env::var("SMOLVM_EGRESS_PROXY") {
+        Ok(value) => {
+            std::env::remove_var("SMOLVM_EGRESS_PROXY");
+            Some(
+                value
+                    .parse::<smolvm::network::EgressProxy>()
+                    .map_err(|error| smolvm::Error::config("egress proxy launch handoff", error))?,
+            )
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            std::env::remove_var("SMOLVM_EGRESS_PROXY");
+            return Err(smolvm::Error::config(
+                "egress proxy launch handoff",
+                "proxy URI must be valid UTF-8",
+            ));
+        }
+    };
+
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:
     // the API server, a fleet node, or — for the SDKs — the Node/Python
@@ -584,6 +606,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
         guest_boot: config.guest_boot.as_ref(),
+        egress_proxy,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)
