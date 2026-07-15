@@ -47,6 +47,7 @@ booting an external Asterinas kernel:
 ```bash
 smolvm machine create \
   --name asterinas \
+  --cpus 1 \
   --net \
   --kernel ./aster-kernel-osdk-bin.qemu_bin \
   --kernel-format raw \
@@ -78,6 +79,11 @@ their existing behavior.
 This is intentionally an MVP compatibility contract for Asterinas's current
 static network. It can converge toward SmolVM's dynamic Linux network profile
 after Asterinas supports the required address and route mutation APIs.
+
+The current AArch64 kernel is also single-core: it reports one processor and
+does not boot secondary vCPUs. The profile therefore requires `--cpus 1`.
+SmolVM rejects larger values during create, update, and launch so a machine
+cannot appear healthy and then fail only when a forkable golden is frozen.
 
 The installed libkrun must export `krun_set_kernel` and, for the Asterinas
 profile, `krun_get_default_init`. Asterinas early-console output additionally

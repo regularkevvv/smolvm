@@ -345,9 +345,9 @@ fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
         "set -e; \
          hostname '{c}' 2>/dev/null || true; \
          printf '%s\\n' '{c}' > /etc/hostname; \
-         tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id; \
+         printf '%.32s\\n' '{s}' > /etc/machine-id; \
          if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then \
-             tr -d '-' < /proc/sys/kernel/random/uuid > /var/lib/dbus/machine-id; \
+             printf '%.32s\\n' '{s}' > /var/lib/dbus/machine-id; \
          fi; \
          if [ -d /etc/ssh ] && command -v ssh-keygen >/dev/null 2>&1; then \
              rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; \
@@ -503,6 +503,8 @@ mod tests {
         assert!(script.contains("> /etc/machine-id"));
         assert!(script.contains("> /etc/hostname"));
         assert!(script.contains("/var/lib/dbus/machine-id"));
+        assert!(script.contains("printf '%.32s\\n' 'deadbeef'"));
+        assert!(!script.contains("/proc/sys/kernel/random/uuid"));
         // The clone name and RNG seed are threaded through.
         assert!(script.contains("clone-a"));
         assert!(script.contains("deadbeef"));
