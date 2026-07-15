@@ -92,6 +92,8 @@ pub struct MachineEntry {
     /// virtiofs instead of having the guest pull from a registry. `None` for
     /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
     pub source_smolmachine: Option<String>,
+    /// Persisted custom guest-kernel configuration, if any.
+    pub guest_boot: Option<crate::data::guest_boot::GuestBootConfig>,
 }
 
 /// Parameters for registering a new machine.
@@ -384,6 +386,7 @@ impl ApiState {
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.source_smolmachine.clone(),
+                            guest_boot: record.guest_boot.clone(),
                         })),
                     );
                     loaded.push(name.clone());
@@ -853,6 +856,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
+                        guest_boot: None,
                     })),
                 );
                 Ok(())
@@ -1090,6 +1094,7 @@ pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
+    guest_boot: Option<crate::data::guest_boot::GuestBootConfig>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
     let mut features = match machine_name {
@@ -1103,6 +1108,7 @@ pub fn build_launch_features(
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
     features.dns_filter_hosts = dns_filter_hosts;
+    features.guest_boot = guest_boot;
     Ok(features)
 }
 
@@ -1152,6 +1158,7 @@ pub async fn ensure_machine_running(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
                 entry.resources.allowed_hosts.clone(),
+                entry.guest_boot.clone(),
             )?
         };
         entry
@@ -1430,11 +1437,11 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let features = build_launch_features(None, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 
@@ -1483,6 +1490,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                guest_boot: None,
             },
         );
 
@@ -1545,6 +1553,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                guest_boot: None,
             },
         );
 

@@ -87,7 +87,8 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
 
 /// Boot `record` with the given launch features and return a handle. Shared by
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
-fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
+fn launch_from_record(record: &VmRecord, mut features: LaunchFeatures) -> Result<VmHandle> {
+    features.guest_boot = record.guest_boot.clone();
     let manager =
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;

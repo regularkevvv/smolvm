@@ -46,6 +46,10 @@ pub struct KrunFunctions {
     /// `krun_set_console_output`). Unix: input/output/err file descriptors.
     pub add_virtio_console_default:
         unsafe extern "C" fn(u32, libc::c_int, libc::c_int, libc::c_int) -> i32,
+    /// Add an ARM PL011-compatible serial console. Optional so existing
+    /// bundled-kernel machines can still use older libkrun builds unchanged.
+    pub add_serial_console_default:
+        Option<unsafe extern "C" fn(u32, libc::c_int, libc::c_int) -> i32>,
     pub set_egress_policy: Option<
         unsafe extern "C" fn(
             u32,
@@ -71,6 +75,21 @@ pub struct KrunFunctions {
     /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
     pub create_disk_overlay:
         Option<unsafe extern "C" fn(*const libc::c_char, *const libc::c_char, u32) -> i32>,
+    /// Select an externally supplied guest kernel and optional initramfs.
+    /// `None` on libkrun builds that predate custom-kernel boot support.
+    pub set_kernel: Option<
+        unsafe extern "C" fn(
+            u32,
+            *const libc::c_char,
+            u32,
+            *const libc::c_char,
+            *const libc::c_char,
+        ) -> i32,
+    >,
+    /// Return libkrun's built-in `/init.krun` image. This is used to construct
+    /// an Asterinas-compatible initramfs while preserving libkrun's launch
+    /// environment contract.
+    pub get_default_init: Option<unsafe extern "C" fn(*mut *const u8, *mut libc::size_t) -> i32>,
 }
 
 impl KrunFunctions {
@@ -147,6 +166,7 @@ impl KrunFunctions {
         let start_enter = load_sym!(krun_start_enter);
         let add_vsock = load_sym!(krun_add_vsock);
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
+        let add_serial_console_default = load_optional_sym!("krun_add_serial_console_default");
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
@@ -155,6 +175,8 @@ impl KrunFunctions {
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
+        let set_kernel = load_optional_sym!("krun_set_kernel");
+        let get_default_init = load_optional_sym!("krun_get_default_init");
 
         Ok(Self {
             _handle: handle,
@@ -173,6 +195,7 @@ impl KrunFunctions {
             start_enter,
             add_vsock,
             add_virtio_console_default,
+            add_serial_console_default,
             set_egress_policy,
             add_net_unixstream,
             get_egress_handle,
@@ -181,7 +204,29 @@ impl KrunFunctions {
             set_control_socket,
             set_snapshot,
             create_disk_overlay,
+            set_kernel,
+            get_default_init,
         })
+    }
+
+    /// Copy libkrun's embedded `/init.krun` bytes into owned memory.
+    pub fn default_init_bytes(&self) -> Result<Vec<u8>, String> {
+        let get_default_init = self.get_default_init.ok_or_else(|| {
+            "installed libkrun does not export krun_get_default_init; update libkrun to use the asterinas guest profile".to_string()
+        })?;
+        let mut data = std::ptr::null();
+        let mut len = 0;
+        let rc = unsafe { get_default_init(&mut data, &mut len) };
+        if rc < 0 {
+            return Err(format!("krun_get_default_init failed with error code {rc}"));
+        }
+        if data.is_null() || len == 0 {
+            return Err("krun_get_default_init returned an empty init image".to_string());
+        }
+        // SAFETY: a successful libkrun call returns a process-lifetime pointer
+        // to `len` immutable bytes. Copying makes the result independent of the
+        // dynamic-library handle's lifetime.
+        Ok(unsafe { std::slice::from_raw_parts(data, len) }.to_vec())
     }
 }
 
@@ -193,7 +238,8 @@ impl KrunFunctions {
     ///
     /// The opened fds are intentionally leaked: a console device's fds must stay
     /// valid for the VM's lifetime, and `krun_start_enter` runs the VM in this
-    /// process, so the process owns them until it exits.
+    /// process, so the process owns them until it exits. A failed device-add
+    /// call closes its newly opened descriptors before returning.
     ///
     /// # Safety
     /// `ctx` must be a valid libkrun context that has not yet been started.
@@ -211,7 +257,48 @@ impl KrunFunctions {
         // Console input comes from /dev/null (the agent talks over vsock, not the
         // console); output and stderr both go to the log file.
         let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
+        if null_fd < 0 {
+            unsafe { libc::close(out_fd) };
+            return -libc::EIO;
+        }
+        let rc = unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) };
+        if rc < 0 {
+            unsafe {
+                libc::close(null_fd);
+                libc::close(out_fd);
+            }
+        }
+        rc
+    }
+
+    /// Add a serial console that writes to `path` when the installed libkrun
+    /// provides the API. Asterinas uses this PL011 device for `earlycon`, before
+    /// its virtio-console driver is available.
+    ///
+    /// # Safety
+    /// `ctx` must be a valid libkrun context that has not yet been started.
+    #[cfg(unix)]
+    pub unsafe fn serial_console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
+        use std::os::fd::IntoRawFd;
+        let Some(add_serial_console_default) = self.add_serial_console_default else {
+            return -libc::ENOSYS;
+        };
+        let Ok(out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return -libc::EIO;
+        };
+        let out_fd = out.into_raw_fd();
+        // A negative input fd means output-only. In particular, do not pass
+        // /dev/null here: macOS kqueue cannot register a regular character fd
+        // with the epoll compatibility layer used by libkrun's PL011 backend.
+        let rc = unsafe { add_serial_console_default(ctx, -1, out_fd) };
+        if rc < 0 {
+            unsafe { libc::close(out_fd) };
+        }
+        rc
     }
 
     /// Windows stub: the virtio-console redirection relies on POSIX file
@@ -224,6 +311,12 @@ impl KrunFunctions {
     #[cfg(not(unix))]
     pub unsafe fn console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
         -1
+    }
+
+    /// Non-Unix stub for the fd-based serial-console API.
+    #[cfg(not(unix))]
+    pub unsafe fn serial_console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
+        -libc::ENOSYS
     }
 }
 

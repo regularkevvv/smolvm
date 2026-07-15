@@ -1689,6 +1689,19 @@ impl AgentManager {
         // snapshot path) so it can map the golden's memfd. No-op unless privileged;
         // opt out with SMOLVM_VM_UID_DROP=off. See process::vm_drop_ids.
         let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
+        let guest_boot = features
+            .guest_boot
+            .take()
+            .map(|config| {
+                let data_dir = data_dir.as_deref().ok_or_else(|| {
+                    Error::agent(
+                        "resolve custom boot artifacts",
+                        "machine storage disk has no data directory",
+                    )
+                })?;
+                config.resolve_and_verify(data_dir)
+            })
+            .transpose()?;
         let registry = vm_uid_registry_dir();
         let mut uid_env: Vec<(&str, String)> = Vec::new();
         // Shared pack store: `with_packed_layers` sets `pack_idmap_source` when
@@ -1813,6 +1826,7 @@ impl AgentManager {
             pack_idmap_source,
             extra_disks: features.extra_disks,
             pod_netns: features.pod_netns,
+            guest_boot,
         };
         let config_path = self
             .storage_disk

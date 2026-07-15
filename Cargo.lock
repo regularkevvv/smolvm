@@ -3019,6 +3019,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "flate2",
  "futures-util",
  "hex",
  "humantime",

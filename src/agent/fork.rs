@@ -201,7 +201,18 @@ pub fn prepare_fork(
         clone_rec.ports = remapped;
     }
     clone_rec.golden = Some(golden.to_string());
-    db.insert_vm(clone, &clone_rec)?;
+    if let Some(guest_boot) = clone_rec.guest_boot.as_ref() {
+        if let Err(e) = crate::agent::guest_boot::clone_guest_boot(guest_boot, &gdir, &clone_dir) {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return Err(e);
+        }
+    }
+    if let Err(e) = db.insert_vm(clone, &clone_rec) {
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return Err(e);
+    }
 
     // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
     let cleanup = || {

@@ -278,6 +278,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         if let Some(ref d) = config.packed_layers_dir {
             read_exec.push(d.clone());
         }
+        if let Some(ref guest_boot) = config.guest_boot {
+            read_exec.push(guest_boot.kernel.path.clone());
+            if let Some(ref initramfs) = guest_boot.initramfs {
+                read_exec.push(initramfs.path.clone());
+            }
+        }
         // Grant read+exec on the directory libkrun/libkrunfw are actually
         // dlopen'd from, resolved EXACTLY like the loader (`find_lib_dir`):
         // `SMOLVM_LIB_DIR` if it holds the libs, else exe-relative bundle paths
@@ -577,6 +583,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .is_some_and(|hosts| !hosts.is_empty()),
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
+        guest_boot: config.guest_boot.as_ref(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

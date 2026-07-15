@@ -497,6 +497,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 
+    /// Machine-owned custom kernel and initramfs configuration. Artifact paths
+    /// are relative to this machine's data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_boot: Option<crate::data::guest_boot::GuestBootConfig>,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -600,6 +605,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            guest_boot: None,
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
@@ -656,6 +662,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            guest_boot: None,
             ephemeral: false,
             source_smolmachine: None,
             golden: None,

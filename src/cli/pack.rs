@@ -508,6 +508,13 @@ impl PackCreateCmd {
             .get(&vm_name)
             .ok_or_else(|| Error::agent("pack from VM", format!("VM '{}' not found", vm_name)))?;
 
+        if vm.guest_boot.is_some() {
+            return Err(Error::agent(
+                "pack from VM",
+                "machines with custom guest kernels are local-only in this release; clone them locally or create a pack from a bundled-kernel machine",
+            ));
+        }
+
         if vm.actual_state() == RecordState::Running {
             return Err(Error::agent(
                 "pack from VM",

@@ -172,6 +172,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        guest_boot: record.guest_boot.clone(),
     }
 }
 
@@ -876,6 +877,7 @@ pub async fn start_machine(
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
+    let guest_boot = record.guest_boot.clone();
     let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -886,6 +888,7 @@ pub async fn start_machine(
             Some(&name_clone),
             source_smolmachine.as_deref(),
             dns_filter_hosts,
+            guest_boot,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Forkable start: memfd-back guest RAM and expose a control socket at the
@@ -1081,6 +1084,7 @@ pub async fn fork_machine(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
             record.dns_filter_hosts.clone(),
+            record.guest_boot.clone(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.

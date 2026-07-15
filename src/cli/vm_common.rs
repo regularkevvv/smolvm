@@ -461,6 +461,9 @@ pub struct CreateVmParams {
     /// persisted to the VM record (they are not sensitive); resolved
     /// plaintext values are produced per-launch and never touch the DB.
     pub secret_refs: BTreeMap<String, SecretRef>,
+    /// Host paths and options for a custom guest kernel before machine-owned
+    /// staging. Never persisted directly.
+    pub guest_boot: Option<smolvm::data::guest_boot::GuestBootSource>,
 }
 
 /// Resolve refs supplied by a trusted-local caller (CLI with a Smolfile passed
@@ -494,9 +497,28 @@ pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String,
 
 /// Create a named machine configuration (does not start it).
 pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
-    let record = build_vm_record(&params)?;
+    let mut record = build_vm_record(&params)?;
     let reservation = CreateVmReservation::reserve(&params.name)?;
-    reservation.commit(&record)?;
+    let data_dir = smolvm::agent::vm_data_dir(&params.name);
+    let data_dir_preexisted = data_dir.exists();
+    if let Some(source) = params.guest_boot.as_ref() {
+        match smolvm::agent::guest_boot::stage_guest_boot(source, &data_dir) {
+            Ok(guest_boot) => record.guest_boot = Some(guest_boot),
+            Err(e) => {
+                if !data_dir_preexisted {
+                    let _ = std::fs::remove_dir(&data_dir);
+                }
+                return Err(e);
+            }
+        }
+    }
+    if let Err(e) = reservation.commit(&record) {
+        let _ = std::fs::remove_dir_all(data_dir.join(smolvm::data::guest_boot::GUEST_BOOT_DIR));
+        if !data_dir_preexisted {
+            let _ = std::fs::remove_dir(&data_dir);
+        }
+        return Err(e);
+    }
     print_create_success(&params);
     Ok(())
 }
@@ -916,6 +938,7 @@ pub fn start_vm_named(
     // the pre-extracted layers instead of pulling, with no dependency on the
     // original bundle file. Shared with the API and embedded start paths.
     let mut features = smolvm::agent::LaunchFeatures {
+        guest_boot: record.guest_boot.clone(),
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
@@ -1186,6 +1209,7 @@ pub fn persist_named_running(
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
                 r.rosetta = if o.rosetta { Some(true) } else { None };
+                r.guest_boot = o.guest_boot.clone();
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -1225,6 +1249,7 @@ pub struct DefaultVmOverrides {
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
+    pub guest_boot: Option<smolvm::data::guest_boot::GuestBootConfig>,
 }
 
 /// Check if any running VM already binds to the same host ports.

@@ -175,6 +175,11 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
+| `--kernel` | | run, create | Stage and boot a host-supplied guest kernel |
+| `--kernel-format` | | run, create | Kernel format: `raw`, `elf`, `pe-gz`, `image-gz`, `image-bz2`, or `image-zstd` |
+| `--initramfs` | | run, create | Optional initramfs staged with the custom kernel |
+| `--kernel-cmdline` | | run, create | Command line for the custom kernel |
+| `--guest-profile` | | run, create | Guest boot compatibility profile: `linux` or experimental `asterinas` |
 
 ## Smolfile Reference
 

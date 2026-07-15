@@ -7,6 +7,8 @@ pub mod disk;
 /// Canonical error types used by the shared data layer.
 #[path = "errors.rs"]
 pub mod error;
+/// Persistent custom guest-kernel configuration and staged artifact metadata.
+pub mod guest_boot;
 /// Classifying `--image` into a registry ref, local archive, or rootfs dir.
 pub mod image_source;
 /// Canonical network-related data models.

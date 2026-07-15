@@ -92,6 +92,7 @@ pub fn build_create_params(
                 rosetta: false,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
+                guest_boot: None,
             });
         }
     };
@@ -291,6 +292,7 @@ pub fn build_create_params(
             Some(sf_allow_hosts)
         },
         source_smolmachine: None,
+        guest_boot: None,
     })
 }
 

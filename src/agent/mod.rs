@@ -7,6 +7,7 @@ pub mod boot_config;
 mod client;
 pub mod fork;
 mod fsnotify_watch;
+pub mod guest_boot;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;

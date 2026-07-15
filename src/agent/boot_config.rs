@@ -9,6 +9,7 @@
 //! This module defines the serializable config passed to that subprocess.
 
 use crate::data::disk::DiskFormat;
+use crate::data::guest_boot::GuestBootConfig;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
 use crate::data::storage::HostMount;
@@ -84,4 +85,8 @@ pub struct BootConfig {
     /// virtio-net backend. See `agent::pod_net`.
     #[serde(default)]
     pub pod_netns: Option<PathBuf>,
+    /// Resolved, checksummed custom guest-kernel configuration. Unlike the
+    /// persisted record, paths here are absolute and valid only for this boot.
+    #[serde(default)]
+    pub guest_boot: Option<GuestBootConfig>,
 }

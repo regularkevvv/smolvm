@@ -177,6 +177,9 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 /// on manager/launcher functions.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchFeatures {
+    /// Persisted custom guest-kernel configuration. Paths are resolved and
+    /// checksummed by the manager before crossing the subprocess boundary.
+    pub guest_boot: Option<crate::data::guest_boot::GuestBootConfig>,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
     /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest
@@ -411,6 +414,8 @@ pub struct LaunchConfig<'a> {
     /// while privileged. When present, the virtio-net arm bridges the guest NIC to
     /// the tap instead of running the NAT gateway. `None` for non-pod VMs.
     pub pod_net: Option<crate::agent::pod_net::PodNetLaunch>,
+    /// Resolved and verified custom guest-kernel configuration.
+    pub guest_boot: Option<&'a crate::data::guest_boot::GuestBootConfig>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -451,6 +456,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts,
         egress_telemetry,
         pod_net,
+        guest_boot,
     } = config;
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
@@ -471,6 +477,35 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let krun =
         unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
     boot_timing!("dylib loaded");
+
+    // Validate every fallible custom-boot input before allocating a libkrun
+    // context. This keeps malformed artifacts and older libkrun builds on a
+    // bounded error path with nothing to release.
+    let prepared_guest_boot = guest_boot
+        .map(|guest_boot| -> Result<_> {
+            guest_boot.verify_absolute()?;
+            let set_kernel = require_custom_kernel_symbol(krun.set_kernel)?;
+            let kernel = path_to_cstring(&guest_boot.kernel.path)?;
+            let initramfs = guest_boot
+                .initramfs
+                .as_ref()
+                .map(|artifact| path_to_cstring(&artifact.path))
+                .transpose()?;
+            let cmdline = guest_boot
+                .kernel_cmdline
+                .as_deref()
+                .map(|value| {
+                    CString::new(value).map_err(|_| {
+                        Error::agent(
+                            "configure custom guest kernel",
+                            "kernel command line contains a NUL byte",
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok((guest_boot, set_kernel, kernel, initramfs, cmdline))
+        })
+        .transpose()?;
 
     // Pre-read the agent binary into the OS page cache so the virtiofs thread
     // can serve the guest's first exec without waiting for disk I/O.
@@ -523,6 +558,34 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+
+        // Leave the established bundled-kernel path byte-for-byte unchanged
+        // unless a custom guest boot was explicitly configured.
+        if let Some((guest_boot, set_kernel, kernel, initramfs, cmdline)) = prepared_guest_boot {
+            let rc = set_kernel(
+                ctx,
+                kernel.as_ptr(),
+                guest_boot.kernel_format.to_krun_u32(),
+                initramfs
+                    .as_ref()
+                    .map_or(std::ptr::null(), |path| path.as_ptr()),
+                cmdline
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+            );
+            if rc < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure custom guest kernel",
+                    format!(
+                        "krun_set_kernel rejected {} as format {} (error code {rc})",
+                        guest_boot.kernel.path.display(),
+                        guest_boot.kernel_format
+                    ),
+                ));
+            }
+            boot_timing!("custom kernel set");
         }
 
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
@@ -1136,6 +1199,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 #[cfg(not(windows))]
                 tracing::warn!("failed to set console output");
             }
+            if guest_boot.is_some_and(|boot| {
+                boot.guest_profile == crate::data::guest_boot::GuestProfile::Asterinas
+            }) && krun.serial_console_output_to_file(ctx, log_path) < 0
+            {
+                tracing::warn!(
+                    "Asterinas early console unavailable; libkrun lacks working serial-console support"
+                );
+            }
         }
 
         // Register a control socket (pause/resume/checkpoint/restore) when
@@ -1541,6 +1612,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     }
 }
 
+fn require_custom_kernel_symbol<T>(symbol: Option<T>) -> Result<T> {
+    symbol.ok_or_else(|| {
+        Error::agent(
+            "configure custom guest kernel",
+            "installed libkrun does not export krun_set_kernel; update libkrun or run `smolvm setup`",
+        )
+    })
+}
+
 /// Create a CString from a static string that is known not to contain NUL bytes.
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("string literal must not contain NUL bytes")
@@ -1682,6 +1762,14 @@ mod tests {
             dns_filter_hosts: Some(hosts.iter().map(|h| h.to_string()).collect()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn missing_custom_kernel_symbol_is_a_bounded_error() {
+        let error = require_custom_kernel_symbol::<fn()>(None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not export krun_set_kernel"));
     }
 
     #[test]

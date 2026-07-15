@@ -299,6 +299,7 @@ impl Supervisor {
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
                 dns_filter_hosts,
+                record.guest_boot.clone(),
             )?;
             entry
                 .manager

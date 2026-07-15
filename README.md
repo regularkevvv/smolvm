@@ -133,6 +133,11 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
+For kernel development, SmolVM can also stage and boot a host-supplied kernel
+and initramfs. See [Custom guest kernels](docs/custom-kernels.md) for formats,
+artifact lifecycle, integrity checks, and the experimental Asterinas bootstrap
+profile.
+
 Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
 Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.

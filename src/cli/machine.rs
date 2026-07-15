@@ -18,6 +18,7 @@ use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::data::guest_boot::{GuestBootSource, GuestProfile, KernelFormat};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
@@ -318,6 +319,43 @@ pub struct RunCmd {
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
+
+    /// Boot a host-supplied guest kernel. The file is copied into the machine's
+    /// data directory before launch, so the source may be removed afterward.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "from",
+        help_heading = "Machine source"
+    )]
+    pub kernel: Option<PathBuf>,
+
+    /// Format of the supplied guest kernel.
+    #[arg(long, value_enum, requires = "kernel", help_heading = "Machine source")]
+    pub kernel_format: Option<KernelFormat>,
+
+    /// Optional initramfs for the supplied kernel. Asterinas newc archives are
+    /// augmented with libkrun's compatible /init.krun.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "kernel",
+        help_heading = "Machine source"
+    )]
+    pub initramfs: Option<PathBuf>,
+
+    /// Additional command line passed to the supplied guest kernel.
+    #[arg(
+        long,
+        value_name = "ARGS",
+        requires = "kernel",
+        help_heading = "Machine source"
+    )]
+    pub kernel_cmdline: Option<String>,
+
+    /// Compatibility profile for the supplied guest kernel.
+    #[arg(long, value_enum, default_value_t = GuestProfile::Linux, help_heading = "Machine source")]
+    pub guest_profile: GuestProfile,
 
     /// Name a persistent machine when used with --detach.
     /// Matches the --name flag on start/stop/exec/status/resize. In foreground
@@ -789,6 +827,14 @@ impl RunCmd {
             std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
         }
 
+        let guest_boot_source = GuestBootSource::from_options(
+            self.kernel.clone(),
+            self.kernel_format,
+            self.initramfs.clone(),
+            self.kernel_cmdline.clone(),
+            self.guest_profile,
+        )?;
+
         // `--from`: run a packed .smolmachine artifact ephemerally, reusing the
         // proven pack-run path. Resource flags fall back to the artifact's baked
         // manifest values (matching `machine create --from`); the remaining run
@@ -895,6 +941,7 @@ impl RunCmd {
         // (null stdin) anyway. Local images take the direct path below, which
         // stages the archive once in this process and runs init inline (#459).
         if !self.no_init_cache
+            && guest_boot_source.is_none()
             && !self.detach
             && image_bakeable(params.image.as_deref())
             && !params.init.is_empty()
@@ -1040,6 +1087,15 @@ impl RunCmd {
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+        let guest_boot = guest_boot_source
+            .as_ref()
+            .map(|source| {
+                smolvm::agent::guest_boot::stage_guest_boot(
+                    source,
+                    &smolvm::agent::vm_data_dir(&vm_name),
+                )
+            })
+            .transpose()?;
 
         if self.detach {
             eprintln!("Starting persistent machine...");
@@ -1086,6 +1142,7 @@ impl RunCmd {
         let uses_packed_layers = packed_layers_dir.is_some();
 
         let mut features = smolvm::agent::LaunchFeatures {
+            guest_boot: guest_boot.clone(),
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
@@ -1357,6 +1414,7 @@ impl RunCmd {
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
                                 rosetta: self.rosetta || params.rosetta,
+                                guest_boot: guest_boot.clone(),
                             }),
                         )
                     });
@@ -1510,6 +1568,7 @@ impl RunCmd {
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
                             rosetta: false,
+                            guest_boot: guest_boot.clone(),
                         }),
                     )?;
                 }
@@ -2195,6 +2254,27 @@ pub struct CreateCmd {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
+    /// Boot a host-supplied guest kernel. The kernel and initramfs are copied
+    /// into the machine's data directory before the DB record is published.
+    #[arg(long, value_name = "PATH", conflicts_with = "from")]
+    pub kernel: Option<PathBuf>,
+
+    /// Format of the supplied guest kernel.
+    #[arg(long, value_enum, requires = "kernel")]
+    pub kernel_format: Option<KernelFormat>,
+
+    /// Optional initramfs for the supplied kernel.
+    #[arg(long, value_name = "PATH", requires = "kernel")]
+    pub initramfs: Option<PathBuf>,
+
+    /// Additional command line passed to the supplied guest kernel.
+    #[arg(long, value_name = "ARGS", requires = "kernel")]
+    pub kernel_cmdline: Option<String>,
+
+    /// Compatibility profile for the supplied guest kernel.
+    #[arg(long, value_enum, default_value_t = GuestProfile::Linux)]
+    pub guest_profile: GuestProfile,
+
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
     /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
@@ -2214,6 +2294,14 @@ impl CreateCmd {
         if let Some(bytes) = self.max_image_size {
             std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
         }
+        let guest_boot = GuestBootSource::from_options(
+            self.kernel.clone(),
+            self.kernel_format,
+            self.initramfs.clone(),
+            self.kernel_cmdline.clone(),
+            self.guest_profile,
+        )?;
+
         // Branch for --from: create machine from .smolmachine artifact.
         if let Some(ref sidecar_path) = self.from {
             return self.run_from_smolmachine(sidecar_path);
@@ -2266,6 +2354,7 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        params.guest_boot = guest_boot;
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -2466,6 +2555,7 @@ impl CreateCmd {
             gpu_vram_mib: None,
             rosetta: false,
             source_smolmachine: Some(canonical_path),
+            guest_boot: None,
         };
 
         let record = vm_common::build_vm_record(&params)?;
