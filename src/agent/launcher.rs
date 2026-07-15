@@ -10,7 +10,10 @@ use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::{
+    plan_launch_network_for_guest_profile, validate_requested_network_backend_for_guest_profile,
+    EffectiveNetworkBackend,
+};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
@@ -463,7 +466,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = &pod_net;
 
-    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    let guest_profile = guest_boot
+        .map(|boot| boot.guest_profile)
+        .unwrap_or_default();
+    validate_requested_network_backend_for_guest_profile(
+        resources,
+        None,
+        port_mappings.len(),
+        guest_profile,
+    )?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -696,7 +707,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+        let network_plan = select_network_plan(
+            resources,
+            *dns_filter_enabled,
+            port_mappings.len(),
+            guest_profile,
+        );
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
         // Windows the runtime is owned by the accept thread, so the launcher's
@@ -824,7 +840,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
                 }
 
-                let mut guest_network = GuestNetworkConfig::default();
+                let mut guest_network = match guest_profile {
+                    crate::data::guest_boot::GuestProfile::Linux => GuestNetworkConfig::default(),
+                    crate::data::guest_boot::GuestProfile::Asterinas => {
+                        GuestNetworkConfig::asterinas()
+                    }
+                };
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1), which forwards
                 // queries to this address instead of the default.
@@ -1461,6 +1482,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::READY_MARKER, marker)));
         }
 
+        env_strings.push(crate::agent::guest_disk_env(guest_profile));
+
         // DNS allow-host filtering is now enforced inside libkrun (see the
         // egress policy above). The guest-side DNS proxy is intentionally NOT
         // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so
@@ -1672,10 +1695,11 @@ fn select_network_plan(
     resources: &VmResources,
     dns_filter_enabled: bool,
     port_count: usize,
+    guest_profile: crate::data::guest_boot::GuestProfile,
 ) -> crate::network::LaunchNetworkPlan {
     let dns_filter_placeholder = [String::from("configured")];
     let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
-    plan_launch_network(resources, dns_filter_hosts, port_count)
+    plan_launch_network_for_guest_profile(resources, dns_filter_hosts, port_count, guest_profile)
 }
 
 /// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.

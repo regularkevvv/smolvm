@@ -47,6 +47,7 @@ booting an external Asterinas kernel:
 ```bash
 smolvm machine create \
   --name asterinas \
+  --net \
   --kernel ./aster-kernel-osdk-bin.qemu_bin \
   --kernel-format raw \
   --guest-profile asterinas
@@ -64,11 +65,29 @@ Conflicting values fail at creation. SmolVM supplies `console=hvc0`, `earlycon`,
 `loglevel=error`, and `rw` only when the caller did not choose an equivalent
 option.
 
-This profile covers the boot and root-filesystem contract only. It does not
-change guest network configuration; Asterinas-specific network behavior is a
-separate compatibility layer.
+With `--net`, the profile also selects Asterinas's narrow preconfigured-network
+contract. SmolVM forces the virtio-net backend, presents the gateway and DNS at
+`10.0.2.2`, and routes published ports to the kernel-owned
+`10.0.2.15/24` address. IPv6 is disabled for this profile. The guest agent
+preserves the kernel's address, MAC, MTU, interface flags, and routes; it only
+installs `/etc/resolv.conf` and continues its normal readiness/control work.
+An explicit `--net-backend tsi` is rejected rather than silently overriding
+the profile. The ordinary `linux` profile and no-network Asterinas boots retain
+their existing behavior.
+
+This is intentionally an MVP compatibility contract for Asterinas's current
+static network. It can converge toward SmolVM's dynamic Linux network profile
+after Asterinas supports the required address and route mutation APIs.
 
 The installed libkrun must export `krun_set_kernel` and, for the Asterinas
 profile, `krun_get_default_init`. Asterinas early-console output additionally
 uses libkrun's serial-console API. SmolVM reports a bounded update/setup error
 when a required API is unavailable.
+
+Asterinas persistent storage uses base ext2 with 4 KiB blocks for both the
+writable root overlay and `/storage`; `/workspace` continues to point at that
+storage disk. The host therefore needs e2fsprogs (`mkfs.ext2`) the first time a
+disk is prepared. Linux guests retain the existing ext4 template path and disk
+markers, so selecting the Asterinas profile does not change their storage
+contract. The guest also formats an uninitialized disk as ext2 if host-side
+formatting was unavailable.

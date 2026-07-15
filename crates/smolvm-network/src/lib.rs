@@ -114,14 +114,36 @@ impl PortMapping {
     }
 }
 
+/// How the guest's network state reaches the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestNetworkSetup {
+    /// The SmolVM agent programs the address, link, and routes at boot.
+    Agent,
+    /// The guest kernel already owns the address, link, and routes.
+    Preconfigured,
+}
+
+/// Optional IPv6 configuration for a guest network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestIpv6Config {
+    /// Guest IPv6 address.
+    pub guest_ip: Ipv6Addr,
+    /// Gateway IPv6 address.
+    pub gateway_ip: Ipv6Addr,
+    /// IPv6 prefix length.
+    pub prefix_len: u8,
+}
+
 /// Static guest network configuration for the virtio-net MVP.
 ///
 /// This struct describes the two endpoints of the single virtual Ethernet link:
 /// - the guest NIC (`guest_*`)
 /// - the host-side gateway implemented by smolvm (`gateway_*`)
 ///
-/// The link is dual-stack: a /30 IPv4 point-to-point pair and a /64 ULA IPv6
-/// pair (`fd53:4d00::/64` — `53:4d` = "SM", matching the MAC OUI scheme).
+/// The normal link is dual-stack: a /30 IPv4 point-to-point pair and a /64 ULA
+/// IPv6 pair (`fd53:4d00::/64` — `53:4d` = "SM", matching the MAC OUI
+/// scheme). Compatibility profiles may select another IPv4 subnet and disable
+/// IPv6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestNetworkConfig {
     /// Guest IPv4 address.
@@ -130,12 +152,8 @@ pub struct GuestNetworkConfig {
     pub gateway_ip: Ipv4Addr,
     /// Prefix length.
     pub prefix_len: u8,
-    /// Guest IPv6 (ULA) address.
-    pub guest_ip6: Ipv6Addr,
-    /// Gateway IPv6 (ULA) address.
-    pub gateway_ip6: Ipv6Addr,
-    /// IPv6 prefix length.
-    pub prefix_len6: u8,
+    /// Optional IPv6 link. `None` makes this an IPv4-only profile.
+    pub ipv6: Option<GuestIpv6Config>,
     /// Guest MAC address.
     pub guest_mac: [u8; 6],
     /// Gateway MAC address.
@@ -152,6 +170,8 @@ pub struct GuestNetworkConfig {
     /// caller passes `--dns <ip>` so a VM on a network that blocks the default
     /// resolver can still resolve names.
     pub upstream_dns: Ipv4Addr,
+    /// Whether the agent or the guest kernel configures the NIC.
+    pub setup: GuestNetworkSetup,
 }
 
 impl GuestNetworkConfig {
@@ -161,9 +181,11 @@ impl GuestNetworkConfig {
             guest_ip: Ipv4Addr::new(100, 96, 0, 2),
             gateway_ip: Ipv4Addr::new(100, 96, 0, 1),
             prefix_len: 30,
-            guest_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 2),
-            gateway_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1),
-            prefix_len6: 64,
+            ipv6: Some(GuestIpv6Config {
+                guest_ip: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 2),
+                gateway_ip: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1),
+                prefix_len: 64,
+            }),
             guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
             gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
             dns_server: Ipv4Addr::new(100, 96, 0, 1),
@@ -171,6 +193,25 @@ impl GuestNetworkConfig {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
             },
+            setup: GuestNetworkSetup::Agent,
+        }
+    }
+
+    /// Asterinas's current kernel-owned static network contract.
+    pub const fn asterinas() -> Self {
+        Self {
+            guest_ip: Ipv4Addr::new(10, 0, 2, 15),
+            gateway_ip: Ipv4Addr::new(10, 0, 2, 2),
+            prefix_len: 24,
+            ipv6: None,
+            guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
+            gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
+            dns_server: Ipv4Addr::new(10, 0, 2, 2),
+            upstream_dns: match DEFAULT_DNS_ADDR {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
+            },
+            setup: GuestNetworkSetup::Preconfigured,
         }
     }
 }
@@ -297,9 +338,8 @@ pub fn start_virtio_network(
             guest_mac: guest_network.guest_mac,
             gateway_ipv4: guest_network.gateway_ip,
             guest_ipv4: guest_network.guest_ip,
-            gateway_ipv6: guest_network.gateway_ip6,
-            guest_ipv6: guest_network.guest_ip6,
-            prefix_len6: guest_network.prefix_len6,
+            prefix_len: guest_network.prefix_len,
+            ipv6: guest_network.ipv6,
             upstream_dns: guest_network.upstream_dns,
             mtu: 1500,
         },
@@ -362,12 +402,24 @@ impl Drop for VirtioNetworkRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::format_network_log_line;
+    use super::{format_network_log_line, GuestNetworkConfig, GuestNetworkSetup};
+    use std::net::Ipv4Addr;
     use std::time::UNIX_EPOCH;
 
     #[test]
     fn formats_timestamped_network_log_prefix() {
         let line = format_network_log_line(UNIX_EPOCH, "virtio-net: smoke test");
         assert_eq!(line, "[1970-01-01T00:00:00Z]: virtio-net: smoke test");
+    }
+
+    #[test]
+    fn asterinas_profile_matches_kernel_owned_ipv4_contract() {
+        let config = GuestNetworkConfig::asterinas();
+        assert_eq!(config.guest_ip, Ipv4Addr::new(10, 0, 2, 15));
+        assert_eq!(config.gateway_ip, Ipv4Addr::new(10, 0, 2, 2));
+        assert_eq!(config.prefix_len, 24);
+        assert_eq!(config.dns_server, Ipv4Addr::new(10, 0, 2, 2));
+        assert_eq!(config.ipv6, None);
+        assert_eq!(config.setup, GuestNetworkSetup::Preconfigured);
     }
 }

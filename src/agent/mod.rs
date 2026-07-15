@@ -99,9 +99,21 @@ pub(crate) fn guest_network_env(
         push(guest_env::GATEWAY, n.gateway_ip.to_string());
         push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
         push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
-        push(guest_env::GUEST_IP6, n.guest_ip6.to_string());
-        push(guest_env::GATEWAY6, n.gateway_ip6.to_string());
-        push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
+        push(
+            guest_env::NETWORK_SETUP,
+            match n.setup {
+                smolvm_network::GuestNetworkSetup::Agent => guest_env::NETWORK_SETUP_AGENT,
+                smolvm_network::GuestNetworkSetup::Preconfigured => {
+                    guest_env::NETWORK_SETUP_PRECONFIGURED
+                }
+            }
+            .to_string(),
+        );
+        if let Some(ipv6) = n.ipv6 {
+            push(guest_env::GUEST_IP6, ipv6.guest_ip.to_string());
+            push(guest_env::GATEWAY6, ipv6.gateway_ip.to_string());
+            push(guest_env::PREFIX_LEN6, ipv6.prefix_len.to_string());
+        }
         push(guest_env::DNS, n.dns_server.to_string());
     } else if let Some(dns) = dns_override {
         push(guest_env::DNS, dns.to_string());
@@ -109,9 +121,94 @@ pub(crate) fn guest_network_env(
     env
 }
 
+/// Build the persistent-disk filesystem environment variable for the guest.
+pub(crate) fn guest_disk_env(
+    guest_profile: crate::data::guest_boot::GuestProfile,
+) -> std::ffi::CString {
+    use smolvm_protocol::guest_env;
+    let filesystem = match guest_profile {
+        crate::data::guest_boot::GuestProfile::Linux => guest_env::DISK_FILESYSTEM_EXT4,
+        crate::data::guest_boot::GuestProfile::Asterinas => guest_env::DISK_FILESYSTEM_EXT2,
+    };
+    std::ffi::CString::new(format!("{}={filesystem}", guest_env::DISK_FILESYSTEM))
+        .expect("disk filesystem env contains NUL")
+}
+
 fn format_mac(mac: [u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guest_disk_env, guest_network_env};
+    use crate::data::guest_boot::GuestProfile;
+    use smolvm_protocol::guest_env;
+
+    fn strings(values: Vec<std::ffi::CString>) -> Vec<String> {
+        values
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn asterinas_network_env_is_preconfigured_and_ipv4_only() {
+        let env = strings(guest_network_env(
+            Some(smolvm_network::GuestNetworkConfig::asterinas()),
+            None,
+        ));
+        assert!(env.contains(&format!("{}=10.0.2.15", guest_env::GUEST_IP)));
+        assert!(env.contains(&format!("{}=10.0.2.2", guest_env::GATEWAY)));
+        assert!(env.contains(&format!("{}=24", guest_env::PREFIX_LEN)));
+        assert!(env.contains(&format!("{}=10.0.2.2", guest_env::DNS)));
+        assert!(env.contains(&format!(
+            "{}={}",
+            guest_env::NETWORK_SETUP,
+            guest_env::NETWORK_SETUP_PRECONFIGURED
+        )));
+        assert!(!env.iter().any(|value| {
+            value.starts_with(guest_env::GUEST_IP6)
+                || value.starts_with(guest_env::GATEWAY6)
+                || value.starts_with(guest_env::PREFIX_LEN6)
+        }));
+    }
+
+    #[test]
+    fn linux_network_env_keeps_agent_configuration_and_ipv6() {
+        let env = strings(guest_network_env(
+            Some(smolvm_network::GuestNetworkConfig::default()),
+            None,
+        ));
+        assert!(env.contains(&format!(
+            "{}={}",
+            guest_env::NETWORK_SETUP,
+            guest_env::NETWORK_SETUP_AGENT
+        )));
+        assert!(env
+            .iter()
+            .any(|value| value.starts_with(&format!("{}=", guest_env::GUEST_IP6))));
+    }
+
+    #[test]
+    fn guest_profile_selects_its_disk_filesystem() {
+        assert_eq!(
+            guest_disk_env(GuestProfile::Linux).to_str().unwrap(),
+            format!(
+                "{}={}",
+                guest_env::DISK_FILESYSTEM,
+                guest_env::DISK_FILESYSTEM_EXT4
+            )
+        );
+        assert_eq!(
+            guest_disk_env(GuestProfile::Asterinas).to_str().unwrap(),
+            format!(
+                "{}={}",
+                guest_env::DISK_FILESYSTEM,
+                guest_env::DISK_FILESYSTEM_EXT2
+            )
+        );
+    }
 }

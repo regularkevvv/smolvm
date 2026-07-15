@@ -1,7 +1,7 @@
 //! Persistent storage management.
 //!
 //! This module provides [`StorageDisk`] for managing persistent storage.
-//! Each VM (default or named) gets its own sparse ext4 disk image that stores
+//! Each VM (default or named) gets its own sparse filesystem image that stores
 //! OCI layers, container overlays, and cached manifests.
 //!
 //! # Storage Locations
@@ -11,12 +11,13 @@
 //!
 //! # Architecture
 //!
-//! The storage disk is a sparse raw disk image formatted with ext4.
+//! The storage disk is a sparse raw image. Linux guests use ext4 while guest
+//! compatibility profiles may select another e2fs filesystem.
 //! It's mounted inside the agent VM which handles OCI layer extraction
 //! and overlay filesystem management.
 
 use crate::data::consts::BYTES_PER_GIB;
-pub use crate::data::disk::{DiskFormat, DiskType, Overlay, Storage};
+pub use crate::data::disk::{DiskFilesystem, DiskFormat, DiskType, Overlay, Storage};
 pub use crate::data::storage::{
     DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
     STORAGE_DISK_FILENAME,
@@ -374,6 +375,11 @@ impl<K: DiskType> VmDisk<K> {
     ///
     /// The template approach eliminates the e2fsprogs dependency for end users.
     pub fn ensure_formatted(&self) -> Result<()> {
+        self.ensure_formatted_as(DiskFilesystem::Ext4)
+    }
+
+    /// Pre-format the disk with the filesystem required by the guest profile.
+    pub fn ensure_formatted_as(&self, filesystem: DiskFilesystem) -> Result<()> {
         if self.format == DiskFormat::Qcow2 {
             // A qcow2 CoW overlay inherits its backing disk's already-formatted
             // filesystem; formatting it would write a fresh fs into the overlay
@@ -381,7 +387,7 @@ impl<K: DiskType> VmDisk<K> {
             return Ok(());
         }
 
-        if !self.needs_format() {
+        if !self.needs_format_as(filesystem) {
             tracing::debug!(
                 path = %self.path.display(),
                 disk_type = K::NAME,
@@ -390,13 +396,21 @@ impl<K: DiskType> VmDisk<K> {
             return Ok(());
         }
 
-        if let Some(template_path) = Self::template_path() {
-            disk_utils::copy_disk_from_template::<K>(&self.path, self.size_bytes, &template_path)?;
+        if filesystem == DiskFilesystem::Ext4 {
+            if let Some(template_path) = Self::template_path() {
+                disk_utils::copy_disk_from_template::<K>(
+                    &self.path,
+                    self.size_bytes,
+                    &template_path,
+                )?;
+            } else {
+                disk_utils::format_disk_with_mkfs::<K>(&self.path, filesystem)?;
+            }
         } else {
-            disk_utils::format_disk_with_mkfs::<K>(&self.path)?;
+            disk_utils::format_disk_with_mkfs::<K>(&self.path, filesystem)?;
         }
 
-        self.mark_formatted()
+        self.mark_formatted_as(filesystem)
     }
 
     /// Get the path to the disk image.
@@ -424,6 +438,11 @@ impl<K: DiskType> VmDisk<K> {
     /// Fast path: if the format marker and the disk file both exist, the disk
     /// was formatted successfully, so skip the expensive `file` command check.
     pub fn needs_format(&self) -> bool {
+        self.needs_format_as(DiskFilesystem::Ext4)
+    }
+
+    /// Check whether the disk marker matches the guest's filesystem contract.
+    pub fn needs_format_as(&self, filesystem: DiskFilesystem) -> bool {
         if !self.disk_marker_path().exists() {
             return true;
         }
@@ -441,12 +460,22 @@ impl<K: DiskType> VmDisk<K> {
             return true;
         }
 
-        false
+        let marker = std::fs::read_to_string(self.disk_marker_path()).unwrap_or_default();
+        match filesystem {
+            // Legacy markers (`"1"` or an empty VM-pack marker) are ext4.
+            DiskFilesystem::Ext4 => marker.trim() == DiskFilesystem::Ext2.as_str(),
+            DiskFilesystem::Ext2 => marker.trim() != DiskFilesystem::Ext2.as_str(),
+        }
     }
 
     /// Mark a disk as formatted by creating its marker file.
     pub fn mark_formatted(&self) -> Result<()> {
-        std::fs::write(self.disk_marker_path(), "1")?;
+        self.mark_formatted_as(DiskFilesystem::Ext4)
+    }
+
+    /// Mark a disk as formatted with the selected guest filesystem.
+    pub fn mark_formatted_as(&self, filesystem: DiskFilesystem) -> Result<()> {
+        std::fs::write(self.disk_marker_path(), filesystem.as_str())?;
         Ok(())
     }
 
@@ -712,6 +741,45 @@ mod tests {
         disk.delete().unwrap();
         assert!(!disk_path.exists());
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_asterinas_ext2_disk_contract() {
+        if disk_utils::find_e2fsprogs_tool("mkfs.ext2").is_none() {
+            eprintln!("skipping test_asterinas_ext2_disk_contract: mkfs.ext2 not found");
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let disk_path = temp_dir.path().join("asterinas-storage.raw");
+        let disk = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+
+        disk.mark_formatted().unwrap();
+        assert!(disk.needs_format_as(DiskFilesystem::Ext2));
+        disk.ensure_formatted_as(DiskFilesystem::Ext2).unwrap();
+        assert!(!disk.needs_format_as(DiskFilesystem::Ext2));
+        assert!(disk.needs_format_as(DiskFilesystem::Ext4));
+        assert_eq!(
+            std::fs::read_to_string(disk_path.with_extension("formatted")).unwrap(),
+            "ext2"
+        );
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut image = std::fs::File::open(&disk_path).unwrap();
+        image.seek(SeekFrom::Start(1024)).unwrap();
+        let mut superblock = [0u8; 64];
+        image.read_exact(&mut superblock).unwrap();
+        assert_eq!(u16::from_le_bytes([superblock[56], superblock[57]]), 0xef53);
+        assert_eq!(
+            u32::from_le_bytes([
+                superblock[24],
+                superblock[25],
+                superblock[26],
+                superblock[27]
+            ]),
+            2,
+            "Asterinas ext2 requires 4 KiB blocks"
+        );
     }
 
     #[test]

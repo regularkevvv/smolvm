@@ -1,3 +1,4 @@
+use crate::data::guest_boot::GuestProfile;
 use crate::data::resources::VmResources;
 use crate::network::backend::NetworkBackend;
 
@@ -88,6 +89,24 @@ pub fn plan_launch_network(
     }
 }
 
+/// Compute the network plan while honoring a guest compatibility profile.
+///
+/// Asterinas owns a static virtio NIC inside the kernel, so any networking
+/// intent must use virtio-net. A profile with networking disabled still gets
+/// no NIC and retains the ordinary vsock-only control path.
+pub fn plan_launch_network_for_guest_profile(
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+    guest_profile: GuestProfile,
+) -> LaunchNetworkPlan {
+    let mut plan = plan_launch_network(resources, dns_filter_hosts, port_count);
+    if guest_profile == GuestProfile::Asterinas && plan.has_network() {
+        plan.backend = EffectiveNetworkBackend::VirtioNet;
+    }
+    plan
+}
+
 /// Validate the requested networking against what each backend can do.
 ///
 /// - Published ports need virtio-net: TSI is outbound-only, so a port request on
@@ -154,6 +173,27 @@ pub fn validate_requested_network_backend(
         ));
     }
 
+    Ok(())
+}
+
+/// Validate backend selection together with the guest compatibility profile.
+pub fn validate_requested_network_backend_for_guest_profile(
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+    guest_profile: GuestProfile,
+) -> crate::Result<()> {
+    validate_requested_network_backend(resources, dns_filter_hosts, port_count)?;
+    let plan = plan_launch_network(resources, dns_filter_hosts, port_count);
+    if guest_profile == GuestProfile::Asterinas
+        && plan.has_network()
+        && resources.network_backend == Some(NetworkBackend::Tsi)
+    {
+        return Err(crate::Error::config(
+            "--net-backend",
+            "guest profile 'asterinas' requires virtio-net because its network is configured by the guest kernel",
+        ));
+    }
     Ok(())
 }
 
@@ -317,5 +357,40 @@ mod tests {
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let hosts = ["example.com".to_string()];
         validate_requested_network_backend(&resources, Some(&hosts), 0).unwrap();
+    }
+
+    #[test]
+    fn asterinas_network_intent_forces_virtio_net() {
+        let mut resources = resources();
+        resources.network = true;
+        assert_eq!(
+            plan_launch_network_for_guest_profile(&resources, None, 0, GuestProfile::Asterinas)
+                .backend,
+            EffectiveNetworkBackend::VirtioNet
+        );
+    }
+
+    #[test]
+    fn asterinas_without_network_stays_vsock_only() {
+        assert_eq!(
+            plan_launch_network_for_guest_profile(&resources(), None, 0, GuestProfile::Asterinas)
+                .backend,
+            EffectiveNetworkBackend::None
+        );
+    }
+
+    #[test]
+    fn asterinas_rejects_explicit_tsi() {
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        let error = validate_requested_network_backend_for_guest_profile(
+            &resources,
+            None,
+            0,
+            GuestProfile::Asterinas,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires virtio-net"));
     }
 }

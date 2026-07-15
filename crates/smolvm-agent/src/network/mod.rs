@@ -10,8 +10,8 @@
 //! When virtio-net is selected, the launcher does not run guest shell
 //! commands like `ip link`, `ip addr`, or `ip route`. Instead it passes a
 //! small, explicit configuration contract into the guest as environment
-//! variables. The agent reads those values very early in boot and programs
-//! the kernel network state directly.
+//! variables. The agent reads those values very early in boot and either
+//! programs the kernel network state or preserves a kernel-owned profile.
 //!
 //! That gives us a narrow host/guest boundary:
 //!
@@ -24,7 +24,7 @@
 //!
 //! guest agent
 //!   -> parses SMOLVM_NETWORK_* env
-//!   -> configures eth0 inside the guest kernel
+//!   -> configures eth0 or preserves its kernel-owned state
 //!   -> continues normal boot
 //! ```
 //!
@@ -64,6 +64,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// - `SMOLVM_NETWORK_PREFIX_LEN`
 /// - `SMOLVM_NETWORK_GUEST_MAC`
 /// - `SMOLVM_NETWORK_DNS`
+/// - `SMOLVM_NETWORK_SETUP=agent|preconfigured`
 /// - `SMOLVM_NETWORK_GUEST_IP6` / `SMOLVM_NETWORK_GATEWAY6` /
 ///   `SMOLVM_NETWORK_PREFIX_LEN6` (optional trio — absent means IPv4-only)
 ///
@@ -86,7 +87,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 ///
 /// 1. Decide whether the current boot even wants guest virtio networking.
 /// 2. Parse the environment strings into typed values.
-/// 3. Call the Linux backend to program `eth0`.
+/// 3. Either program `eth0`, or preserve it and install only resolver state.
 ///
 /// Outcome
 /// -------
@@ -111,17 +112,48 @@ pub fn configure_from_env() -> Result<bool, String> {
         ));
     }
 
+    let dns_server = env_ipv4(guest_env::DNS)?;
+    let setup = network_setup(std::env::var(guest_env::NETWORK_SETUP).ok().as_deref())?;
+    if setup == NetworkSetup::Preconfigured {
+        // Validate the IPv4 contract even though the kernel already owns it.
+        let _guest_ip = env_ipv4(guest_env::GUEST_IP)?;
+        let _gateway = env_ipv4(guest_env::GATEWAY)?;
+        let _prefix_len = env_u8(guest_env::PREFIX_LEN)?;
+        if env_ipv6_config()?.is_some() {
+            return Err("preconfigured network profiles must be IPv4-only".to_string());
+        }
+        linux::configure_preconfigured(dns_server)?;
+        return Ok(true);
+    }
+
     let guest_ip = env_ipv4(guest_env::GUEST_IP)?;
     let gateway = env_ipv4(guest_env::GATEWAY)?;
     let prefix_len = env_u8(guest_env::PREFIX_LEN)?;
     let guest_mac = env_mac(guest_env::GUEST_MAC)?;
-    let dns_server = env_ipv4(guest_env::DNS)?;
     let ipv6 = env_ipv6_config()?;
 
     linux::configure_interface(
         "eth0", guest_mac, 1500, guest_ip, prefix_len, gateway, ipv6, dns_server,
     )?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkSetup {
+    Agent,
+    Preconfigured,
+}
+
+fn network_setup(value: Option<&str>) -> Result<NetworkSetup, String> {
+    match value {
+        None | Some("") | Some(guest_env::NETWORK_SETUP_AGENT) => Ok(NetworkSetup::Agent),
+        Some(guest_env::NETWORK_SETUP_PRECONFIGURED) => Ok(NetworkSetup::Preconfigured),
+        Some(value) => Err(format!(
+            "unsupported {} value: {}",
+            guest_env::NETWORK_SETUP,
+            value
+        )),
+    }
 }
 
 /// Parse the optional IPv6 trio. All three vars must be present together; a
@@ -228,6 +260,10 @@ mod linux {
     ) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
+
+    pub fn configure_preconfigured(_dns_server: Ipv4Addr) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +282,19 @@ mod tests {
     fn parse_mac_rejects_invalid_input() {
         assert!(parse_mac("02:53:4d").is_err());
         assert!(parse_mac("zz:53:4d:00:00:02").is_err());
+    }
+
+    #[test]
+    fn network_setup_is_backwards_compatible_and_strict() {
+        assert_eq!(network_setup(None).unwrap(), NetworkSetup::Agent);
+        assert_eq!(
+            network_setup(Some(guest_env::NETWORK_SETUP_AGENT)).unwrap(),
+            NetworkSetup::Agent
+        );
+        assert_eq!(
+            network_setup(Some(guest_env::NETWORK_SETUP_PRECONFIGURED)).unwrap(),
+            NetworkSetup::Preconfigured
+        );
+        assert!(network_setup(Some("best-effort")).is_err());
     }
 }

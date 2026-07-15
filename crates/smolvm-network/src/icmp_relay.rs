@@ -203,9 +203,17 @@ fn run_icmp_relay(
                     }
                     let flow = flows.get_mut(&key).expect("flow inserted above");
                     flow.last_active = Instant::now();
-                    // Best-effort send; ICMP loss is allowed.
-                    let request = echo_request_bytes(echo.destination, echo.seq, &echo.data);
-                    let _ = flow.socket.send(&request);
+                    // Best-effort send; ICMP loss is allowed, but surface host
+                    // socket errors so unsupported host behavior is diagnosable.
+                    let request =
+                        echo_request_bytes(echo.destination, echo.ident, echo.seq, &echo.data);
+                    if let Err(err) = flow.socket.send(&request) {
+                        virtio_net_log!(
+                            "virtio-net: failed to send host ICMP echo to {}: {}",
+                            echo.destination,
+                            err
+                        );
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
@@ -311,8 +319,9 @@ fn create_flow_socket(destination: IpAddr) -> std::io::Result<HostSocket> {
 
 /// Build the raw ICMP echo-request bytes (type byte through payload) sent to a
 /// host ping socket. The kernel overwrites the identifier with the socket's
-/// port and fills the checksum, so both are left zero here.
-fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
+/// port. Linux also fills the checksum, but BSD ping sockets require a valid
+/// ICMPv4 checksum on send; the kernel adjusts it when rewriting the ident.
+fn echo_request_bytes(destination: IpAddr, ident: u16, seq: u16, data: &[u8]) -> Vec<u8> {
     let type_byte = if destination.is_ipv6() {
         ICMPV6_ECHO_REQUEST
     } else {
@@ -322,9 +331,14 @@ fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
     buf.push(type_byte);
     buf.push(0); // code
     buf.extend_from_slice(&[0, 0]); // checksum (kernel fills)
-    buf.extend_from_slice(&[0, 0]); // identifier (kernel overwrites)
+                                    // BSD ping sockets preserve this identifier; Linux may replace it with
+                                    // the socket port. Reply parsing deliberately ignores the host value.
+    buf.extend_from_slice(&ident.to_be_bytes());
     buf.extend_from_slice(&seq.to_be_bytes());
     buf.extend_from_slice(data);
+    if destination.is_ipv4() {
+        Icmpv4Packet::new_unchecked(&mut buf).fill_checksum();
+    }
     buf
 }
 
@@ -333,6 +347,27 @@ fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
 /// guest's own. Returns `None` for anything that isn't an echo reply (e.g. an
 /// ICMP error the kernel surfaced on the socket).
 fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)> {
+    // Linux ping sockets return the ICMP message directly, while macOS and
+    // other BSD-derived hosts may retain the IPv4 header on receive. Accept
+    // both forms so the relay behaves the same on every supported host.
+    let bytes = match destination {
+        IpAddr::V4(_) if bytes.first().is_some_and(|byte| byte >> 4 == 4) => {
+            // Darwin exposes `ip_len` and `ip_off` in host byte order on raw
+            // receive, so a standards-oriented IPv4 parser can reject the
+            // otherwise valid packet. The IHL nibble itself is portable and
+            // is all we need to locate the ICMP message.
+            let header_len = usize::from(bytes[0] & 0x0f) * 4;
+            if header_len < 20 || header_len > bytes.len() {
+                return None;
+            }
+            &bytes[header_len..]
+        }
+        IpAddr::V6(_) if bytes.first().is_some_and(|byte| byte >> 4 == 6) => {
+            Ipv6Packet::new_checked(bytes).ok()?.payload()
+        }
+        _ => bytes,
+    };
+
     if bytes.len() < 8 {
         return None;
     }
@@ -506,16 +541,54 @@ mod tests {
     }
 
     #[test]
+    fn flow_socket_round_trips_an_echo_via_loopback() {
+        let socket = match create_flow_socket(IpAddr::V4(Ipv4Addr::LOCALHOST)) {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
+        let request = echo_request_bytes(IpAddr::V4(Ipv4Addr::LOCALHOST), 0x4321, 9, b"sockettest");
+        socket.send(&request).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buf = [MaybeUninit::<u8>::uninit(); MAX_ICMP_BYTES];
+        while Instant::now() < deadline {
+            match socket.recv(&mut buf) {
+                Ok(len) => {
+                    // SAFETY: `recv` reports `len` initialized leading bytes.
+                    let bytes =
+                        unsafe { &*(&buf[..len] as *const [MaybeUninit<u8>] as *const [u8]) };
+                    let (seq, data) = parse_echo_reply(IpAddr::V4(Ipv4Addr::LOCALHOST), bytes)
+                        .unwrap_or_else(|| panic!("unrecognized ICMP reply bytes: {bytes:02x?}"));
+                    assert_eq!(seq, 9);
+                    assert_eq!(data, b"sockettest");
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("failed to receive ICMP reply: {err}"),
+            }
+        }
+        panic!("expected a direct echo reply from loopback");
+    }
+
+    #[test]
     fn echo_request_carries_seq_and_payload() {
-        let bytes = echo_request_bytes(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 0x0042, b"ping");
+        let bytes = echo_request_bytes(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            0x1234,
+            0x0042,
+            b"ping",
+        );
         assert_eq!(bytes[0], ICMPV4_ECHO_REQUEST);
+        assert_eq!(&bytes[4..6], &[0x12, 0x34]); // identifier
         assert_eq!(&bytes[6..8], &[0x00, 0x42]); // sequence
         assert_eq!(&bytes[8..], b"ping");
     }
 
     #[test]
     fn echo_request_uses_v6_type_for_v6_destination() {
-        let bytes = echo_request_bytes(IpAddr::V6(Ipv6Addr::LOCALHOST), 1, b"");
+        let bytes = echo_request_bytes(IpAddr::V6(Ipv6Addr::LOCALHOST), 1, 1, b"");
         assert_eq!(bytes[0], ICMPV6_ECHO_REQUEST);
     }
 
@@ -524,6 +597,28 @@ mod tests {
         // type=0, code=0, cksum, ident=0xdead (host port), seq=0x0042, data.
         let reply = [0u8, 0, 0, 0, 0xde, 0xad, 0x00, 0x42, b'h', b'i'];
         let (seq, data) = parse_echo_reply(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), &reply).unwrap();
+        assert_eq!(seq, 0x0042);
+        assert_eq!(data, b"hi");
+    }
+
+    #[test]
+    fn parse_reply_accepts_ipv4_header_returned_by_bsd_ping_sockets() {
+        let icmp = [0u8, 0, 0, 0, 0xde, 0xad, 0x00, 0x42, b'h', b'i'];
+        let ip = Ipv4Repr {
+            src_addr: Ipv4Addr::LOCALHOST,
+            dst_addr: Ipv4Addr::LOCALHOST,
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp.len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; ip.buffer_len() + icmp.len()];
+        ip.emit(
+            &mut Ipv4Packet::new_unchecked(&mut packet[..]),
+            &ChecksumCapabilities::default(),
+        );
+        packet[ip.buffer_len()..].copy_from_slice(&icmp);
+
+        let (seq, data) = parse_echo_reply(IpAddr::V4(Ipv4Addr::LOCALHOST), &packet).unwrap();
         assert_eq!(seq, 0x0042);
         assert_eq!(data, b"hi");
     }

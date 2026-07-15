@@ -20,6 +20,38 @@ pub enum DiskFormat {
     Qcow2,
 }
 
+/// Filesystem stored inside SmolVM's persistent block disks.
+///
+/// Linux guests use the existing ext4 templates. The Asterinas compatibility
+/// profile uses base ext2 because that is the on-disk filesystem implemented by
+/// its kernel today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskFilesystem {
+    /// Existing SmolVM Linux disk contract.
+    #[default]
+    Ext4,
+    /// Asterinas-compatible base ext2 with 4 KiB blocks.
+    Ext2,
+}
+
+impl DiskFilesystem {
+    /// Filesystem name used in disk markers and guest configuration.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Ext2 => "ext2",
+        }
+    }
+
+    /// Host-side e2fsprogs formatter for this filesystem.
+    pub const fn mkfs_tool(self) -> &'static str {
+        match self {
+            Self::Ext4 => "mkfs.ext4",
+            Self::Ext2 => "mkfs.ext2",
+        }
+    }
+}
+
 impl DiskFormat {
     /// File extension used for disks of this format.
     pub fn extension(self) -> &'static str {
@@ -102,5 +134,13 @@ mod tests {
         );
         let parsed: DiskFormat = serde_json::from_str("\"raw\"").unwrap();
         assert_eq!(parsed, DiskFormat::Raw);
+    }
+
+    #[test]
+    fn disk_filesystem_contract_is_explicit() {
+        assert_eq!(DiskFilesystem::default(), DiskFilesystem::Ext4);
+        assert_eq!(DiskFilesystem::Ext4.as_str(), "ext4");
+        assert_eq!(DiskFilesystem::Ext2.as_str(), "ext2");
+        assert_eq!(DiskFilesystem::Ext2.mkfs_tool(), "mkfs.ext2");
     }
 }

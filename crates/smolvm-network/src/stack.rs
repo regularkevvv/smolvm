@@ -117,12 +117,10 @@ pub struct VirtioPollConfig {
     pub gateway_ipv4: Ipv4Addr,
     /// Guest IPv4 address.
     pub guest_ipv4: Ipv4Addr,
-    /// Gateway IPv6 (ULA) address.
-    pub gateway_ipv6: Ipv6Addr,
-    /// Guest IPv6 (ULA) address.
-    pub guest_ipv6: Ipv6Addr,
-    /// IPv6 prefix length for the virtual link.
-    pub prefix_len6: u8,
+    /// IPv4 prefix length for the virtual link.
+    pub prefix_len: u8,
+    /// Optional IPv6 configuration for the virtual link.
+    pub ipv6: Option<crate::GuestIpv6Config>,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     pub upstream_dns: Ipv4Addr,
     /// IP-level MTU.
@@ -205,11 +203,11 @@ fn run_network_stack(
     let (icmp4_handle, icmp6_handle) = add_icmp_raw_sockets(&mut sockets);
     // Gateway addresses answer their own pings locally; everything else is
     // relayed out to real host ICMP sockets.
-    let gateway_addrs = [
-        IpAddr::V4(config.gateway_ipv4),
-        IpAddr::V6(config.gateway_ipv6),
-        IpAddr::V6(link_local_from_mac(config.gateway_mac)),
-    ];
+    let mut gateway_addrs = vec![IpAddr::V4(config.gateway_ipv4)];
+    if let Some(ipv6) = config.ipv6 {
+        gateway_addrs.push(IpAddr::V6(ipv6.gateway_ip));
+        gateway_addrs.push(IpAddr::V6(link_local_from_mac(config.gateway_mac)));
+    }
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None, egress.clone());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
@@ -440,8 +438,8 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
     //
     // Equivalent conceptual state:
     //   MAC: config.gateway_mac
-    //   IP : config.gateway_ipv4/30
-    //        config.gateway_ipv6/64 (ULA) + fe80 link-local
+    //   IP : config.gateway_ipv4/config.prefix_len
+    //        optional IPv6 ULA + fe80 link-local
     //
     // The guest IP exists as a peer on the same virtual link; it is not an
     // address owned by this interface.
@@ -454,23 +452,25 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
     );
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
+            .push(gateway_ipv4_cidr(config))
             .expect("failed to add gateway IPv4 address");
-        addresses
-            .push(IpCidr::new(
-                IpAddress::Ipv6(config.gateway_ipv6),
-                config.prefix_len6,
-            ))
-            .expect("failed to add gateway IPv6 address");
-        // RFC-clean NDP wants a link-local peer on the segment; derive the
-        // standard EUI-64 link-local from the gateway MAC so the guest kernel
-        // can talk NDP to fe80::… as well as to the ULA.
-        addresses
-            .push(IpCidr::new(
-                IpAddress::Ipv6(link_local_from_mac(config.gateway_mac)),
-                64,
-            ))
-            .expect("failed to add gateway IPv6 link-local address");
+        if let Some(ipv6) = config.ipv6 {
+            addresses
+                .push(IpCidr::new(
+                    IpAddress::Ipv6(ipv6.gateway_ip),
+                    ipv6.prefix_len,
+                ))
+                .expect("failed to add gateway IPv6 address");
+            // RFC-clean NDP wants a link-local peer on the segment; derive the
+            // standard EUI-64 link-local from the gateway MAC so the guest kernel
+            // can talk NDP to fe80::… as well as to the ULA.
+            addresses
+                .push(IpCidr::new(
+                    IpAddress::Ipv6(link_local_from_mac(config.gateway_mac)),
+                    64,
+                ))
+                .expect("failed to add gateway IPv6 link-local address");
+        }
     });
     // The interface acts as the gateway and may need to answer packets for
     // destinations other than its directly assigned IP, so the route table and
@@ -479,12 +479,18 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
         .routes_mut()
         .add_default_ipv4_route(config.gateway_ipv4)
         .expect("failed to add default IPv4 route");
-    interface
-        .routes_mut()
-        .add_default_ipv6_route(config.gateway_ipv6)
-        .expect("failed to add default IPv6 route");
+    if let Some(ipv6) = config.ipv6 {
+        interface
+            .routes_mut()
+            .add_default_ipv6_route(ipv6.gateway_ip)
+            .expect("failed to add default IPv6 route");
+    }
     interface.set_any_ip(true);
     interface
+}
+
+fn gateway_ipv4_cidr(config: &VirtioPollConfig) -> IpCidr {
+    IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), config.prefix_len)
 }
 
 /// Derive the EUI-64 IPv6 link-local address for a MAC (RFC 4291 appendix A):
@@ -672,7 +678,7 @@ fn relay_accepted_tcp_connection(
             match receiver.try_recv() {
                 Ok(connection) => {
                     let guest_destination =
-                        SocketAddr::new(std::net::IpAddr::V4(guest_ipv4), connection.guest_port);
+                        published_guest_destination(guest_ipv4, connection.guest_port);
                     virtio_net_log!(
                         "virtio-net: accepted published TCP connection peer={} host_port={} guest_destination={}",
                         connection.peer_addr,
@@ -706,6 +712,10 @@ fn relay_accepted_tcp_connection(
     if disconnected {
         *tcp_receiver = None;
     }
+}
+
+fn published_guest_destination(guest_ipv4: Ipv4Addr, guest_port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(guest_ipv4), guest_port)
 }
 
 /// Bound on outstanding forwarded DNS queries (UDP context) awaiting an answer
@@ -1249,5 +1259,33 @@ mod tests {
             classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw]),
             FrameAction::TcpSyn { .. }
         ));
+    }
+
+    #[test]
+    fn asterinas_gateway_uses_its_24_bit_link() {
+        let guest = crate::GuestNetworkConfig::asterinas();
+        let config = VirtioPollConfig {
+            gateway_mac: guest.gateway_mac,
+            guest_mac: guest.guest_mac,
+            gateway_ipv4: guest.gateway_ip,
+            guest_ipv4: guest.guest_ip,
+            prefix_len: guest.prefix_len,
+            ipv6: guest.ipv6,
+            upstream_dns: guest.upstream_dns,
+            mtu: 1500,
+        };
+        assert_eq!(
+            gateway_ipv4_cidr(&config),
+            IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(10, 0, 2, 2)), 24)
+        );
+    }
+
+    #[test]
+    fn asterinas_published_ports_target_static_guest_ip() {
+        let guest = crate::GuestNetworkConfig::asterinas();
+        assert_eq!(
+            published_guest_destination(guest.guest_ip, 8080),
+            "10.0.2.15:8080".parse().unwrap()
+        );
     }
 }

@@ -848,6 +848,44 @@ fn ensure_mount_dir(path: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn guest_disk_filesystem() -> &'static str {
+    match std::env::var(guest_env::DISK_FILESYSTEM).as_deref() {
+        Ok(guest_env::DISK_FILESYSTEM_EXT2) => guest_env::DISK_FILESYSTEM_EXT2,
+        _ => guest_env::DISK_FILESYSTEM_EXT4,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_e2fs_device(device: &str, label: &str, filesystem: &str) -> bool {
+    let tool = if filesystem == guest_env::DISK_FILESYSTEM_EXT2 {
+        "mkfs.ext2"
+    } else {
+        "mkfs.ext4"
+    };
+    let mut command = Command::new(tool);
+    command.args(["-F", "-q", "-m", "0"]);
+    if filesystem == guest_env::DISK_FILESYSTEM_EXT2 {
+        command.args(["-b", "4096"]);
+    } else {
+        command.args(["-O", "^has_journal"]);
+    }
+    match command.args(["-L", label, device]).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            boot_log(
+                "ERROR",
+                &format!("{tool} failed (exit {})", status.code().unwrap_or(-1)),
+            );
+            false
+        }
+        Err(error) => {
+            boot_log("ERROR", &format!("{tool} not available: {error}"));
+            false
+        }
+    }
+}
+
 /// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
 ///
 /// If /dev/vdb exists (overlay disk attached by host), this function:
@@ -870,6 +908,7 @@ fn setup_persistent_rootfs() {
     const STORAGE_DEVICE: &str = "/dev/vda";
     const STORAGE_TEMP_MOUNT: &str = "/mnt/storage";
     const NEWROOT: &str = "/mnt/newroot";
+    let disk_filesystem = guest_disk_filesystem();
 
     // pivot_root requires that the current root mount is NOT shared.
     // The kernel mounts virtiofs as shared:1 by default.  We must make it
@@ -930,20 +969,20 @@ fn setup_persistent_rootfs() {
 
     ensure_mount_dir(OVERLAY_MOUNT);
 
-    // Probe and mount storage disk in parallel with the overlay ext4 operations.
-    // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
+    // Probe and mount storage disk in parallel with the overlay e2fs operations.
+    // Spawning here (before the /dev/vdb filesystem mount) lets storage work overlap
     // with both the virtiofs activity between probe and mount (~27ms gap) and
     // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
     // removes storage mount latency from the critical path entirely.
     let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
         ensure_mount_dir(STORAGE_TEMP_MOUNT);
-        Some(std::thread::spawn(|| {
+        Some(std::thread::spawn(move || {
             // Resize before mount — template may be smaller than device.
             // Skip if filesystem already fills the device (subsequent boots).
             // If resize fails (e.g. macOS-created template with incompatible features),
             // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !ext4_already_full_size(STORAGE_DEVICE)
-                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            if !e2fs_already_full_size(STORAGE_DEVICE)
+                && !resize_e2fs_if_needed(STORAGE_DEVICE, "storage")
             {
                 boot_log(
                     "WARN",
@@ -954,13 +993,13 @@ fn setup_persistent_rootfs() {
 
             let dev = cstr(STORAGE_DEVICE);
             let mnt = cstr(STORAGE_TEMP_MOUNT);
-            let ext4 = cstr("ext4");
-            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            let filesystem = cstr(disk_filesystem);
+            // SAFETY: mount /dev/vda at /mnt/storage with noatime
             let mounted = unsafe {
                 libc::mount(
                     dev.as_ptr(),
                     mnt.as_ptr(),
-                    ext4.as_ptr(),
+                    filesystem.as_ptr(),
                     libc::MS_NOATIME,
                     std::ptr::null(),
                 ) == 0
@@ -981,25 +1020,26 @@ fn setup_persistent_rootfs() {
         None
     };
 
-    // Resize ext4 on the UNMOUNTED device before mounting. The host copies
+    // Resize the e2fs filesystem on the UNMOUNTED device before mounting. Linux
+    // copies ext4 templates; Asterinas receives a full-size ext2 filesystem.
     // from a small template (~512MB) then extends the sparse file. resize2fs
     // on a mounted device fails with "Resource busy" — must resize first.
     // Skip if filesystem already fills the device (subsequent boots).
     // If resize fails (macOS-created template), the mount+mkfs fallback below handles it.
-    if !ext4_already_full_size(OVERLAY_DEVICE) {
-        let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    if !e2fs_already_full_size(OVERLAY_DEVICE) {
+        let _ = resize_e2fs_if_needed(OVERLAY_DEVICE, "overlay");
     }
 
-    // Try to mount overlay disk (should be pre-formatted ext4)
+    // Try to mount the profile-formatted overlay disk.
     let dev = cstr(OVERLAY_DEVICE);
     let mnt = cstr(OVERLAY_MOUNT);
-    let ext4 = cstr("ext4");
-    // SAFETY: mount /dev/vdb as ext4 at /mnt/overlay with noatime
+    let filesystem = cstr(disk_filesystem);
+    // SAFETY: mount /dev/vdb at /mnt/overlay with noatime
     let mounted = unsafe {
         libc::mount(
             dev.as_ptr(),
             mnt.as_ptr(),
-            ext4.as_ptr(),
+            filesystem.as_ptr(),
             libc::MS_NOATIME,
             std::ptr::null(),
         ) == 0
@@ -1007,27 +1047,17 @@ fn setup_persistent_rootfs() {
 
     if !mounted {
         // First boot — format the disk
-        let _ = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-q",
-                "-O",
-                "^has_journal",
-                "-L",
-                "smolvm-overlay",
-                OVERLAY_DEVICE,
-            ])
-            .status();
+        let _ = format_e2fs_device(OVERLAY_DEVICE, "smolvm-overlay", disk_filesystem);
 
         let dev = cstr(OVERLAY_DEVICE);
         let mnt = cstr(OVERLAY_MOUNT);
-        let ext4 = cstr("ext4");
+        let filesystem = cstr(disk_filesystem);
         // SAFETY: retry mount after formatting with noatime
         if unsafe {
             libc::mount(
                 dev.as_ptr(),
                 mnt.as_ptr(),
-                ext4.as_ptr(),
+                filesystem.as_ptr(),
                 libc::MS_NOATIME,
                 std::ptr::null(),
             )
@@ -1129,7 +1159,7 @@ fn setup_persistent_rootfs() {
     }
 
     // Join parallel storage mount and move it into new root.
-    // On subsequent boots, the ext4 mount succeeds and overlaps with the
+    // On subsequent boots, the disk mount succeeds and overlaps with the
     // overlayfs setup above. On first boot from macOS template, mount fails
     // and mount_storage_disk() handles it with full fsck/mkfs recovery.
     if let Some(handle) = storage_handle {
@@ -1283,7 +1313,7 @@ fn setup_signal_handlers() {
 /// `needs_recovery` on mount in ~1-2ms, so a full e2fsck is unnecessary
 /// on the happy path. Uses boot_log instead of tracing because this runs
 /// before tracing_subscriber is initialized.
-fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
+fn resize_e2fs_if_needed(device: &str, label: &str) -> bool {
     use std::process::Command;
 
     // Try resize2fs directly — skip e2fsck on the happy path.
@@ -1397,7 +1427,7 @@ fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
 ///
 /// Returns false (conservative, triggers resize path) on any error: unformatted
 /// device, non-ext4 filesystem, corrupt superblock, or I/O failure.
-fn ext4_already_full_size(device: &str) -> bool {
+fn e2fs_already_full_size(device: &str) -> bool {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1472,18 +1502,18 @@ fn create_storage_dirs(mount_point: &str) {
     }
 }
 
-/// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+/// Mount the profile-selected e2fs filesystem at /storage.
 #[cfg(target_os = "linux")]
-fn try_mount_storage_ext4() -> bool {
+fn try_mount_storage_e2fs(filesystem: &str) -> bool {
     let dev = cstr("/dev/vda");
     let mnt = cstr("/storage");
-    let ext4 = cstr("ext4");
-    // SAFETY: mount /dev/vda as ext4 at /storage with noatime
+    let filesystem = cstr(filesystem);
+    // SAFETY: mount /dev/vda at /storage with noatime
     unsafe {
         libc::mount(
             dev.as_ptr(),
             mnt.as_ptr(),
-            ext4.as_ptr(),
+            filesystem.as_ptr(),
             libc::MS_NOATIME,
             std::ptr::null(),
         ) == 0
@@ -1502,6 +1532,7 @@ fn mount_storage_disk() -> bool {
 
     const STORAGE_DEVICE: &str = "/dev/vda";
     const STORAGE_MOUNT: &str = "/storage";
+    let disk_filesystem = guest_disk_filesystem();
 
     // Create mount point if needed
     let _ = std::fs::create_dir_all(STORAGE_MOUNT);
@@ -1528,8 +1559,8 @@ fn mount_storage_disk() -> bool {
 
     // --- Attempt 1: resize (if needed) + mount (works on subsequent boots) ---
     let resized =
-        ext4_already_full_size(STORAGE_DEVICE) || resize_ext4_if_needed(STORAGE_DEVICE, "storage");
-    if resized && try_mount_storage_ext4() {
+        e2fs_already_full_size(STORAGE_DEVICE) || resize_e2fs_if_needed(STORAGE_DEVICE, "storage");
+    if resized && try_mount_storage_e2fs(disk_filesystem) {
         info!("storage disk mounted after resize");
         create_storage_dirs(STORAGE_MOUNT);
         return true;
@@ -1542,7 +1573,12 @@ fn mount_storage_disk() -> bool {
         warn!("resize failed, attempting fsck repair before mount");
     }
 
-    let fsck_ok = match Command::new("fsck.ext4")
+    let fsck_tool = if disk_filesystem == guest_env::DISK_FILESYSTEM_EXT2 {
+        "fsck.ext2"
+    } else {
+        "fsck.ext4"
+    };
+    let fsck_ok = match Command::new(fsck_tool)
         .args(["-y", "-f", STORAGE_DEVICE])
         .status()
     {
@@ -1557,14 +1593,14 @@ fn mount_storage_disk() -> bool {
             }
         }
         Err(e) => {
-            warn!(error = %e, "fsck.ext4 not available");
+            warn!(error = %e, tool = fsck_tool, "filesystem checker not available");
             false
         }
     };
 
     if fsck_ok {
-        let _ = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
-        if try_mount_storage_ext4() {
+        let _ = resize_e2fs_if_needed(STORAGE_DEVICE, "storage");
+        if try_mount_storage_e2fs(disk_filesystem) {
             info!("storage disk mounted after fsck repair");
             create_storage_dirs(STORAGE_MOUNT);
             return true;
@@ -1574,22 +1610,11 @@ fn mount_storage_disk() -> bool {
 
     // --- Attempt 3: mkfs (last resort, destroys data) ---
     info!("formatting storage disk (first boot or unrecoverable)");
-    match Command::new("mkfs.ext4")
-        .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            error!(exit_code = status.code().unwrap_or(-1), "mkfs.ext4 failed");
-            return false;
-        }
-        Err(e) => {
-            error!(error = %e, "mkfs.ext4 not available");
-            return false;
-        }
+    if !format_e2fs_device(STORAGE_DEVICE, "smolvm", disk_filesystem) {
+        return false;
     }
 
-    if try_mount_storage_ext4() {
+    if try_mount_storage_e2fs(disk_filesystem) {
         info!("storage disk mounted after format");
         create_storage_dirs(STORAGE_MOUNT);
         return true;

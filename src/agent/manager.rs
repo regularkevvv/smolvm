@@ -1365,6 +1365,7 @@ impl AgentManager {
         mounts: &[HostMount],
         ports: &[PortMapping],
         resources: VmResources,
+        disk_filesystem: crate::storage::DiskFilesystem,
     ) -> Result<()> {
         // Refuse to (re)launch a fork base while clones depend on it. Clones
         // CoW-read this VM's disks by path; re-running it would reopen them
@@ -1470,8 +1471,8 @@ impl AgentManager {
             let storage_disk = &self.storage_disk;
             let overlay_disk = &self.overlay_disk;
             std::thread::scope(|s| {
-                let storage_handle = s.spawn(|| storage_disk.ensure_formatted());
-                let overlay_result = overlay_disk.ensure_formatted();
+                let storage_handle = s.spawn(|| storage_disk.ensure_formatted_as(disk_filesystem));
+                let overlay_result = overlay_disk.ensure_formatted_as(disk_filesystem);
                 if let Err(e) = storage_handle.join().unwrap_or_else(|_| {
                     Err(crate::Error::storage("format storage", "thread panicked"))
                 }) {
@@ -1621,12 +1622,18 @@ impl AgentManager {
         let t_launch = Instant::now();
 
         let resources_for_config = resources.clone();
+        let disk_filesystem = match features.guest_boot.as_ref().map(|boot| boot.guest_profile) {
+            Some(crate::data::guest_boot::GuestProfile::Asterinas) => {
+                crate::storage::DiskFilesystem::Ext2
+            }
+            _ => crate::storage::DiskFilesystem::Ext4,
+        };
         // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
         // boot gate to avoid host-disk thrash on slow/shared storage; removed
         // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
         // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
         // was non-binding and only serialized needlessly.
-        self.prepare_for_launch(&mounts, &ports, resources)?;
+        self.prepare_for_launch(&mounts, &ports, resources, disk_filesystem)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: disks ready"

@@ -83,6 +83,14 @@ pub fn configure_interface(
     Ok(())
 }
 
+/// Preserve a kernel-owned network and install only its resolver contract.
+///
+/// This path deliberately performs no interface ioctl or route-netlink call.
+/// It is used by guests such as Asterinas that bring up their own static NIC.
+pub fn configure_preconfigured(dns_server: Ipv4Addr) -> Result<(), String> {
+    write_resolv_conf(dns_server)
+}
+
 /// Resolve the Linux interface index used by rtnetlink messages.
 ///
 /// C ABI context:

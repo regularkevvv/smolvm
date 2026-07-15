@@ -2,7 +2,7 @@
 //! resizing of the raw VM disk images.
 
 use crate::data::consts::BYTES_PER_GIB;
-use crate::data::disk::DiskType;
+use crate::data::disk::{DiskFilesystem, DiskType};
 use crate::error::{Error, Result};
 use crate::platform::Os;
 use std::io::{Seek, SeekFrom, Write};
@@ -188,27 +188,31 @@ pub(crate) fn expand_sparse_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> 
     Ok(())
 }
 
-/// Format a disk with mkfs.ext4 (requires e2fsprogs).
-pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()> {
+/// Format a disk with the profile-selected e2fsprogs tool.
+pub(crate) fn format_disk_with_mkfs<D: DiskType>(
+    disk_path: &Path,
+    filesystem: DiskFilesystem,
+) -> Result<()> {
+    let mkfs_tool = filesystem.mkfs_tool();
     tracing::info!(
         path = %disk_path.display(),
         disk_type = D::NAME,
-        "formatting {} disk with mkfs.ext4",
-        D::NAME
+        filesystem = filesystem.as_str(),
+        "formatting {} disk",
+        D::NAME,
     );
 
-    let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
+    let mkfs_path = find_e2fsprogs_tool(mkfs_tool).ok_or_else(|| {
         let hint = if Os::current().is_macos() {
             "On macOS, install with: brew install e2fsprogs"
         } else {
             "On Linux, install with: apt install e2fsprogs (or equivalent)"
         };
         Error::storage(
-            "find mkfs.ext4",
+            format!("find {mkfs_tool}"),
             format!(
-                "mkfs.ext4 not found - required for {} disk formatting.\n  {}",
-                D::NAME,
-                hint
+                "{mkfs_tool} not found - required for {} disk formatting.\n  {hint}",
+                D::NAME
             ),
         )
     })?;
@@ -217,45 +221,48 @@ pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()>
         .to_str()
         .ok_or_else(|| Error::storage("validate path", "disk path contains invalid characters"))?;
 
-    let output = std::process::Command::new(mkfs_path)
-        .args([
-            // Force creation on a regular file rather than requiring a block
-            // device. Our "disk" here is a raw sparse image file on the host.
-            "-F",
-            // Quiet mode keeps stderr/stdout small on success. We only need the
-            // detailed mkfs output when the command fails.
-            "-q",
-            // Set the reserved-blocks percentage flag.
-            "-m",
-            // Reserve 0% of blocks for root. This is a VM-owned data disk, not
-            // a host root filesystem, so holding capacity back for root is just
-            // wasted space.
-            "0",
-            // Specify ext4 feature flags explicitly.
-            "-O",
-            // Disable the journal. These disks are scratch/data images managed
-            // by a VM, and dropping the journal reduces write amplification and
-            // space overhead for our use case.
-            "^has_journal",
-            // Set the filesystem label.
-            "-L",
-            // The label lets the guest-side tooling distinguish storage and
-            // overlay disks in logs and inspection output.
-            D::VOLUME_LABEL,
-            // The target sparse image file to format.
-            path_str,
-        ])
+    let mut command = std::process::Command::new(mkfs_path);
+    command.args([
+        // Force creation on a regular file rather than requiring a block
+        // device. Our "disk" here is a raw sparse image file on the host.
+        "-F",
+        // Quiet mode keeps stderr/stdout small on success. We only need the
+        // detailed mkfs output when the command fails.
+        "-q", // Set the reserved-blocks percentage flag.
+        "-m",
+        // Reserve 0% of blocks for root. This is a VM-owned data disk, not
+        // a host root filesystem, so holding capacity back for root is just
+        // wasted space.
+        "0",
+    ]);
+    match filesystem {
+        DiskFilesystem::Ext4 => {
+            // Disable the journal to reduce write amplification for VM-owned
+            // scratch/data images.
+            command.args(["-O", "^has_journal"]);
+        }
+        DiskFilesystem::Ext2 => {
+            // Asterinas's ext2 implementation currently requires 4 KiB blocks.
+            command.args(["-b", "4096"]);
+        }
+    }
+    let output = command
+        .args(["-L", D::VOLUME_LABEL, path_str])
         .output()
-        .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
+        .map_err(|e| Error::storage(format!("run {mkfs_tool}"), e.to_string()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::storage("format with mkfs.ext4", stderr.to_string()));
+        return Err(Error::storage(
+            format!("format with {mkfs_tool}"),
+            stderr.to_string(),
+        ));
     }
 
     tracing::info!(
         path = %disk_path.display(),
         disk_type = D::NAME,
+        filesystem = filesystem.as_str(),
         "{} disk formatted successfully",
         D::NAME
     );

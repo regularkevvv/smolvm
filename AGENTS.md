@@ -12,6 +12,10 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 
 Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no fork/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
+The `asterinas` guest profile uses ext2 with 4 KiB blocks for its persistent
+overlay and storage disks. Host-side preparation requires `mkfs.ext2` from
+e2fsprogs; ordinary Linux guests continue to use ext4 and its templates.
+
 ## Quick Reference
 
 ```bash
@@ -265,6 +269,10 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
 - Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
+- `--guest-profile asterinas --net` forces virtio-net with the guest's
+  kernel-owned `10.0.2.15/24` address, `10.0.2.2` gateway/DNS, no IPv6, and
+  published ports targeting `10.0.2.15`; the agent leaves NIC/link/routes
+  untouched and only installs resolver configuration.
 
 ### Proxy Support
 

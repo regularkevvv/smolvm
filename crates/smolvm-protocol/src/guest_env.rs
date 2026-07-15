@@ -53,6 +53,18 @@ pub const HOST_TIME_NS: &str = "SMOLVM_HOST_TIME_NS";
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".
 pub const BACKEND_VIRTIO_NET: &str = "virtio-net";
+/// Selects whether the agent should configure the NIC or preserve kernel state.
+pub const NETWORK_SETUP: &str = "SMOLVM_NETWORK_SETUP";
+/// The ordinary Linux profile asks the agent to configure the NIC.
+pub const NETWORK_SETUP_AGENT: &str = "agent";
+/// A kernel-owned profile asks the agent to preserve link/address/route state.
+pub const NETWORK_SETUP_PRECONFIGURED: &str = "preconfigured";
+/// Selects the filesystem used by the persistent block disks.
+pub const DISK_FILESYSTEM: &str = "SMOLVM_DISK_FILESYSTEM";
+/// Existing Linux guest disk contract.
+pub const DISK_FILESYSTEM_EXT4: &str = "ext4";
+/// Asterinas-compatible disk contract.
+pub const DISK_FILESYSTEM_EXT2: &str = "ext2";
 /// Guest IPv4 address.
 pub const GUEST_IP: &str = "SMOLVM_NETWORK_GUEST_IP";
 /// Guest-visible default gateway IPv4 address.

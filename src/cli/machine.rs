@@ -22,7 +22,7 @@ use smolvm::data::guest_boot::{GuestBootSource, GuestProfile, KernelFormat};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
-use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::network::{validate_requested_network_backend_for_guest_profile, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1078,10 +1078,14 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
-        validate_requested_network_backend(
+        validate_requested_network_backend_for_guest_profile(
             &resources,
             params.dns_filter_hosts.as_deref(),
             params.port.len(),
+            guest_boot_source
+                .as_ref()
+                .map(|boot| boot.guest_profile)
+                .unwrap_or_default(),
         )?;
 
         let manager =
@@ -2386,10 +2390,15 @@ impl CreateCmd {
         // Without this, `machine create` succeeds and the failure only
         // surfaces later at `machine start` (see QA BUG-44).
         resources.validate()?;
-        validate_requested_network_backend(
+        validate_requested_network_backend_for_guest_profile(
             &resources,
             params.dns_filter_hosts.as_deref(),
             params.port.len(),
+            params
+                .guest_boot
+                .as_ref()
+                .map(|boot| boot.guest_profile)
+                .unwrap_or_default(),
         )?;
         if self.ssh_agent {
             params.ssh_agent = true;
