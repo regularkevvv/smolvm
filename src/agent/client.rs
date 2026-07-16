@@ -93,6 +93,17 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+/// Read/write timeout for a restored clone's readiness ping.
+///
+/// Asterinas can need several seconds after the host-side vsock transport is
+/// live before the restored guest schedules its agent (roughly one second
+/// normally and six seconds under transport tracing). A shorter deadline
+/// abandons a connection that the guest will still receive, so repeated probes
+/// accumulate stale handshakes and trigger a vsock reset storm. Keep one probe
+/// alive for the normal request timeout; `wait_for_ready` retains the outer
+/// startup deadline for a clone that truly never resumes.
+const CLONE_BOOT_PROBE_TIMEOUT_MS: u64 = DEFAULT_READ_TIMEOUT_SECS * 1_000;
+
 // ============================================================================
 // I/O Constants
 // ============================================================================
@@ -527,10 +538,16 @@ impl AgentClient {
     ///
     /// Unlike the marker-first cold-boot fallback above, a clone can only
     /// prove readiness by answering this ping. Give its already-running agent
-    /// enough time to schedule and reply under host/network load; a 5ms read
-    /// deadline can otherwise create a retry storm of abandoned connections.
+    /// enough time to schedule and reply under host/network load. In
+    /// particular, Asterinas may expose the host transport about a second
+    /// before its restored agent runs; abandoning connections during that gap
+    /// creates a retry storm of stale guest-side handshakes.
     pub fn connect_with_clone_boot_probe_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
-        Self::connect_with_timeouts_ms(socket_path.as_ref(), 250, 250)
+        Self::connect_with_timeouts_ms(
+            socket_path.as_ref(),
+            CLONE_BOOT_PROBE_TIMEOUT_MS,
+            CLONE_BOOT_PROBE_TIMEOUT_MS,
+        )
     }
 
     /// Internal connect implementation (single attempt).
@@ -1567,7 +1584,7 @@ impl AgentClient {
     /// Transparently dispatches between single-shot and streaming
     /// based on `data.len()`:
     ///
-    /// - Files ≤ [`FILE_WRITE_SINGLE_SHOT_MAX`] (1 MiB): one
+    /// - Files ≤ [`FILE_WRITE_SINGLE_SHOT_MAX`] (16 KiB): one
     ///   [`AgentRequest::FileWrite`] message — the lowest-latency
     ///   path and what 99% of `cp` calls hit.
     /// - Files larger than that: a sequence of
@@ -1668,7 +1685,7 @@ impl AgentClient {
 
     /// Core streaming upload loop. Reads chunks from `reader` and
     /// sends them over the protocol. Only one chunk buffer is live
-    /// at a time (~1 MiB).
+    /// at a time (~16 KiB).
     fn write_file_streaming_from_reader<R: std::io::Read, F: FnMut(u64)>(
         &mut self,
         path: &str,
@@ -2820,10 +2837,11 @@ mod clone_boot_probe_tests {
             let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
             stream.read_exact(&mut payload).expect("read ping payload");
 
-            // Reproduces the real regression: the restored agent accepted the
-            // connection immediately but host load delayed its response beyond
-            // the old 5ms deadline.
-            std::thread::sleep(Duration::from_millis(25));
+            // Reproduces the Asterinas restore regression: the host transport
+            // accepts immediately, but the restored guest does not drain the
+            // request for several seconds. The former 250ms and 3s probes both
+            // abandoned connections during this gap and caused a reset storm.
+            std::thread::sleep(Duration::from_millis(3_200));
             stream
                 .write_all(
                     &encode_message(&AgentResponse::Pong {

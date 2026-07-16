@@ -921,7 +921,18 @@ impl AgentManager {
     /// Returns Some(()) if agent is running and reachable, None otherwise.
     /// This also updates the internal state to Running if successful.
     pub fn try_connect_existing(&self) -> Option<()> {
-        self.try_connect_existing_with_pid(None)
+        self.try_connect_existing_client().map(|_| ())
+    }
+
+    /// Check whether an agent is already running and return the connection that
+    /// answered the liveness ping.
+    ///
+    /// Reusing this connection matters for restored guests: opening a second
+    /// connection immediately after the ping needlessly doubles the number of
+    /// guest handler slots in flight, and reset-and-reconnect vsock restores can
+    /// take several seconds to retire the first one.
+    pub fn try_connect_existing_client(&self) -> Option<super::AgentClient> {
+        self.try_connect_existing_client_with_pid_and_start_time(None, None)
     }
 
     /// Try to reconnect to an existing agent with a known PID.
@@ -930,7 +941,8 @@ impl AgentManager {
     /// Falls back to reading the PID file if no PID is provided.
     /// Returns Some(()) if agent is running and reachable, None otherwise.
     pub fn try_connect_existing_with_pid(&self, pid: Option<i32>) -> Option<()> {
-        self.try_connect_existing_with_pid_and_start_time(pid, None)
+        self.try_connect_existing_client_with_pid_and_start_time(pid, None)
+            .map(|_| ())
     }
 
     /// Try to reconnect to an existing agent with a known PID and expected start time.
@@ -942,6 +954,15 @@ impl AgentManager {
         pid: Option<i32>,
         expected_start_time: Option<u64>,
     ) -> Option<()> {
+        self.try_connect_existing_client_with_pid_and_start_time(pid, expected_start_time)
+            .map(|_| ())
+    }
+
+    fn try_connect_existing_client_with_pid_and_start_time(
+        &self,
+        pid: Option<i32>,
+        expected_start_time: Option<u64>,
+    ) -> Option<super::AgentClient> {
         if !self.vsock_socket.exists() {
             return None;
         }
@@ -1004,7 +1025,7 @@ impl AgentManager {
                         }
                     }
                 }
-                return Some(());
+                return Some(client);
             }
         }
 

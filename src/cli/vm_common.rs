@@ -113,7 +113,7 @@ pub fn ensure_running_and_connect(
         None => "smolvm machine start".to_string(),
     };
 
-    if manager.try_connect_existing().is_none() {
+    let Some(client) = manager.try_connect_existing_client() else {
         // Distinguish "machine not found" from "machine stopped"
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
@@ -157,9 +157,8 @@ pub fn ensure_running_and_connect(
                 label, start_hint
             ),
         ));
-    }
+    };
 
-    let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
     Ok((manager, client))
 }
 
