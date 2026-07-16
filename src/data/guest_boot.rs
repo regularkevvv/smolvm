@@ -92,25 +92,6 @@ impl GuestProfile {
             Self::Asterinas => "asterinas",
         }
     }
-
-    /// Validate resource constraints imposed by the guest implementation.
-    ///
-    /// Asterinas currently reports one processor on AArch64 and does not boot
-    /// secondary vCPUs. Leaving extra libkrun vCPU threads parked before their
-    /// PSCI `CPU_ON` handshake makes a fork checkpoint impossible to quiesce,
-    /// so reject that configuration instead of creating a machine that only
-    /// fails when it is promoted to a golden.
-    pub fn validate_vcpu_count(self, cpus: u8) -> crate::Result<()> {
-        if self == Self::Asterinas && cpus != 1 {
-            return Err(crate::Error::config(
-                "--cpus",
-                format!(
-                    "the Asterinas AArch64 guest profile currently supports exactly 1 vCPU, got {cpus}; use --cpus 1"
-                ),
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl std::fmt::Display for GuestProfile {
@@ -423,16 +404,6 @@ mod tests {
         assert_eq!(KernelFormat::ImageBz2.to_krun_u32(), 3);
         assert_eq!(KernelFormat::ImageGz.to_krun_u32(), 4);
         assert_eq!(KernelFormat::ImageZstd.to_krun_u32(), 5);
-    }
-
-    #[test]
-    fn asterinas_profile_requires_one_vcpu() {
-        GuestProfile::Asterinas.validate_vcpu_count(1).unwrap();
-        let error = GuestProfile::Asterinas.validate_vcpu_count(2).unwrap_err();
-        assert!(error.to_string().contains("exactly 1 vCPU"));
-        assert!(error.to_string().contains("--cpus 1"));
-
-        GuestProfile::Linux.validate_vcpu_count(2).unwrap();
     }
 
     #[test]

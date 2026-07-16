@@ -475,7 +475,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let guest_profile = guest_boot
         .map(|boot| boot.guest_profile)
         .unwrap_or_default();
-    guest_profile.validate_vcpu_count(resources.cpus)?;
     validate_requested_network_backend_for_guest_profile(
         resources,
         None,

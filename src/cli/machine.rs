@@ -1127,11 +1127,6 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
-        guest_boot_source
-            .as_ref()
-            .map(|boot| boot.guest_profile)
-            .unwrap_or_default()
-            .validate_vcpu_count(resources.cpus)?;
         validate_requested_network_backend_for_guest_profile(
             &resources,
             params.dns_filter_hosts.as_deref(),
@@ -2545,12 +2540,6 @@ impl CreateCmd {
         // Without this, `machine create` succeeds and the failure only
         // surfaces later at `machine start` (see QA BUG-44).
         resources.validate()?;
-        params
-            .guest_boot
-            .as_ref()
-            .map(|boot| boot.guest_profile)
-            .unwrap_or_default()
-            .validate_vcpu_count(resources.cpus)?;
         validate_requested_network_backend_for_guest_profile(
             &resources,
             params.dns_filter_hosts.as_deref(),
@@ -3227,13 +3216,6 @@ impl UpdateCmd {
             ..record.vm_resources()
         };
         proposed.validate()?;
-        record
-            .guest_boot
-            .as_ref()
-            .map(|boot| boot.guest_profile)
-            .unwrap_or_default()
-            .validate_vcpu_count(proposed.cpus)?;
-
         // Validate env specs have KEY=VALUE format with non-empty key
         for spec in &self.env {
             match spec.split_once('=') {
