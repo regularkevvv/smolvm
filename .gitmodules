@@ -1,6 +1,6 @@
 [submodule "libkrun"]
 	path = libkrun
-	url = git@github.com:smol-machines/libkrun.git
+	url = git@github.com:regularkevvv/libkrun.git
 [submodule "libkrunfw"]
 	path = libkrunfw
 	url = git@github.com:smol-machines/libkrunfw.git
